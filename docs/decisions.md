@@ -36,6 +36,9 @@ rollback; failures are undone via separate compensating transactions instead.
   and the state-machine section of the PRD.
 - Requires a safety-net mechanism for the case where the expected event
   (payment webhook) never arrives at all (see next decision).
+- *(See "Multi-item orders" decision below — the saga's inventory-reservation
+  step now spans N items per order, not one, which is a direct consequence of
+  this orchestration design being reused rather than rebuilt.)*
 
 ---
 
@@ -72,7 +75,9 @@ primary resolution path (the webhook is).
 
 **Consequences:**
 Sweep interval becomes a tunable parameter to decide later (affects how long
-stock can sit wrongly-reserved past its TTL before release).
+stock can sit wrongly-reserved past its TTL before release). With multi-item
+orders, a single sweep now needs to release a *set* of reservations tied to one
+order, not a single row.
 
 ---
 
@@ -140,6 +145,12 @@ achieved.
 
 ## Decision: Service boundaries drawn by traffic shape + failure blast radius
 
+> **Note:** the resulting service list below (specifically Vendor Service and
+> Settlement Service) is partially superseded by the "Product vision pivot"
+> decision further down. The *rule* used to derive boundaries — traffic shape
+> + blast radius — still stands and is unaffected; only the concrete service
+    > list changed.
+
 **Context / Problem:**
 FlashMart's data (vendors, products, flash sales, stock reservations, orders, notifications, settlements) could live in one monolith service/DB, or be split across multiple services. Needed a non-arbitrary rule for where to cut boundaries — "split by noun" or "microservices are good practice" aren't real justifications.
 
@@ -164,6 +175,12 @@ Every future service-boundary question (e.g. "should X be its own service") must
 ---
 
 ## Decision: Vendor Service kept as one combined service (not split into Identity/Auth vs. Vendor Profile/Payout)
+
+> **Note:** partially superseded — see "Product vision pivot" below. The
+> payout/commission portion of Vendor Service's original scope no longer
+> exists; this decision's *reasoning* (don't split without a concrete
+> traffic/blast-radius story) is still the live rule and gets re-applied to
+> the now-smaller Vendor/Brand Service in that later decision.
 
 **Context / Problem:**
 Vendor-related data spans three concerns: identity/auth (login, JWT, API keys), business profile (name, KYC), and payout details (bank account, commission terms). Real-world systems often split identity/auth into its own service. Needed to decide whether FlashMart should do the same.
@@ -214,6 +231,8 @@ Forcing the payment confirmation wait into a synchronous call would hold a reque
 **Consequences:**
 - Kafka's at-least-once delivery means every consumer (starting with Inventory Service's `PaymentConfirmed` handler) must be built as an **idempotent consumer** — checking current state before applying a transition — rather than assuming each event arrives exactly once.
 - Inbound webhook delivery is not guaranteed to happen at all (e.g., if Razorpay Clone crashes before sending it) — noted as a gap not yet addressed by the PRD; a reconciliation/polling fallback may be needed later (open item, not yet designed).
+- The Order→Inventory reservation call in this table refers to a single-item call; the "Reservation strategy" decision below spells out how this is invoked for multi-item orders (a loop of these same calls, not a new communication mode).
+- Settlement Service is no longer a consumer of `PaymentConfirmed` — see "Product vision pivot" below.
 
 ---
 
@@ -365,7 +384,10 @@ that Kafka event being consumed and applied in Inventory.
 **Consequences:**
 Inventory Service's `products` schema needs the denormalized email column, and
 its Kafka consumer set grows by one (vendor-email-change events from Vendor
-Service) — to be reflected when Inventory's schema is finalized.
+Service) — to be reflected when Inventory's schema is finalized. With multi-item
+orders, this reservation call now happens once per item in the order (see
+"Reservation strategy" below) — the enrichment pattern itself is unaffected,
+since each call already returns its own product's vendor email independently.
 
 ---
 
@@ -409,7 +431,9 @@ status alone gets "was this order paid or not," not full fulfillment status.
 
 **Consequences:**
 Every terminal state needs an idempotent guard against late-arriving events —
-see next decision.
+see next decision. This state machine is unaffected by the multi-item order
+model — it remains order-level regardless of item count (see "Multi-item
+orders" decision below).
 
 ---
 
@@ -452,3 +476,167 @@ This guard needs to be built and explicitly tested (a late webhook fired after
 expiry) once the state machine and webhook handler are implemented — a
 candidate for one of the "break it" scenarios in the Learn → Build → Revise
 cycle for this feature.
+
+---
+
+## Decision: Multi-item orders — Order supports multiple OrderItems, not one-product-per-order
+
+**Context / Problem:**
+The PRD's schema sketch (`orders.flash_sale_id`, singular) and the purchase
+sequence diagram (`reserve(productId, qty)`, one call) implicitly modeled one
+order = one product = one flash sale. This does not reflect realistic
+e-commerce usage, where a customer buys several different products from the
+same brand's sale in one checkout (e.g. Shoes ×2 + T-Shirt ×1).
+
+**Options Considered:**
+1. Keep one-product-per-order, matching the PRD's original schema sketch.
+2. Support multiple OrderItems per Order, each with its own product, quantity,
+   unit price, and subtotal.
+
+**Chosen Approach:**
+Option 2. `Order` → many `OrderItem`s; each `OrderItem` holds `productId`,
+`quantity`, `unitPrice`, `subtotal`.
+
+**Why:**
+One-product-per-order was simpler but not realistic, and it was quietly
+avoiding — not solving — the partial-multi-item-reservation-failure problem
+that any real flash-sale checkout with more than one item eventually has to
+face. Making the model explicit forces that problem to be designed for
+directly (see "Reservation strategy" decision below) rather than deferred
+indefinitely.
+
+**Trade-offs:**
+Reintroduces genuine saga complexity that single-item orders had sidestepped:
+partial reservation failure across N items, saga step semantics that now mean
+"all items," and event payloads that must carry a full item list instead of a
+single product/quantity pair.
+
+**Consequences:**
+- `orders.flash_sale_id` and `orders.quantity` removed; `flash_sale_id` moves
+  to `order_items` (each line item can belong to a different flash sale).
+- `orders.amount` becomes derived as `SUM(order_items.subtotal)` at
+  order-creation time, not a single flash-sale-price × qty calculation.
+- The `reserve(productId, qty)` Feign call is no longer sufficient as a single
+  call per order — see "Reservation strategy" decision below.
+- `outbox` event payloads (`OrderCreated`, `PaymentConfirmed`, etc.) must carry
+  the full item list, not a single product/quantity pair.
+- A new sequence diagram is needed for partial-item-reservation-failure, which
+  did not exist as a scenario under the single-item model.
+
+---
+
+## Decision: Reservation strategy for multi-item orders — all-or-nothing, via a sequential loop of per-item Feign calls
+
+**Context / Problem:**
+Once an order can contain multiple items, a real scenario emerges that didn't
+exist before: some items in an order can be reserved successfully while others
+cannot (out of stock). Needed to decide both the *outcome policy* (what happens
+to the order) and the *call shape* (how Order Service actually invokes
+Inventory Service for N items).
+
+**Options Considered:**
+- Outcome policy:
+    1. All-or-nothing — if any item's reservation fails, release any items
+       already reserved for that order and do not proceed to payment.
+    2. Partial fulfillment — let the order proceed with only the items that
+       succeeded.
+- Call shape:
+    1. Order Service loops over unique order items, calling Inventory's existing
+       single-item `reserve(productId, quantity)` once per iteration.
+    2. A new batch endpoint on Inventory Service accepting a list of
+       `{productId, quantity}` pairs, reserved in one call.
+
+**Chosen Approach:**
+All-or-nothing outcome policy, implemented as a sequential loop of per-item
+`reserve(productId, quantity)` Feign calls (not a new batch endpoint).
+
+**Why:**
+Partial fulfillment was rejected because it would change what "PAID" means
+mid-flight — the charged amount, the item list, and the buyer's expectation
+would all have to be recalculated after the fact, which conflicts with the
+existing decision to snapshot `amount` at order-creation time. All-or-nothing
+keeps the existing Order state machine's semantics intact: `PENDING_PAYMENT`
+still means "every item is reserved," unchanged from the single-item model.
+The per-item-loop call shape (over a new batch endpoint) was chosen to keep
+Inventory Service's API surface unchanged — it never needs to know or reason
+about multi-item orders at all; that concept, and the saga complexity that
+comes with it, stays entirely inside Order Service, which already owns saga
+orchestration.
+
+**Trade-offs:**
+- Sequential per-item Feign calls mean per-order reservation latency scales
+  with item count (N round trips instead of 1) — a real cost against the
+  buy-endpoint p99 latency target (NFR-P2), to be measured once load-tested,
+  not assumed acceptable.
+- Requires explicit compensating logic: on any item's failure mid-loop,
+  already-reserved items from earlier in the same loop must be released via a
+  matching release/cancel call — Inventory Service's `reserve` API needs a
+  counterpart for this to be possible.
+- Introduces a time-of-check gap within a single order: real wall-clock time
+  passes between the first item's reservation and a later item's failure,
+  during which the earlier reservation's own TTL clock is already running.
+
+**Consequences:**
+- Inventory Service needs a `release`/`cancel` reservation endpoint,
+  independent of and in addition to `reserve` — not yet designed.
+- `saga_state.step` value `INVENTORY_RESERVED` now represents "all N items
+  reserved," not a single item; a failure partway through the loop must be
+  representable as its own saga state (e.g. compensating), not just success or
+  failure of one call.
+- A new sequence diagram (partial-item-reservation-failure → compensation) is
+  needed before Inventory Service's reservation API can be finalized.
+
+---
+
+## Decision: Product vision pivot — FlashMart is a flash-sale platform for brands, not a multi-vendor marketplace; Settlement Service removed
+
+**Context / Problem:**
+The original PRD modeled FlashMart as a multi-vendor marketplace: independent
+sellers list products, and the platform itself computes commission and batches
+payouts to them (Settlement Service, `settlements`/`payout_batches` tables).
+This was revisited: FlashMart's actual intended use case is brands (e.g. Puma,
+Nike) running their own flash sales on the platform, not the platform
+intermediating money between independent third-party sellers.
+
+**Options Considered:**
+1. Keep the marketplace framing — independent vendors, platform-computed
+   commission, payout batching (original PRD scope).
+2. Narrow to a brand-platform framing — brands manage their own products,
+   pricing, and inventory directly; the platform does not compute commission
+   or handle payouts on their behalf.
+
+**Chosen Approach:**
+Option 2. Settlement Service and its two tables (`settlements`,
+`payout_batches`) are removed entirely. Vendor Service's scope narrows to
+brand identity, API keys, and product ownership — bank details and KYC (which
+existed for payout/compliance purposes) are dropped.
+
+**Why:**
+Under the brand-platform model there is no platform-computed money movement to
+third-party sellers to justify a settlement engine — each brand owns its own
+payment relationship independent of FlashMart. This is a deliberate scope cut,
+not a re-solved problem: the original PRD explicitly called vendor
+settlement/commission a "first-class real-world backend problem" worth
+building, and this decision removes it rather than replacing it with something
+equivalent.
+
+**Trade-offs:**
+- Gains: removes an entire service, its data model, and its Kafka consumer
+  relationship, simplifying the system with no corresponding new complexity
+  introduced elsewhere.
+- Costs: gives up the settlement/payout engine as a learning opportunity and
+  as a resume bullet (PRD Section 8) — this trade-off is accepted knowingly,
+  not incidentally.
+
+**Consequences:**
+- Settlement Service removed from the architecture and API Gateway routing.
+- The `PaymentConfirmed → Settlement Service` Kafka consumer relationship no
+  longer exists.
+- Vendor Service's original single-vs-split decision (see above) gets
+  re-opened at smaller scope: with bank details/KYC gone, the remaining
+  justification for a standalone Vendor/Brand Service is weaker than before —
+  **not yet decided** whether it remains its own service or folds into
+  Inventory Service. To be resolved before Inventory/Vendor schema work
+  starts.
+- Order Service, its schema, saga design, and state machine are entirely
+  unaffected by this decision — none of them depended on settlement.
