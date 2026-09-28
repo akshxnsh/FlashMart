@@ -1,227 +1,351 @@
 # FlashMart — Architecture
 
-> Reflects the current design as of the latest entries in `docs/decisions.md`
-> and the FlashMart Notion log. Supersedes the original PRD wherever the two
-> conflict (see `CLAUDE.md`). This is a **design document** — see Section 7
-> for what actually has code behind it.
+> Current design per `docs/decisions.md` through Revision 3. Supersedes the
+> PRD wherever they conflict (see `CLAUDE.md`). Design document — Section 8
+> is what actually has code behind it (currently nothing).
 
 ## 1. System Overview
 
 FlashMart is flash-sale infrastructure for brands (e.g. Puma, Nike) running
 their own time-boxed, limited-stock sales — not a multi-vendor marketplace.
-Brands manage their own products, pricing, and inventory directly; FlashMart
-does not aggregate independent sellers and does not compute commission or
-handle payouts (that scope was deliberately removed — see "Product vision
-pivot" in `docs/decisions.md`). The core engineering problem the system is
-built to solve is real concurrency and consistency under scarcity: many
-buyers racing for a small, fixed pool of stock, with order/payment/inventory
-state that must reach a consistent outcome without a distributed transaction.
+Brands manage their own products, pricing, and inventory directly; no
+settlement/payout engine exists or is planned. The core engineering problem:
+many buyers racing for a small, fixed pool of stock, with order/payment/
+inventory state that must reach a consistent outcome without a distributed
+transaction.
 
 ## 2. Service Boundaries
 
-Boundaries are drawn by traffic shape (hot/bursty vs. cold/low-volume) and
-failure blast radius, not by domain noun or convention — see "Service
-boundaries drawn by traffic shape + failure blast radius" in
-`docs/decisions.md`.
+Drawn by traffic shape (hot/bursty vs. cold/low-volume) and failure blast
+radius, not by domain noun.
 
-| Service | Owns | Boundary justification |
+| Service | Owns | Why this boundary |
 |---|---|---|
-| **API Gateway** | Nothing (no DB) | Stateless routing, JWT validation at the edge, coarse rate limiting. Kept dataless so it has no state to be a blast-radius source itself. |
-| **Order Service** | `orders`, `order_items`, `saga_state`, `outbox` | Owns saga orchestration for the purchase flow. Hot/bursty path (every buy attempt), isolated from cold identity/notification traffic so an incident there can't starve checkout. |
-| **Inventory Service** | `flash_sales`, `flash_sale_items`, `stock_reservations`, `products` | The hottest, most contended path in the system — thousands of buyers racing to decrement the same `flash_sale_items` row during a sale. Isolated so this contention can't lock-starve unrelated services. |
-| **Identity Service** | `brands`, `api_keys`, `users` (buyers) | Brands and buyers are grouped together *not* because they're the same kind of entity, but because they share one access pattern: cold, low-volume signup/login, never on the hot checkout path. See "Identity Service" decision. |
-| **Notification Service** | `notification_log`, `brand_contacts`, `buyer_contacts` | Cold, batch-tolerant consumer of purchase events; can lag without affecting checkout. Owns its own contact caches so it has no runtime dependency on Identity for the emails it sends. |
-| **Razorpay Clone** (external) | Payment state | Built separately, called via OpenFeign. Not part of this codebase's service boundaries, but its 202-Accepted-then-webhook behavior directly shaped the Order state machine (Section 5). |
+| **API Gateway** | Nothing (no DB) | Stateless routing, JWT at the edge, coarse rate limiting. |
+| **Order Service** | `orders`, `order_items`, `refunds`, `outbox` | Sole authority on an order's fate (§6). Hot/bursty, isolated from cold traffic. |
+| **Inventory Service** | `flash_sales`, `flash_sale_items`, `stock_reservations`, `products` | The hottest, most contended row in the system (`flash_sale_items`). Isolated so contention can't lock-starve unrelated services. |
+| **Identity Service** | `brands`, `api_keys`, `users`, `outbox` | Brands and buyers share one access pattern — cold, low-volume auth — not because they're the same kind of entity. |
+| **Notification Service** | `notification_log`, `brand_contacts`, `buyer_contacts` | Cold, batch-tolerant; owns its own contact caches so it has no runtime dependency on Identity. |
+| **Razorpay Clone** (external) | Payment state | Separate project, called via OpenFeign. Not built yet (§9). |
 
-**No Settlement Service.** The original PRD's vendor-payout/commission engine
-is permanently out of scope under the brand-platform model — there's no
-platform-computed money movement to third parties to justify it.
-
-Each service owns its own database; no service reads another's DB directly.
-Cross-service references (e.g. `flash_sales.brand_id → brands.id`) are plain
-values, not enforced FKs — referential integrity across services is an
-application-level concern by design.
+No Settlement Service — permanently out of scope, no money movement to third
+parties to justify one. Each service owns its own database; no service reads
+another's directly. Cross-service references are plain values, never FKs (§5).
 
 ## 3. Communication Patterns
 
-Chosen per-interaction based on whether the caller needs the result before
-it can proceed — not defaulted to REST-everywhere or Kafka-everywhere. See
-"Communication pattern per service interaction" in `docs/decisions.md`.
+Chosen per-interaction by whether the caller needs the result before
+proceeding.
 
 **Synchronous (OpenFeign):**
-- Order Service → Inventory Service: `reserve(flash_sale_id, product_id, qty)`, once per unique item in the order (a loop, not a batch call — see Section 4). Order cannot proceed without the outcome.
-- Order Service → Razorpay Clone: initiate payment. Response is 202 Accepted only — confirms receipt, not outcome — so Order Service sets `PENDING_PAYMENT`, never `PAID`, off this call.
+- **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). Returns `{ success, reservationId, salePrice, brandId, productName }` (money as a string). `200` for buyer-legitimate outcomes (`OUT_OF_STOCK`, `SALE_NOT_LIVE`); non-`200` means something upstream is wrong and should alert (`404 ITEM_NOT_FOUND`, `409 QUANTITY_MISMATCH`, `400 INVALID_QUANTITY`). **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
+- **Order → Razorpay Clone** — initiate payment, with an idempotency key derived from the order ID. 202-only response; Order sets `PENDING_PAYMENT`, never `PAID`, off it.
+- **Order → Razorpay Clone** — refund a captured payment, and a payment-status lookup (used both to check "already refunded?" and by the reconciliation sweep, §6). Must accept *our* idempotency key or order reference, not only the gateway's own payment ID.
+- **Inventory → Order** — `GET /internal/orders/{orderId}/status` → `{ orderId, status }`, used by Inventory's stale-reservation reconciler. `PAID` → confirm; terminal failure → release; `CREATED`/`PENDING_PAYMENT` → do nothing **and alert** (an hours-old reservation on a live order means Order's sweep has died); `404`/unreachable → do nothing and alert, never guess. Safe without locking: every answer acted on is terminal and can't change after being read. Internal only. The reconciler scans a bounded number of rows per pass, so a systemic backlog (e.g. Kafka down for hours) can't flood Order.
+
+> **Cross-project caveat:** Razorpay Clone is not built yet. Idempotency on
+> `initiate` and `refund`, and a payment-status lookup by our key, are
+> requirements placed on it — designed, not verified. Correctness never
+> depends on them: the one-payment invariant (§6) and the already-refunded
+> check catch the failure either way. Prevention and correction are
+> deliberately independent.
 
 **Asynchronous — inbound webhook:**
-- Razorpay Clone → Order Service: payment result. Timing is outside Order Service's control, so it can't be a blocking call. Must be signature-verified before acting on it (FR-P2).
+- **Razorpay Clone → Order** — payment result, signature-verified (FR-P2). Applies the one-payment invariant (§6); returns 200 only after its transaction commits, so a pre-commit crash is replayed by the gateway's own retry.
 
-**Asynchronous — Kafka (each publisher owns an `outbox`, written in the same local transaction as the business change):**
-- **Order Service** publishes `OrderCreated`, `PaymentConfirmed` (payload carries the full item list, plus `brand_id` and `buyer_id` for Notification's enrichment — never persisted as columns on `orders`).
-- **Inventory Service** publishes `ReservationExpired` (one event per order, from the TTL sweep over `stock_reservations`).
-- **Identity Service** publishes `BrandUpserted` and `UserUpserted` (on creation *and* email change — fires on creation specifically so a new brand/buyer isn't missing from Notification's contact cache).
-- **Notification Service** publishes nothing and owns no outbox.
+**Asynchronous — Kafka** (each publisher owns an `outbox`, same local
+transaction as the business change):
+- **Order** publishes `PaymentConfirmed { order_id, buyer_id, brand_id, items: [{product_id, product_name, quantity, unit_price, subtotal}], amount }` — consumed by **Inventory** (needs only `order_id`, to confirm reservations) and **Notification** (needs the rest, for the receipt).
+- **Order** publishes `OrderCancelled { order_id, reason, buyer_id }`, `reason ∈ {RESERVATION_FAILED, PAYMENT_FAILED, PAYMENT_UNAVAILABLE, ORDER_EXPIRED}` — consumed by **Inventory** (releases every reservation for the order, any reason) and **Notification** (buyer only, and only for `PAYMENT_FAILED`/`ORDER_EXPIRED` — the two reasons determined after the buyer's request has closed; the other two are answered synchronously, and emailing them would give a deliberately cold service a bursty hot-path load).
+- **Identity** publishes `BrandUpserted { brand_id, email, updated_at }` / `UserUpserted { user_id, email, updated_at }` on creation and email change. `updated_at` is the **source-side** timestamp — required for Notification's out-of-order-safe upsert (§4).
+- **Inventory** and **Notification** publish nothing; Inventory is a pure consumer plus Feign responder.
 
-`StockReserved` was considered and dropped — reservation is already a
-synchronous Feign call whose response Order Service uses directly, so no
-consumer needs a duplicate event on the hottest write path.
+Every event is a **flat, bare payload** — no envelope, no `event_version`, no
+`event_id`. Adding a field is safe by default; the discipline is to only add
+optional fields and rename rather than repurpose one. **Every monetary field
+crosses as a JSON string** (`"3999.00"`, never a bare number) — applies to
+every Feign response too, not just Kafka. Kafka is at-least-once; every
+consumer is idempotent via unique constraints or a state-guarded write
+(§4), never via a claimed exactly-once guarantee.
 
-Kafka's at-least-once delivery means every consumer must be an idempotent
-consumer (check current state before applying a transition), not "exactly
-once" — enforced via unique constraints (`notification_log`,
-`stock_reservations`) plus the order state machine's terminal-state guard.
+**Dropped from the PRD's original seven:** `StockReserved`, `OrderCreated`,
+`PaymentInitiated`, `OrderConfirmed` — no consumer ever needed them, and any
+could be re-added cleanly. `ReservationExpired`, `PaymentFailed` — absorbed
+into `OrderCancelled`; re-adding either means re-splitting a death path that
+was deliberately unified.
 
 ## 4. Data Model Per Service
 
-### Order Service — finalized
+### Order Service
 ```
-orders(id, buyer_id, flash_sale_id, amount, status,
-       idempotency_key, payment_ref, created_at, updated_at)
+orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
+       payment_ref, expires_at, failure_detail, payment_reconciled_at,
+       created_at, updated_at)
   -- flash_sale_id: order-level — one order = exactly one brand's sale
-  -- amount: SUM(order_items.subtotal), snapshotted at creation
+  -- amount: SUM(order_items.subtotal), DECIMAL, NULL until the last item priced
+  -- status: CREATED | PENDING_PAYMENT | PAID | PAYMENT_FAILED
+  --         | ORDER_EXPIRED | PAYMENT_UNAVAILABLE | RESERVATION_FAILED
   -- idempotency_key: UNIQUE(buyer_id, idempotency_key)
-  -- payment_ref: Razorpay Clone's payment reference, nullable until initiate succeeds
+  -- payment_ref: NULL until initiate is saved; what the one-payment CAS matches on
+  -- expires_at: means two things by status — bounds the reserve loop while
+  --   CREATED, reset to the payment window on entering PENDING_PAYMENT
+  -- failure_detail: nullable, debug only — never drives state
+  -- payment_reconciled_at: nullable; set once the reconciliation sweep has
+  --   settled this order. Bounds and idempotency-guards the sweep
+  -- CHECK (status NOT IN ('PENDING_PAYMENT','PAID') OR amount IS NOT NULL)
+  -- index: (status, expires_at) expiry sweep; (status, payment_reconciled_at) reconciliation sweep
 
-order_items(id, order_id, product_id, quantity, unit_price, subtotal)
-  -- UNIQUE(order_id, product_id) — one line per product per order
+order_items(id, order_id, product_id, product_name, quantity, unit_price, subtotal)
+  -- UNIQUE(order_id, product_id)
+  -- all rows inserted up front; product_name/unit_price/subtotal (DECIMAL)
+  --   stay NULL until that item's reserve() returns them
+  -- product_name: snapshotted at reservation time, never resynced — a
+  --   receipt shows what was bought, not the product's current name
 
-saga_state(order_id, step, status, last_error, updated_at)
-  -- status: IN_PROGRESS | SUCCESS | FAILED | COMPENSATING
+refunds(id, order_id, payment_ref, amount, status, attempts,
+        next_retry_at, claimed_at, last_error, created_at, updated_at)
+  -- a command outbox (only consumer is Order itself) — not an event outbox
+  -- UNIQUE(payment_ref) — refunds are per payment, not per order
+  -- status: PENDING | PROCESSING | SUCCEEDED | NEEDS_MANUAL_REVIEW
+  -- amount: DECIMAL, from the webhook's reported amount
+  -- claimed_at: claim lease + fence token for the worker's finishing write
+  -- index: (status, next_retry_at)
 
 outbox(id, aggregate_id, event_type, payload_json, published, created_at)
+  -- index: (published, created_at)
 ```
 
-### Inventory Service — finalized
+### Inventory Service
 ```
 flash_sales(id, brand_id, name, start_time, end_time, status)
-  -- status: SCHEDULED | LIVE | ENDED | CANCELLED (stored, not derived)
-  -- OPEN: mechanism to move status SCHEDULED -> LIVE -> ENDED not yet designed
+  -- status: ACTIVE | CANCELLED only — SCHEDULED/LIVE/ENDED are computed, not
+  --   stored, since only cancellation is a fact no timestamp implies
+  -- liveness = status != 'CANCELLED' AND start_time <= now < end_time
+  --   half-open (inclusive start, exclusive end — SQL BETWEEN is wrong here);
+  --   `now` is the DATABASE's clock, evaluated in the same statement as the
+  --   stock decrement — app-side clocks would disagree at the boundary
+  -- CANCELLED is pre-start only: a sale cannot be cancelled once live, so
+  --   "cancelled sale with live orders" is unreachable, not unhandled
+  -- everything about a sale (price, start_time, end_time, cancellation) is
+  --   mutable pre-open and frozen after — a live sale always runs to end_time
+  -- index: (start_time, end_time)
 
 flash_sale_items(id, flash_sale_id, product_id, sale_price,
-                  total_stock, available_stock, version)
+                 total_stock, available_stock, version)
   -- UNIQUE(flash_sale_id, product_id)
+  -- sale_price: DECIMAL, immutable once the sale is live
   -- total_stock fixed (reporting); available_stock is the decremented counter
-  -- version: optimistic lock — this row is where concurrent decrement contention lives
-  -- OPEN: whether optimistic locking alone is sufficient under heavy contention,
-  --   vs. pessimistic locking or a Redis lock in front, is not yet decided/load-tested
+  -- version: optimistic lock — the contended row under concurrent decrement
+  -- OPEN: optimistic alone vs. pessimistic vs. Redis lock — decide + load-test
 
-stock_reservations(id, order_id, flash_sale_item_id, status, expires_at, ...)
+stock_reservations(id, order_id, flash_sale_item_id, status, reserved_at, ...)
   -- UNIQUE(order_id, flash_sale_item_id) — idempotent reserve on retry
-  -- insert-only per buyer, no version column (no concurrent-write contention here)
+  -- insert-only per buyer, no version column (no write contention here)
+  -- status: RESERVED -> CONFIRMED (on PaymentConfirmed) | RELEASED (on
+  --   OrderCancelled). CONFIRMED is never released — a PAID order can't
+  --   later produce an OrderCancelled
+  -- no expires_at: Inventory holds no deadline of its own — reserved_at
+  --   exists only for the reconciler, which asks Order rather than deciding
+  -- index: (status, reserved_at) reconciler; (order_id) confirm/release-all
 
 products(...)
-outbox(id, aggregate_id, event_type, payload_json, published, created_at)
 ```
+No `outbox` — Inventory publishes nothing.
 
-### Identity Service — finalized
+### Identity Service
 ```
 brands(id, name, email UNIQUE, password_hash, created_at, updated_at)
 api_keys(id, brand_id, key_hash UNIQUE, status ACTIVE|REVOKED, created_at)
-  -- separate from JWT session auth: long-lived machine credential vs short-lived human session
+  -- separate from JWT session auth: long-lived machine credential vs short-lived session
 users(id, name, email UNIQUE, password_hash, created_at, updated_at)
 outbox(id, aggregate_id, event_type, payload_json, published, created_at)
 ```
 
-### Notification Service — finalized
+### Notification Service
 ```
-notification_log(..., order_id, event_type, recipient_type, channel, status, sent_at)
-  -- UNIQUE(order_id, event_type, recipient_type, channel) — makes at-least-once
-  --   Kafka delivery idempotent at the consumer
+notification_log(..., order_id, event_type, recipient_type, channel, status,
+                  attempts, next_retry_at, sent_at)
+  -- UNIQUE(order_id, event_type, recipient_type, channel) — idempotent
+  --   consumer for at-least-once Kafka delivery
+  -- status: ... | FAILED | RETRYING. Capped backoff retry (5 attempts), then
+  --   stays FAILED permanently — no escalation; a missed courtesy email
+  --   needs nobody to act, unlike a stuck refund
+  -- claim before send: UPDATE ... SET status='RETRYING' WHERE status='FAILED'
+  --   (rows-affected checked) — a bare claim, not the refund worker's fenced
+  --   claim+lease. Defends ordinary multi-instance scheduling (a normal-
+  --   operation race), not crash recovery, which isn't worth building here
 
 brand_contacts(brand_id, email, updated_at)     -- fed by BrandUpserted
 buyer_contacts(user_id, email, updated_at)      -- fed by UserUpserted
-  -- OPEN (deliberately deferred): out-of-order upsert events could overwrite a
-  --   newer email with a stale one; retry_count/next_retry_at for FAILED sends
-  --   not yet designed
+  -- upsert is conditional: ON CONFLICT ... WHERE updated_at < EXCLUDED.updated_at
+  --   — correctness never depends on Kafka delivery order
 ```
 
-No service's schema currently has code behind it — see Section 7.
+No service's schema has code behind it yet — see §8.
 
-## 5. Order State Machine
+## 5. Cross-Service Relationships: IDs vs. Events
 
-States: `CREATED`, `PENDING_PAYMENT` (transient) → `PAID`, `PAYMENT_FAILED`,
-`ORDER_EXPIRED`, `PAYMENT_UNAVAILABLE` (four terminal states).
+Four services, four databases — every relationship crossing a boundary is
+either a plain ID or an event, never a foreign key (ordinary FKs still apply
+*within* a service). A **cross-service ID** — `orders.buyer_id`,
+`flash_sales.brand_id`, etc. — is a number with no constraint stopping it
+from going stale, resolved only when code looks it up (usually a Feign call).
+An **event** — `PaymentConfirmed`, `OrderCancelled`, `BrandUpserted` — is a
+fact published once and consumed on the consumer's own schedule, no shared
+column at all. The rule: an ID when the caller can't proceed without the
+answer *now*; an event when the producer doesn't need, or can't wait for, a
+reply. Every publisher (now Order and Identity) owns an outbox so the write
+and the publish can never come apart.
 
-- `CREATED → PENDING_PAYMENT`: gateway returns 202 Accepted.
-- `CREATED → PAYMENT_UNAVAILABLE`: circuit breaker open, gateway call never completes.
-- `PENDING_PAYMENT → PAID`: webhook reports payment success.
-- `PENDING_PAYMENT → PAYMENT_FAILED`: webhook reports payment failure.
-- `PENDING_PAYMENT → ORDER_EXPIRED`: TTL sweep (via Inventory's `ReservationExpired` event), buyer never paid in time.
+**5.1 Real FKs (same service):** Identity: `brands`→`api_keys`. Inventory:
+`flash_sales`→`flash_sale_items`, `products`→`flash_sale_items`,
+`flash_sale_items`→`stock_reservations`. Order: `orders`→`order_items`,
+`orders`→`refunds`, `orders`→`outbox`. Notification: none.
 
-`PAID` is terminal by design — Order Service never waits on Notification or
-any other downstream consumer to acknowledge before considering the order
-done, to preserve failure-independence between services. `CONFIRMED` and
-`RESERVED` from the original PRD sketch were dropped: nothing in any
-sequence diagram sets `CONFIRMED`, and `RESERVED` belongs to Inventory's
-`stock_reservations`, not to an Order-level state.
+**5.2 Cross-service IDs:**
 
-Every terminal state has an idempotent guard against late-arriving events: a
-late `FAILED`/`PAYMENT_UNAVAILABLE` webhook after any terminal state is a
-no-op; a late `SUCCESS` webhook arriving after `ORDER_EXPIRED` triggers a
-refund call to Razorpay Clone (via `orders.payment_ref`) as a compensating
-side effect, without changing the order's status back.
+| Column | Points at |
+|---|---|
+| `orders.buyer_id` | Identity `users.id` |
+| `orders.flash_sale_id` | Inventory `flash_sales.id` |
+| `order_items.product_id` | Inventory `products.id` |
+| `flash_sales.brand_id`, `products.brand_id` | Identity `brands.id` |
+| `stock_reservations.order_id`, `notification_log.order_id` | Order `orders.id` |
+| `brand_contacts.brand_id` | Identity `brands.id` |
+| `buyer_contacts.user_id` | Identity `users.id` |
 
-## 6. Key Architectural Decisions
+`orders.payment_ref` / `refunds.payment_ref` are external references to
+Razorpay Clone, not FlashMart cross-service IDs.
 
-Full context, options considered, and trade-offs for each of these live in
-`docs/decisions.md` — this section only names them and their consequence.
+**5.3 Event links:** `PaymentConfirmed` → Inventory (confirm) + Notification
+(receipt). `OrderCancelled` → Inventory (release-all) + Notification (buyer
+only, two reasons). `BrandUpserted`/`UserUpserted` → Notification (refresh
+caches). Inventory publishes nothing; its only outbound call is the
+synchronous status check in §3.
 
-- **Saga (orchestrated), not 2PC** — Order/Inventory/Payment consistency without holding cross-service locks open across a slow external HTTP call.
-- **TTL polling sweep, not Kafka delayed messages** — safety net for a payment webhook that never arrives.
-- **All-or-nothing reservation via a sequential per-item Feign loop** — not a batch endpoint — for multi-item orders; keeps Inventory's API unaware of multi-item concepts entirely.
-- **Optimistic-lock `version` on `flash_sale_items`, not `stock_reservations`** — the contended row is the shared stock counter, not a per-buyer insert-only row.
-- **Every event-publishing service owns an `outbox`** — Order, Inventory, and Identity each have one, written in the same local transaction as the business change, to avoid the dual-write problem.
-- **Idempotent consumers via unique constraints**, not application-level check-then-insert — closes races that check-then-insert can't.
-- **Brand/buyer email delivered to Notification via local contact caches fed by Kafka events**, not a synchronous call to Identity and not carried as dead-weight data through Inventory/Order.
+## 6. Order State Machine
 
-## 7. Current Status
+`CREATED` and `PENDING_PAYMENT` (transient) → five terminal states: `PAID`,
+`PAYMENT_FAILED`, `ORDER_EXPIRED`, `PAYMENT_UNAVAILABLE`, `RESERVATION_FAILED`.
 
-**Designed** (schema, diagrams, and state machines agreed; no code yet):
-- Everything in Sections 2–6 above, in full. This includes all five service
-  schemas, the order state machine, all communication-pattern decisions, and
-  every architectural decision in `docs/decisions.md`.
-- Sequence diagrams for: purchase happy path, payment-failure compensation,
-  reservation TTL expiry, circuit-breaker-open (confirmed present in the
-  FlashMart Notion log, Section 3).
-- Deferred/not-yet-drawn: outbound brand-webhook retry sequence, and
-  partial-item-reservation-failure compensation sequence. No
-  settlement/payout sequence exists (scope removed, not deferred).
+- `CREATED → PENDING_PAYMENT` — every item reserved, `amount` set, gateway returned 202. Saves `payment_ref`, resets `expires_at` to the payment window.
+- `CREATED → RESERVATION_FAILED` — an item was out of stock.
+- `CREATED → PAYMENT_UNAVAILABLE` — circuit breaker open on initiate.
+- `CREATED → ORDER_EXPIRED` — didn't finish the loop + initiate before its deadline.
+- `PENDING_PAYMENT → PAID` — webhook success *for the payment this order holds*.
+- `PENDING_PAYMENT → PAYMENT_FAILED` — webhook failure.
+- `PENDING_PAYMENT → ORDER_EXPIRED` — never paid within the window.
 
-**Implemented** (code exists): **None.** The repository currently contains
-only `docs/decisions.md`, `docs/requirements.md`, and `CLAUDE.md` — no
-service modules, entities, migrations, or build files were found anywhere
-in the repo as of this writing.
+**Every write to `orders.status` is a compare-and-set** — the request thread,
+the expiry sweep, the webhook handler, and the circuit-breaker path each
+issue a conditional update and check rows-affected, sharing one transaction
+with any outbox row produced. This is how races resolve without
+coordination: Order is the sole authority on an order's fate, so a race
+between the sweep and an arriving payment is decided by one atomic update on
+one row, and the loser knows it lost. Inventory never expires anything itself.
 
-**Tested:** None — there is no code to test yet.
+`PAID` is terminal by design — Order never waits on a downstream consumer.
+`CONFIRMED`/`RESERVED` were dropped from the original PRD sketch (nothing
+ever set them); `saga_state.COMPENSATING` was dropped on the same test
+(nothing would ever move an order out of it) — `saga_state` itself no longer
+exists.
 
-**Load-tested / verified under failure:** None. The NFR-P1–P4 performance
-targets (zero overselling under 5,000 concurrent buyers vs. 500 units, p99 <
-500ms buy-endpoint latency, zero duplicate charges, 100% eventual webhook
-delivery) remain unverified targets, per `docs/decisions.md`'s explicit
-decision to document them as such rather than as met-by-design.
+**One invariant governs every late or duplicate payment:** *an order keeps
+exactly one payment; every other captured payment is refunded.* For a
+`SUCCESS` webhook carrying reference `X`: CAS to `PAID` only if
+`status='PENDING_PAYMENT' AND payment_ref=X`; if that fails and the order is
+already `PAID` with `payment_ref=X`, it's a redelivery (no-op); otherwise
+refund `X` (from the webhook, not `orders.payment_ref`, which may be `NULL`
+if Order crashed before saving it). A late `FAILED` webhook needs no such
+care — its CAS simply matches zero rows, and nothing was captured. Refunds
+are never issued inline: the handler writes a `refunds` row in the same
+transaction as its failed CAS, and a worker drains it.
 
-**Notion log cross-check:** the FlashMart Notion page's own section
-headers for "API & Event Contracts," "JPA Entities & Repositories," "Feature
-Implementation," "Infra Wiring," "Testing Per Feature," and "Load Testing &
-Verification" are all present but empty. This agrees with the repo state —
-no discrepancy between what Notion claims and what the code shows.
+**A payment whose webhook never arrives at all** is caught by a second
+producer of `refunds` rows: a reconciliation sweep over unreconciled
+terminal-*failure* orders, asking the gateway what exists for that order's
+deterministic idempotency key (not `payment_ref`, `NULL` in exactly the crash
+window most likely to lack a webhook). `payment_reconciled_at` bounds and
+idempotency-guards the scan. `PAID` orders are never scanned — one accepted,
+permanent exception: see §9.
 
-## 8. Known Open Items / Next Steps
+## 7. Key Architectural Decisions
 
-Pulled directly from `docs/decisions.md`'s "Open Items" section — nothing
-below is invented:
+Full context and trade-offs live in `docs/decisions.md`.
 
-- Regenerate the four service ERDs from the issued prompts and re-check them against `docs/decisions.md`.
-- Update the PRD: drop `StockReserved`; add `ReservationExpired`, `BrandUpserted`, `UserUpserted`; Identity Service replaces Brand Service; three outboxes.
-- Define event payload shapes for `ReservationExpired`, `BrandUpserted`, `UserUpserted`, and the enriched `OrderCreated`/`PaymentConfirmed`.
-- Finalize Inventory's `reserve`/`release` API contract, including returning `brand_id` and translating the reservation UNIQUE violation into a success response.
-- Decide the locking strategy for the hot `flash_sale_items` row — optimistic alone, pessimistic, or a Redis lock in front — and load-test it, not assume it.
-- Design the mechanism that moves `flash_sales.status` through `SCHEDULED → LIVE → ENDED`.
-- Draw the partial-item-reservation-failure sequence diagram.
-- Decide the TTL sweep interval.
-- Design a webhook-never-arrives reconciliation path with Razorpay Clone.
-- Deliberately deferred: out-of-order upsert events overwriting newer emails in the Notification contact caches; retry tracking (`retry_count`, `next_retry_at`) for `FAILED` notifications.
+- **Saga (orchestrated), not 2PC** — no cross-service locks held across a slow external call.
+- **Order is the sole authority on an order's fate; every status write is a CAS** — races decided by one atomic update on one row, not by coordinating two services' clocks.
+- **One order-death event, `OrderCancelled{reason}`** — replaces a separate expiry event and a synchronous `release()`; Inventory reacts identically to every reason. Compensation is asynchronous — nothing waits on a release completing.
+- **`saga_state` dropped** — orchestration state lives on `orders`; a second copy would silently diverge from the four independent writers of `orders.status`.
+- **Scheduled polling sweep** for a payment webhook that never arrives — the mechanism survived Revision 3, the owning service (Order, not Inventory) changed.
+- **Webhook-never-arrives is closed by a reconciliation sweep** querying the gateway by idempotency key, not `payment_ref` — a second, independent producer of `refunds` rows.
+- **All-or-nothing reservation, sequential per-item Feign loop** — not a batch endpoint; Inventory stays unaware of multi-item orders.
+- **`reserve`'s evaluation order is contractual** — an existing reservation is returned before the liveness/stock gates, so a post-deadline retry can't wrongly cancel an order whose stock is already held.
+- **Optimistic-lock `version` on `flash_sale_items`, not `stock_reservations`** — the contended row is the shared counter, not a per-buyer insert-only row.
+- **Sale terms are immutable once live** — price, `start_time`/`end_time`, and cancellation all share one boundary: mutable pre-open, frozen after. A live sale always runs to its end; there is no emergency stop.
+- **Liveness is computed, never stored** — `status` shrinks to `ACTIVE|CANCELLED`; the drift problem is removed, not solved, by asking the two timestamps fresh every time, against the database's clock.
+- **An order keeps exactly one payment** — one CAS-enforced invariant, replacing an enumerated guard that had a hole.
+- **Refunds through a command-outbox table**, not Kafka — the only consumer is Order itself.
+- **Notification notifies only for the two asynchronous failure reasons** — the buyer is already told synchronously for the other two, and emailing all of them would give a cold service a hot-path load spike.
+- **Every event is a flat payload; money always crosses as a string** — no envelope, no version field, no `event_id`; discipline (add, never repurpose) does the job a version number would.
+- **Out-of-order `BrandUpserted`/`UserUpserted` is handled by a timestamp-conditional upsert**, not by requiring Kafka ordering — correctness never depends on delivery order.
+- **Notification's own retry is minimal by design** — capped backoff, a bare claim against concurrent instances, no fencing, no escalation; a missed email isn't a stuck refund.
+- **Every event-publishing service owns an outbox** — now Order and Identity only.
+- **Cross-service relationships are always an ID or an event, never a foreign key** — §5.
+- **Deadlines and leases are derived from the timeouts they race, never picked** — the `CREATED` deadline and refund claim lease stay open until real Feign/Resilience4j config exists.
+- **Outbound brand webhooks dropped, no replacement** — a pre-Revision-3 leftover with no FR behind it; would have been a third implementation of the signed-delivery-with-retry pattern already built twice (inbound payment webhook, refund worker), for a need nothing establishes.
 
-No PDF matching `FlashMart_Project_Plan_v2.pdf` (referenced in `CLAUDE.md`)
-was found in this repository at the time of writing — this document was
-built from `docs/decisions.md`, `docs/requirements.md`, `CLAUDE.md`, and the
-FlashMart Notion engineering log only.
+## 8. Current Status
+
+**Designed:** everything in §2–7, in full — all five schemas, the state
+machine, every communication pattern, every decision in `docs/decisions.md`
+through Revision 3.
+
+**Implemented:** none. The repository contains `CLAUDE.md` and the three
+`docs/` files only — no service modules, entities, migrations, or build files.
+
+**Tested / load-tested:** none — nothing exists to test. NFR-P1–P4 remain
+unverified targets by explicit decision, not by omission.
+
+**Diagrams and ERDs: current.** All sequence diagrams (including the two that
+were pre-Revision-3 and the two that never existed — reconciliation sweep,
+partial-item-failure) and all four ERDs now live in the Notion FlashMart page
+as Mermaid blocks, matching the current design. `docs/Flashmart.prd`
+(Revision 4) also matches, with one known gap: §6.5 undercounts Razorpay
+Clone's requirements (see §9).
+
+**Notion log cross-check:** its "API & Event Contracts" through "Load
+Testing & Verification" sections remain present but empty — consistent with
+the repo, since no code exists yet either. Its design sections (§1–5) are
+current as of this update; they are a personal engineering log, not
+themselves a second source of truth — `docs/decisions.md` remains authoritative
+on conflict.
+
+## 9. Known Open Items / Next Steps
+
+Mirrors `docs/decisions.md`. Nothing below needs more design thinking —
+each is blocked on something that doesn't exist yet, or is mechanical work.
+
+- **Accepted, permanently.** A second captured payment can escape correction
+  entirely if the initiate idempotency key ever fails to dedupe *and* a
+  webhook is separately lost — in the worse of two shapes, the order reaches
+  `PAID` and the sweep never examines it again, since it assumes a `PAID`
+  order's one payment is applied by definition. Requires three independent
+  rare failures to stack; the cost of building "list every payment for this
+  order" plus scanning `PAID` orders is judged not worth it against that
+  likelihood. This is the one place in the design that leans on prevention
+  rather than independent correction.
+- Settle the two derived deadlines (`CREATED`, refund claim lease), the
+  Order sweep interval, and the payment window — blocked on real
+  Feign/Resilience4j config by design.
+- Decide the locking strategy for `flash_sale_items` — optimistic alone,
+  pessimistic, or Redis — and load-test it. Paired with it: the transaction
+  isolation level on the same write path, undecided until now.
+- Build Razorpay Clone with the three behaviours this design leans on:
+  idempotency on `initiate` and `refund`, and a payment-status lookup
+  queryable by our idempotency key or order reference. Not built yet;
+  designed-not-verified until it is.
+
+The PRD is `docs/Flashmart.prd` (Revision 4, markdown). The earlier
+`FlashMart_Project_Plan_v3.pdf` reference was stale — no such file exists or
+ever existed in this repository.
