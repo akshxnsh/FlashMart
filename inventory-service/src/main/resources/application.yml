@@ -9,5 +9,11 @@ spring:
 
   jpa:
     hibernate:
+      # Temporarily 'create' to verify the datasource connects end-to-end.
+      # No @Entity classes exist yet, so this is a no-op today. It must be
+      # revisited before the JPA entities phase: how the schema actually gets
+      # created (Flyway/Liquibase migrations vs Hibernate DDL) is still an
+      # open decision, and 'create' would silently drop/recreate every mapped
+      # table on each boot once entities exist, diverging from docs/.
       ddl-auto: create
     show-sql: true
