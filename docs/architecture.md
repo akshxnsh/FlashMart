@@ -126,8 +126,9 @@ flash_sales(id, brand_id, name, start_time, end_time, status)
   --   stock decrement — app-side clocks would disagree at the boundary
   -- CANCELLED is pre-start only: a sale cannot be cancelled once live, so
   --   "cancelled sale with live orders" is unreachable, not unhandled
-  -- everything about a sale (price, start_time, end_time, cancellation) is
-  --   mutable pre-open and frozen after — a live sale always runs to end_time
+  -- everything about a sale (price, stock quantities, start_time, end_time,
+  --   cancellation) is mutable pre-open and frozen after — a live sale always
+  --   runs to end_time
   -- index: (start_time, end_time)
 
 flash_sale_items(id, flash_sale_id, product_id, sale_price,
@@ -282,7 +283,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **All-or-nothing reservation, sequential per-item Feign loop** — not a batch endpoint; Inventory stays unaware of multi-item orders.
 - **`reserve`'s evaluation order is contractual** — an existing reservation is returned before the liveness/stock gates, so a post-deadline retry can't wrongly cancel an order whose stock is already held.
 - **Optimistic-lock `version` on `flash_sale_items`, not `stock_reservations`** — the contended row is the shared counter, not a per-buyer insert-only row.
-- **Sale terms are immutable once live** — price, `start_time`/`end_time`, and cancellation all share one boundary: mutable pre-open, frozen after. A live sale always runs to its end; there is no emergency stop.
+- **Sale terms are immutable once live** — price, stock quantities (`total_stock`), `start_time`/`end_time`, and cancellation all share one boundary: mutable pre-open, frozen after. `available_stock` moves only through reserve/release/confirm, never through an edit. A live sale always runs to its end; there is no emergency stop.
 - **Liveness is computed, never stored** — `status` shrinks to `ACTIVE|CANCELLED`; the drift problem is removed, not solved, by asking the two timestamps fresh every time, against the database's clock.
 - **An order keeps exactly one payment** — one CAS-enforced invariant, replacing an enumerated guard that had a hole.
 - **Refunds through a command-outbox table**, not Kafka — the only consumer is Order itself.

@@ -2485,6 +2485,17 @@ nothing after.** One invariant to remember instead of three.
   application-level, rejected once `now >= start_time`.
 - Removes the "in-flight and paid orders on a cancelled sale" open item
   entirely; it is now an impossible state rather than an unhandled one.
+- **Stock quantities sit on the same boundary** (added when `flash_sale_items`
+  was written; the list above named price, times and cancellation but not
+  stock). `total_stock` is editable pre-open and frozen after — "stays fixed"
+  already implied it; this states it. `available_stock` changes only through
+  reserve, release and confirm, never through an edit, so no brand-facing
+  top-up or removal of stock mid-sale exists. Same enforcement point as the
+  other pre-open edits: application-level, rejected once `now >= start_time`,
+  checked against the database clock in the same transaction as the write.
+  Side effect worth knowing: no entity-flush write to `flash_sale_items` occurs
+  during a live sale, which leaves the `@Version`-vs-raw-SQL mixing hazard
+  reachable only at the open boundary itself.
 
 ---
 
@@ -3058,6 +3069,23 @@ fixed by writing a new forward migration, not by reverting the old one.
   interact directly — optimistic locking's safety depends on what isolation
   level sits underneath it — so they should be decided together, not as two
   separate open questions.
+- **The reserve write path is specified two different ways, and they are not
+  equivalent.** "Optimistic-lock `version` column on `flash_sale_items`" says
+  the decrement is `... WHERE id = ? AND version = ?`; "Inventory's `reserve`
+  API contract" (steps 4–5) says liveness and the stock check/decrement happen
+  in one statement against the database clock, which implies
+  `... WHERE available_stock >= ? AND <liveness>`. Under READ COMMITTED —
+  Postgres's default, and what the service currently runs — these behave very
+  differently. When an `UPDATE` unblocks after a concurrent writer commits,
+  Postgres re-evaluates the `WHERE` clause against the *newly committed* row
+  rather than the blocked transaction's stale snapshot. A value-based clause
+  therefore re-checks against fresh stock and cleanly matches zero rows when
+  stock ran out — correct with no retry. A `version = ?` clause always fails
+  after any concurrent write, turning every conflict into a retry, which is
+  the opposite of what the 5,000-concurrent target needs. Must be settled
+  before `reserve` is implemented; belongs with the locking-strategy and
+  isolation-level items above, which it interacts with directly. Recorded, not
+  decided — the strategy is to be load-tested, not assumed.
 - **Razorpay Clone is not built yet**, and three of its behaviours are
   requirements FlashMart's design leans on: idempotency keys honoured on
   `initiate`, idempotency keys honoured on `refund`, and a payment-status
