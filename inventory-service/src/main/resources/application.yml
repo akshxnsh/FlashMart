@@ -9,11 +9,8 @@ spring:
 
   jpa:
     hibernate:
-      # Temporarily 'create' to verify the datasource connects end-to-end.
-      # No @Entity classes exist yet, so this is a no-op today. It must be
-      # revisited before the JPA entities phase: how the schema actually gets
-      # created (Flyway/Liquibase migrations vs Hibernate DDL) is still an
-      # open decision, and 'create' would silently drop/recreate every mapped
-      # table on each boot once entities exist, diverging from docs/.
-      ddl-auto: create
+      # Flyway (see db/migration/) owns the schema. Hibernate only validates
+      # that @Entity mappings match what Flyway has already created — it
+      # never generates or mutates DDL. See docs/decisions.md.
+      ddl-auto: validate
     show-sql: true

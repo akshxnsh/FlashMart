@@ -2942,6 +2942,77 @@ None identified. Nothing currently depends on this existing.
 
 ---
 
+## Decision: Flyway (SQL-first migrations), not Hibernate `ddl-auto`, owns schema creation
+
+**Context / Problem:**
+`inventory-service` booted with `ddl-auto: create` as a deliberate, commented
+stopgap — just to verify the datasource connects end-to-end before any
+`@Entity` classes existed. That stopgap runs out the moment the JPA-entities
+phase starts: `create` drops and recreates every mapped table on each boot,
+and its safer-looking sibling `update` can't reliably express or evolve the
+constraints this schema actually needs — composite `UNIQUE`s
+(`UNIQUE(buyer_id, idempotency_key)`, `UNIQUE(order_id, flash_sale_item_id)`,
+`UNIQUE(payment_ref)`), `CHECK` constraints
+(`CHECK (status NOT IN ('PENDING_PAYMENT','PAID') OR amount IS NOT NULL)`),
+and the immutability/versioning behaviour `flash_sale_items.version` depends
+on. There are four services, each with its own database, all evolving schema
+across many further build phases (transactions/locking, outbox, Kafka) — none
+of that is reproducible across environments without a versioned history of
+exactly what ran and when.
+
+**Options Considered:**
+1. `ddl-auto: update` — Hibernate diffs entities against the live schema and
+   patches it. Never drops/renames columns safely, can't express `CHECK`
+   constraints or many composite unique constraints, and leaves no history of
+   what changed or why.
+2. `ddl-auto: create` / `create-drop` — fine for the pre-entity connectivity
+   check this project already used it for; unusable past that, since it wipes
+   data on every boot.
+3. **Flyway** — versioned, hand-written SQL migration files
+   (`V1__description.sql`, ...), tracked in a `flyway_schema_history` table
+   Flyway maintains itself; applies only new versions on boot, in order.
+4. Liquibase — same category as Flyway (versioned migrations), but
+   XML/YAML/JSON-first rather than SQL-first, and heavier tooling than this
+   project needs.
+
+**Chosen Approach:**
+Flyway, with hand-written SQL migrations under
+`src/main/resources/db/migration/`, one migration per schema change from here
+on. `ddl-auto` flips to `validate` — Hibernate only checks that `@Entity`
+mappings match what Flyway already created; it never generates or mutates
+DDL. Applies to `inventory-service` now; the same pattern is expected to be
+replicated in Order, Identity, and Notification Service when their own
+entity phases begin.
+
+**Why:**
+Full control over constraints/indexes that Hibernate's auto-diff can't
+express safely or at all. A real, inspectable history of every schema
+change, reproducible across Akshansh's machine, CI (once it exists), and any
+future environment — instead of the current schema being whatever Hibernate
+inferred from entities at that moment. Migration files are immutable once
+applied anywhere (Flyway checksums each file and errors on a mismatch),
+which forces schema changes to be additive and explicit rather than edited
+in place.
+
+**Trade-offs:**
+No auto-generation — every entity change needs a hand-written SQL migration
+alongside it, which is more upfront work than letting Hibernate infer DDL.
+Flyway Community has no built-in down-migration/rollback; a bad migration is
+fixed by writing a new forward migration, not by reverting the old one.
+
+**Consequences:**
+- Every future `@Entity` in every service pairs 1:1 with a migration file.
+  The `flash_sales` entity (next piece) is the first real one written.
+- `inventory-service/src/main/resources/db/migration/` now exists as an
+  empty, tracked directory establishing the convention; no `.sql` files yet
+  since no entities exist.
+- The locking-strategy decision for `flash_sale_items`
+  (`@Version`/pessimistic/Redis — still open, see Open Items) will itself
+  eventually need a migration once settled; Flyway doesn't resolve that
+  question, it just gives the eventual answer a clean place to land.
+
+---
+
 ## Open Items (not yet designed)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
