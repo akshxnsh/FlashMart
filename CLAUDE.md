@@ -126,7 +126,9 @@ Cross-service relationships are **always either a plain ID or an event, never a 
 
 Follow the phase plan (setup → architecture/requirements → schema → JPA entities → APIs/DTOs → reservation/payment → state machine → security → Redis caching → rate limiting → idempotency → transactions/locking → outbox → Kafka → webhooks → microservices/gateway → load testing). Don't jump ahead to a later phase's concern unless Akshansh explicitly asks.
 
-**Current position:** Inventory Service's four JPA entities are written and merged — `Product`, `FlashSale`, `FlashSaleItem`, `StockReservation` — on Flyway migrations V1–V5, booting and schema-validating against Postgres. No repositories, services or controllers yet; Order, Identity and Notification have no code at all.
+**Current position:** Inventory Service's four JPA entities are written and merged — `Product`, `FlashSale`, `FlashSaleItem`, `StockReservation` — on Flyway migrations V1–V5, booting and schema-validating against Postgres, with 15 persistence tests. Identity, Order and Notification are **scaffolded only**: Spring Boot 4.1.1 projects with the same dependency set, their own Postgres database, an empty `db/migration/`, and a fixed port; they boot but have no entities, migrations, repositories or controllers. Inventory has no repositories, services or controllers either.
+
+**Ports** (8080 reserved for the API Gateway, not built): identity `8081`, inventory `8082`, order `8083`, notification `8084`. All four share one `DB_USERNAME`/`DB_PASSWORD` pair against one local Postgres instance, but each owns a **separate database** — the "services never share a schema" rule still holds.
 
 ## Engineering discipline expected in this repo
 

@@ -1,3 +1,9 @@
+server:
+  # 8080 is reserved for the API Gateway. Each service gets a fixed port so
+  # all four can run at once: identity 8081, inventory 8082, order 8083,
+  # notification 8084.
+  port: 8082
+
 spring:
   application:
     name: inventory-service
