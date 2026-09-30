@@ -1,0 +1,22 @@
+server:
+  # 8080 is reserved for the API Gateway. Each service gets a fixed port so
+  # all four can run at once: identity 8081, inventory 8082, order 8083,
+  # notification 8084.
+  port: 8083
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/order-service
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      # Flyway (see db/migration/) owns the schema. Hibernate only validates
+      # that @Entity mappings match what Flyway has already created — it
+      # never generates or mutates DDL. See docs/decisions.md.
+      ddl-auto: validate
+    show-sql: true
