@@ -1185,6 +1185,25 @@ back the decrement too.
 Resolves the open question "whether the stock decrement and the reservation
 insert share one local transaction" — they must.
 
+**Addendum (added when the entity was written):** the row also carries
+`quantity`, which no earlier entry stated — the schema stub ended in `...` and
+hid it. It is not optional. `OrderCancelled { order_id, reason, buyer_id }`
+carries no item list, and there is no `release()` endpoint to pass one, so the
+held units exist **only** on these rows: release reads
+`WHERE order_id = ? AND status = 'RESERVED'` and adds each row's `quantity`
+back. The same column is what the replay check compares to distinguish a
+genuine retry from `409 QUANTITY_MISMATCH` (see "Inventory's `reserve` API
+contract"), so the contract already depended on it. Constraints:
+`quantity > 0`, matching `400 INVALID_QUANTITY`.
+
+The release path must flip `RESERVED → RELEASED` by CAS **first** and add back
+only the units whose rows actually flipped, in one transaction. At-least-once
+Kafka means a redelivered `OrderCancelled` would otherwise add the same units
+twice; the flip matching zero rows is what makes the redelivery a no-op. The
+`available_stock <= total_stock` CHECK is the last-resort net if that ordering
+is ever got wrong. Filtering on `status = 'RESERVED'` is also what enforces
+"CONFIRMED is never released".
+
 ---
 
 ## Decision: `total_stock` stays fixed; `available_stock` is the decremented counter
@@ -1388,6 +1407,17 @@ an email change and its event being applied.
 > `outbox(published, created_at)` index is gone with its outbox. Order gains
 > two: `orders(status, expires_at)` for its own sweep, and
 > `refunds(status, next_retry_at)` for the refund worker. See Revision 3 below.
+>
+> **A fourth, dropped when the entity was written:** the separate
+> `stock_reservations(order_id)` index for confirm/release-all. It was
+> redundant — `UNIQUE(order_id, flash_sale_item_id)` already creates an index
+> whose *leading* column is `order_id`, which Postgres uses for
+> `WHERE order_id = ?` on its own. Keeping both would add a second index write
+> to every reserve, the hottest insert path in the service, for no read
+> benefit. This does not weaken the rule below (define indexes alongside the
+> schema, each traceable to a named query); it applies it — the query has an
+> index, just not a dedicated one. To be revisited only if a real query plan
+> shows the composite index being declined.
 
 **Context / Problem:**
 Every brand API request looks up an API key by its hash, and none of the

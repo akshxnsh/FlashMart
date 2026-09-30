@@ -139,15 +139,20 @@ flash_sale_items(id, flash_sale_id, product_id, sale_price,
   -- version: optimistic lock — the contended row under concurrent decrement
   -- OPEN: optimistic alone vs. pessimistic vs. Redis lock — decide + load-test
 
-stock_reservations(id, order_id, flash_sale_item_id, status, reserved_at, ...)
+stock_reservations(id, order_id, flash_sale_item_id, quantity, status, reserved_at)
   -- UNIQUE(order_id, flash_sale_item_id) — idempotent reserve on retry
+  -- quantity: required by design — release (OrderCancelled carries no items)
+  --   must know how many units to add back, and the replay check compares it
+  --   to detect QUANTITY_MISMATCH
   -- insert-only per buyer, no version column (no write contention here)
   -- status: RESERVED -> CONFIRMED (on PaymentConfirmed) | RELEASED (on
   --   OrderCancelled). CONFIRMED is never released — a PAID order can't
   --   later produce an OrderCancelled
   -- no expires_at: Inventory holds no deadline of its own — reserved_at
   --   exists only for the reconciler, which asks Order rather than deciding
-  -- index: (status, reserved_at) reconciler; (order_id) confirm/release-all
+  -- index: (status, reserved_at) reconciler. No separate (order_id) index for
+  --   confirm/release-all: UNIQUE(order_id, flash_sale_item_id) already leads
+  --   with order_id, and an extra index only slows every reserve insert
 
 products(...)
 ```

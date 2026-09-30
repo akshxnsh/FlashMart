@@ -463,8 +463,10 @@ flash_sale_items(id, flash_sale_id, product_id, sale_price,
   -- version: optimistic lock -- THE contended row under concurrent decrement
   -- OPEN: optimistic alone vs. pessimistic vs. Redis lock -- decide + load-test (§10)
 
-stock_reservations(id, order_id, flash_sale_item_id, status, reserved_at, ...)
+stock_reservations(id, order_id, flash_sale_item_id, quantity, status, reserved_at)
   -- UNIQUE(order_id, flash_sale_item_id) -- idempotent reserve on retry
+  -- quantity: required -- OrderCancelled names only the order, so the release path
+  --   reads the held units from here; the replay check also compares it for 409
   -- insert-only per buyer, no version column (no write contention here)
   -- status: RESERVED -> CONFIRMED (on PaymentConfirmed) | RELEASED (on OrderCancelled)
   --   CONFIRMED is never released -- a PAID order cannot later produce an OrderCancelled
@@ -545,7 +547,6 @@ Each index is derived from a **named** query, not added defensively.
 | Order, Identity | `outbox(published, created_at)` | Outbox relay: unpublished events in order |
 | Inventory | `flash_sales(start_time, end_time)` | Liveness / sale listing |
 | Inventory | `stock_reservations(status, reserved_at)` | Stale-reservation reconciler |
-| Inventory | `stock_reservations(order_id)` | Confirm / release all items of an order |
 | Identity | `UNIQUE(api_keys.key_hash)` | API-key lookup on every brand API request |
 | Notification | `UNIQUE(order_id, event_type, recipient_type, channel)` | Duplicate-delivery detection |
 
