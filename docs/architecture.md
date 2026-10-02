@@ -237,6 +237,13 @@ outbox(id, aggregate_id, event_type, payload_json, created_at,
   --   the index stays tiny. Same shape applies to Order's outbox
   -- aggregate_id has no FK: it names a brand OR a user, told apart by
   --   event_type, so a query by aggregate_id alone is wrong
+  -- CHECK (event_type IN ('BrandUpserted','UserUpserted')) — the whole
+  --   interpretation of aggregate_id rests on event_type, so an unconstrained
+  --   string made it uninterpretable on a typo AND produced an event no
+  --   consumer recognises, both silently. NOT an aggregate_type column: that
+  --   is derivable from event_type, and a second copy of derivable state is
+  --   what saga_state was dropped for. Adding an event type now needs a
+  --   migration, which keeps that decision explicit
   -- THE RELAY MUST CLAIM WITH `FOR UPDATE SKIP LOCKED`. Two relay instances
   --   is ordinary scaling, and without a claim both read the same unsent rows
   --   and both publish them. SKIP LOCKED makes the second step over rows the
@@ -404,7 +411,7 @@ through Revision 3.
   column is `TIMESTAMPTZ`, read as `Instant` (V6 converted the original
   zone-less `TIMESTAMP`; see §9).
 - **Identity Service** — complete: `Brand`, `User`, `ApiKey` and
-  `OutboxEvent` on migrations V1–V6, including the `bump_updated_at` trigger
+  `OutboxEvent` on migrations V1–V7, including the `bump_updated_at` trigger
   attached to both identity tables.
 - **Order, Notification** — scaffolded only: Spring Boot projects, own
   database, fixed port, empty `db/migration/`. No entities.
@@ -412,8 +419,8 @@ through Revision 3.
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 17 entity and time-zone tests in Inventory and 43 in Identity (19 and
-45 including a context test and the zone-less-timestamp guard that every service
+**Tested:** 17 entity and time-zone tests in Inventory and 45 in Identity (19 and
+47 including a context test and the zone-less-timestamp guard that every service
 now carries; Order and Notification have the guard and a context test), each saving
 into real Postgres inside a rolled-back transaction; every CHECK, unique key
 and FK is verified to reject bad rows, not merely to exist. The tests can

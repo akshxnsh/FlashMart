@@ -3078,7 +3078,7 @@ fixed by writing a new forward migration, not by reverting the old one.
 **Consequences:**
 - Every future `@Entity` in every service pairs 1:1 with a migration file.
   *(Done for Inventory: migrations V1–V6 for its four entities; for Identity,
-  V1–V6 for `brands`, `users`, `api_keys`, `outbox` and the `bump_updated_at` trigger function. Order and
+  V1–V7 for `brands`, `users`, `api_keys`, `outbox` and the `bump_updated_at` trigger function. Order and
   Notification have an empty `db/migration/` and no entities yet.)*
 - `db/migration/` exists in every service, establishing the convention.
 - **Correction found when this was first booted:** the Flyway *library*
@@ -3362,6 +3362,36 @@ earlier entry got wrong by omission:**
 No FK is possible, and any query by `aggregate_id` alone is wrong without
 `event_type` beside it. A test asserts brand 7 and user 7 can coexist.
 
+**Examined on its own and found not to be a data bug (2026-10-02).** The
+payloads carry the *typed* id — `BrandUpserted {"brand_id": 12, …}`,
+`UserUpserted {"user_id": 7, …}` — and Notification reads the payload, never
+`aggregate_id`, so nothing today reads the ambiguous column. The mapping
+`event_type → aggregate type` is many-to-one and always decidable, so the data
+is unambiguous; what is real is a trap for a *future* query.
+
+**Options considered, and the one rejected on principle:** an `aggregate_type`
+column (`BRAND`/`USER`) is the obvious fix and the wrong one — it is **fully
+derivable from `event_type`**, so it is a second copy of existing state that can
+drift from the first, needing a `CHECK` tying them together to store nothing new.
+That is exactly why `saga_state` was dropped. Globally unique ids shared between
+`brands` and `users` would also work but change two built tables for a problem no
+code has.
+
+**Chosen, as the least change that makes the disambiguation real:**
+`CHECK (event_type IN ('BrandUpserted','UserUpserted'))`. `event_type` was any
+string up to 50 characters, and the entire interpretation of `aggregate_id`
+rests on it: a typo (`BrandUpdated`, `brandupserted`) left `aggregate_id`
+pointing at nothing identifiable *and* produced an event no consumer
+recognises, both silently. Pinning the vocabulary makes "`event_type`
+determines the aggregate type" guaranteed rather than conventional. One
+`ALTER TABLE`, no new column, no entity change.
+
+**Trade-off:** adding an event type now needs a migration. Proportionate here —
+the system's event list was deliberately cut to four and each addition is a
+documented decision, so the migration keeps that decision explicit rather than
+letting a new event type appear by free-text. Order's outbox should take the
+same constraint with its own vocabulary (`PaymentConfirmed`, `OrderCancelled`).
+
 **The security rule no constraint can carry:** authentication looks up
 `WHERE key_hash = ?`, and the revoked row is still present, so it **must** add
 `AND status = 'ACTIVE'`. Without it a revoked key keeps working, which is the
@@ -3478,6 +3508,7 @@ skipped.
 | `api_keys` | `revoked_at` NULL iff `status = 'ACTIVE'` | the revocation code setting both together |
 | `outbox` | `attempts >= 0` | the relay's own increment |
 | `outbox` | `length(btrim(event_type)) > 0` | the publishing code |
+| `outbox` | `event_type IN ('BrandUpserted','UserUpserted')` | **nothing** — `aggregate_id` is interpretable only through `event_type`, and a typo'd name would otherwise be stored silently and consumed by no one |
 | `outbox` | `payload_json` is `JSONB`, so invalid JSON is rejected at write time | the serializer |
 
 **Two lessons recorded with it:**
@@ -3599,15 +3630,33 @@ Neither check exercises behaviour.
    | `users` trigger dropped | the two `updated_at` tests |
    | `start_time` returned to zone-less | both time-zone tests, with the wrong answers |
    | a zone-less column added to `products` | the guard test, naming `products.promo_starts_at` |
+   | the two `outbox` CHECKs dropped | exactly those two tests |
+   | **the `outbox` partial index dropped** | **nothing — see below** |
 
-3. **A control accompanies any test that asserts the absence of a bug.**
+   A mutation that changes a *column type* is too blunt to isolate anything:
+   `validate` then fails and every test in the class errors at startup rather
+   than the one guarding that property. Drop the constraint, not the type.
+
+3. **Known gap, accepted and left as is: no test guards an index.** Dropping
+   `idx_outbox_unpublished` broke no test, because the relay's query still
+   returns the right rows — just by scanning the table instead of the index.
+   Every assertion here is about *correctness*, and an index is a
+   *performance* property, invisible at ten rows and painful at ten million.
+   So a later change that removed the partial index, or replaced it with an
+   ordinary one over every row, would leave the suite green. The same is true
+   of every other index in the project. A test reading `pg_indexes` could close
+   it; that is deliberately **not** built, because the cost it guards against
+   is unmeasured until load testing, and the load tests are where an index
+   regression should surface with real numbers rather than as an assertion
+   about schema shape. Recorded so it is a known limit rather than a surprise.
+4. **A control accompanies any test that asserts the absence of a bug.**
    `TimeZoneConsistencyTest` includes a zone-less temporary table asserting the
    bug *does* reproduce there, so the real assertions cannot pass for the wrong
    reason.
-4. **Tests that depend on a database property use an adversarial input.** The
+5. **Tests that depend on a database property use an adversarial input.** The
    trigger test seeds a row whose `updated_at` is an hour *ahead* of the clock;
    an ordinary row cannot distinguish "old + 1 µs" from "copy the clock".
-5. **`NoZoneLessTimestampsTest` exists in all four services.** It reads
+6. **`NoZoneLessTimestampsTest` exists in all four services.** It reads
    `information_schema` and fails, naming the column, if any `public` column is
    `timestamp without time zone` (excluding Flyway's own table). It turns the
    `TIMESTAMPTZ` rule from a convention into a check, and applies to Order and
@@ -3625,7 +3674,7 @@ Neither check exercises behaviour.
 
 **Consequences:**
 Totals: Inventory 19 (17 entity and time-zone tests, the guard, a context test),
-Identity 45 (43, the guard, a context test), Order and Notification 2 each. All
+Identity 47 (45, the guard, a context test), Order and Notification 2 each. All
 persistence behaviour above is *tested*, not load-tested or verified under
 concurrency — no `reserve` exists to test.
 
