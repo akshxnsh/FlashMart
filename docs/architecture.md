@@ -123,6 +123,11 @@ outbox(id, aggregate_id, event_type, payload_json, published, created_at)
 flash_sales(id, brand_id, name, start_time, end_time, status)
   -- status: ACTIVE | CANCELLED only — SCHEDULED/LIVE/ENDED are computed, not
   --   stored, since only cancellation is a fact no timestamp implies
+  -- start_time/end_time are TIMESTAMPTZ (Instant): one absolute moment fixed
+  --   at write time. A zone-less TIMESTAMP compared against now() is read
+  --   using the CONNECTION's TimeZone, so two pods could disagree about the
+  --   same sale at the same instant — hence "now is the database's clock"
+  --   alone was never sufficient; the column type has to agree too
   -- liveness = status != 'CANCELLED' AND start_time <= now < end_time
   --   half-open (inclusive start, exclusive end — SQL BETWEEN is wrong here);
   --   `now` is the DATABASE's clock, evaluated in the same statement as the
@@ -351,16 +356,19 @@ through Revision 3.
 
 **Implemented:**
 - **Inventory Service** — all four entities (`Product`, `FlashSale`,
-  `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V5.
-- **Identity Service** — `Brand` on migrations V1–V2, including the
-  `bump_updated_at` trigger. `users`, `api_keys` and `outbox` are not written.
+  `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V6. Every time
+  column is `TIMESTAMPTZ`, read as `Instant` (V6 converted the original
+  zone-less `TIMESTAMP`; see §9).
+- **Identity Service** — `Brand` and `User` on migrations V1–V4, including the
+  `bump_updated_at` trigger attached to both. `api_keys` and `outbox` are not
+  written.
 - **Order, Notification** — scaffolded only: Spring Boot projects, own
   database, fixed port, empty `db/migration/`. No entities.
 - **Not built anywhere:** repositories, services, controllers, the API
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 15 persistence tests in Inventory and 8 in Identity, each saving
+**Tested:** 17 persistence tests in Inventory and 22 in Identity, each saving
 into real Postgres inside a rolled-back transaction; every CHECK, unique key
 and FK is verified to reject bad rows, not merely to exist. The tests can
 fail: weakening `reserved_at`'s mapping and the `updated_at` trigger each
@@ -407,16 +415,16 @@ each is blocked on something that doesn't exist yet, or is mechanical work.
 - Decide the locking strategy for `flash_sale_items` — optimistic alone,
   pessimistic, or Redis — and load-test it. Paired with it: the transaction
   isolation level on the same write path, undecided until now.
-- **Convert Inventory's timestamp columns to `TIMESTAMPTZ` — next piece.**
-  `flash_sales.start_time`/`end_time`, `stock_reservations.reserved_at` and
-  `products`' audit columns are zone-less `TIMESTAMP`. Comparing one against
-  `now()` (which is `TIMESTAMPTZ`) makes Postgres fill the gap from the
-  *connection's* `TimeZone` setting, so the same row at the same instant gives
-  different liveness answers on two connections — demonstrated on the live
-  schema: a sale starting `10:00` read as open in `Asia/Kolkata` and not open
-  in `UTC`. That is the two-clocks problem the DB-clock rule exists to remove,
-  reintroduced through the column type. Identity already uses
-  `TIMESTAMPTZ`/`Instant`; Inventory must match before `reserve` is built.
+- **Inventory's time columns are `TIMESTAMPTZ` — done (V6), recorded here
+  because it constrains `reserve`.** `flash_sales.start_time`/`end_time`,
+  `stock_reservations.reserved_at` and `products`' audit columns were zone-less
+  `TIMESTAMP`. Comparing one against `now()` (a `TIMESTAMPTZ`) makes Postgres
+  fill the gap from the *connection's* `TimeZone` setting, so the same row at
+  the same instant gave different liveness answers on two connections — a
+  sale starting `10:00` read as open in `Asia/Kolkata` and not open in `UTC`.
+  That was the two-clocks problem the DB-clock rule exists to remove,
+  reintroduced through the column type. Any new time column must be
+  `TIMESTAMPTZ`; never compare a zone-less column against `now()`.
 - **Settle how `reserve` writes the decrement.** Two decision entries specify
   it incompatibly: `WHERE id = ? AND version = ?` versus one statement
   checking `available_stock` and liveness against the database clock. Under

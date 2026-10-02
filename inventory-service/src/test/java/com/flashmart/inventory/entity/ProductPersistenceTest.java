@@ -7,7 +7,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -43,8 +43,8 @@ class ProductPersistenceTest {
         entityManager.persist(product);
         entityManager.flush();
 
-        LocalDateTime createdAt = product.getCreatedAt();
-        LocalDateTime firstUpdatedAt = product.getUpdatedAt();
+        Instant createdAt = product.getCreatedAt();
+        Instant firstUpdatedAt = product.getUpdatedAt();
 
         Thread.sleep(20);
         product.setName("Update Probe Renamed");

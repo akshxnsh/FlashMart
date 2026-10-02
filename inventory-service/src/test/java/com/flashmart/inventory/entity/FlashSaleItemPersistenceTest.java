@@ -8,7 +8,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -33,8 +33,8 @@ class FlashSaleItemPersistenceTest {
         FlashSale sale = new FlashSale();
         sale.setBrandId(1L);
         sale.setName("Item Probe Sale");
-        sale.setStartTime(LocalDateTime.of(2030, 1, 1, 10, 0));
-        sale.setEndTime(LocalDateTime.of(2030, 1, 1, 12, 0));
+        sale.setStartTime(Instant.parse("2030-01-01T10:00:00Z"));
+        sale.setEndTime(Instant.parse("2030-01-01T12:00:00Z"));
         sale.setStatus(FlashSaleStatus.ACTIVE);
         entityManager.persist(sale);
 

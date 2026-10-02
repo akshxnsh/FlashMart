@@ -8,7 +8,7 @@
 >
 > **Status note:** everything here is *designed*, not implemented or tested,
 > unless an entry says otherwise. As of 2026-10-02 the exceptions are the
-> schema decisions for Inventory's four tables and Identity's `brands`, which
+> schema decisions for Inventory's four tables and Identity's `brands` and `users`, which
 > are implemented as entities on Flyway migrations and persistence-tested
 > against real Postgres; their entries are marked where that changed the
 > record. Nothing is load-tested, and no `reserve`, API, Kafka or Redis code
@@ -3073,8 +3073,8 @@ fixed by writing a new forward migration, not by reverting the old one.
 
 **Consequences:**
 - Every future `@Entity` in every service pairs 1:1 with a migration file.
-  *(Done for Inventory: migrations V1–V5 for its four entities; for Identity,
-  V1–V2 for `brands` and the `bump_updated_at` trigger function. Order and
+  *(Done for Inventory: migrations V1–V6 for its four entities; for Identity,
+  V1–V4 for `brands`, `users` and the `bump_updated_at` trigger function. Order and
   Notification have an empty `db/migration/` and no entities yet.)*
 - `db/migration/` exists in every service, establishing the convention.
 - **Correction found when this was first booted:** the Flyway *library*
@@ -3175,6 +3175,70 @@ the already-decided event shape and Notification's guard unchanged.
 - Verified, not assumed: a test seeds a row whose `updated_at` is an hour ahead
   of the clock, updates it, and asserts the new time is still later; weakening
   the function to plain `clock_timestamp()` fails exactly that test.
+
+---
+
+## Decision: Every time column is `TIMESTAMPTZ`/`Instant`; Inventory's zone-less columns converted by a forward migration
+
+> **Note:** the "`updated_at` on `brands`/`users`" entry above chose
+> `TIMESTAMPTZ` for Identity on the grounds that its comparison was "the one
+> place a zone-less timestamp could silently skew". That was wrong: Inventory's
+> liveness check is the same class of comparison and was the worse instance.
+
+**Context / Problem:**
+Inventory's `flash_sales.start_time`/`end_time`, `stock_reservations.reserved_at`
+and `products`' audit columns were zone-less `TIMESTAMP`, mapped to
+`LocalDateTime`. A zone-less value carries no label for whose clock it is, so
+comparing it against `now()` (a `TIMESTAMPTZ`) makes Postgres guess from the
+**connection's** `TimeZone` setting. Demonstrated on the live schema: a sale
+starting `10:00` read as open from an `Asia/Kolkata` connection and not open
+from a `UTC` one — same row, same instant. Two Inventory pods with different
+connection settings would disagree about whether a sale is live. That is
+exactly the two-clocks problem "`now` is the database's clock" was adopted to
+remove, reintroduced through the column type, and it sits under the core
+no-overselling guarantee.
+
+**Options Considered:**
+1. A new migration, `ALTER COLUMN ... TYPE TIMESTAMPTZ USING <col> AT TIME ZONE
+   '<zone>'`.
+2. Edit V1/V3/V5 in place and drop and recreate the local database. Cleaner
+   history, but rewrites migration files already pushed, against the
+   never-edit-an-applied-migration rule.
+3. Leave the columns and set every connection's `TimeZone` explicitly. Fixes
+   the symptom by convention, and a missed connection reintroduces the bug
+   silently.
+
+**Chosen Approach:**
+Option 1, as `V6`. Every time column in every service is `TIMESTAMPTZ`, read as
+`Instant`. `USING ... AT TIME ZONE` *names* the zone the old values meant
+instead of inheriting the connection's, which is what makes the conversion
+identical on every machine. The tables held no rows, so the zone chosen
+(`UTC`) could not shift data; had they held rows, the correct zone would have
+to be established from what the application wrote (`LocalDateTime` carries
+none — it is whatever the JVM's zone was at save time), not assumed.
+
+**Why:**
+`TIMESTAMPTZ` settles the zone once, at write time, into one absolute moment;
+a comparison then involves two absolute moments and the connection's setting
+only affects display. Option 3 depends on every connection being configured
+correctly forever. Option 2 would have been defensible on empty tables but
+forms a habit the rule exists to prevent.
+
+**Trade-offs:**
+- `LocalDateTime` → `Instant` changes every entity field and test that touched
+  these columns.
+- `Instant` has no zone to display; anything user-facing must format it in the
+  viewer's zone, which is correct but is now an API-phase concern.
+
+**Consequences:**
+- A new time column must be `TIMESTAMPTZ`. Comparing a zone-less column against
+  `now()` is never acceptable.
+- `TimeZoneConsistencyTest` pins the behaviour: an open and a not-yet-started
+  sale are read identically from `Asia/Kolkata`, `UTC`, `America/Los_Angeles`
+  and `Pacific/Auckland` connections, and a control on a zone-less temporary
+  table asserts the bug *does* reproduce there, so the test cannot pass for
+  the wrong reason. Putting `start_time` back to zone-less made both real tests
+  fail with exactly the wrong answers; restoring it passed all 18.
 
 ---
 

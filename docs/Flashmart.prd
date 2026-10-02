@@ -5,7 +5,7 @@
 Prepared by Akshansh · **Revision 4 — September 2026** (supersedes Revision 3, September 2026)
 
 > **Status of this document.** The design is **designed**; only the entity layer exists.
-> Implemented and persistence-tested: Inventory's four entities and Identity's `brands`, on Flyway
+> Implemented and persistence-tested: Inventory's four entities and Identity's `brands` and `users`, on Flyway
 > migrations. Order and Notification are scaffolded only; no repositories, services, controllers,
 > gateway, Kafka, Redis or security exist anywhere. Nothing is load-tested or verified under
 > failure. Section 8's metrics are **targets until measured**. Details in §9.
@@ -404,7 +404,7 @@ Kafka -> Notification : BrandUpserted -> upsert brand_contacts
 ## 4. Data Model Per Service
 
 All five schemas are final at design level. **Code exists for Inventory's four tables and
-Identity's `brands` only** (§9).
+Identity's `brands` and `users` only** (§9).
 Cross-service references are plain IDs with no DB-level foreign key.
 
 ### 4.1 Order Service
@@ -677,7 +677,7 @@ Mapped session-for-session to the Coding Shuttle Razorpay Clone cohort schedule.
 | 2 | Gateway internals & diagrams | Architecture + purchase-flow sequence diagrams | Done; current (§9) |
 | 3 | Requirement gathering | `docs/requirements.md` | Done; checked against Revision 3 on 2026-10-02 — behavioural only, no stale mechanism in it |
 | 4 | Schema design | All five schemas + ERDs | **Done** — ERDs regenerated and kept in sync as entities are written |
-| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities and Identity's `Brand` done; `users`, `api_keys`, `outbox`, all of Order, all of Notification remain. No repositories yet |
+| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities and Identity's `Brand` and `User` done; `api_keys`, `outbox`, all of Order, all of Notification remain. No repositories yet |
 | 7–8 | Merchant API — signup, API key | Identity Service: brand + buyer signup/login, brand API key generation, `BrandUpserted` / `UserUpserted` outbox rows | |
 | 9 | Order APIs with MapStruct | Order creation/status/list APIs, multi-item request/response, DTO↔entity mapping | |
 | 10 | Payment Initiate API, Strategy | Reserve endpoint + Order's per-item loop, all-or-nothing, contractual evaluation order | |
@@ -730,8 +730,8 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 | | |
 |---|---|
 | **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` through Revision 3 |
-| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V5. **Identity:** `Brand`, Flyway V1–V2, including the `bump_updated_at` trigger. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
-| **Tested** | 15 persistence tests in Inventory, 8 in Identity, each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
+| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** `Brand` and `User`, Flyway V1–V4, including the `bump_updated_at` trigger attached to both. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
+| **Tested** | 17 persistence tests in Inventory, 22 in Identity, each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
 | **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
 | **Verified under failure** | None |
 
@@ -787,8 +787,8 @@ on prevention rather than independent correction.**
 - Identity, for the API phase: a lost signup race must read "email already taken", not a 500;
   the JWT must say whether its subject is a brand or a user; published `outbox` rows need a
   cleanup job.
-- Continue Sessions 5–6: Identity's `users`, `api_keys`, `outbox`; then Order's four tables and
-  Notification's three; then repositories. Inventory and Identity's `brands` are done.
+- Continue Sessions 5–6: Identity's `api_keys` and `outbox`; then Order's four tables and
+  Notification's three; then repositories. Inventory and Identity's `brands` and `users` are done.
 
 ---
 

@@ -14,7 +14,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 @Entity
 @Table(name = "stock_reservations", uniqueConstraints = {
@@ -44,5 +44,5 @@ public class StockReservation {
     private StockReservationStatus status;
 
     @Column(name = "reserved_at", nullable = false, insertable = false, updatable = false)
-    private LocalDateTime reservedAt;
+    private Instant reservedAt;
 }
