@@ -3074,7 +3074,7 @@ fixed by writing a new forward migration, not by reverting the old one.
 **Consequences:**
 - Every future `@Entity` in every service pairs 1:1 with a migration file.
   *(Done for Inventory: migrations V1–V6 for its four entities; for Identity,
-  V1–V4 for `brands`, `users` and the `bump_updated_at` trigger function. Order and
+  V1–V5 for `brands`, `users`, `api_keys` and the `bump_updated_at` trigger function. Order and
   Notification have an empty `db/migration/` and no entities yet.)*
 - `db/migration/` exists in every service, establishing the convention.
 - **Correction found when this was first booted:** the Flyway *library*
@@ -3293,6 +3293,37 @@ rows is a cost that grows forever.
 - `JSONB` normalises key order and whitespace, so the stored text is not
   byte-identical to what was written. Nothing reads it as text.
 
+**Extended when `api_keys` was written (2026-10-02).** Choosing SHA-256 settled
+the algorithm but not its *written form*, and hex has two of them. Postgres
+compares text exactly, so `A3F…` and `a3f…` are different strings: a key stored
+one way and hashed the other on lookup is simply never found, the brand is told
+its valid key is invalid, and `UNIQUE(key_hash)` never sees the duplicate — the
+same shape as the case-sensitive email bug. `CHECK (key_hash ~ '^[0-9a-f]{64}$')`
+pins it to 64 lowercase hex characters, and the same check rejects two worse
+mistakes: a **raw unhashed key** (anyone reading the database could then use the
+keys directly) and a **bcrypt hash**, which is 60 characters starting `$2a$` and,
+being salted, could never be looked up by equality at all — so the wrong
+algorithm fails at the first write instead of silently breaking every lookup.
+
+**`revoked_at` added, and tied to `status`.** Keeping revoked rows was justified
+as "the row is the audit trail", but `created_at` alone never says *when* a key
+was revoked. `revoked_at` is NULL while `ACTIVE` and set on revocation, with
+`CHECK ((status = 'ACTIVE' AND revoked_at IS NULL) OR (status = 'REVOKED' AND
+revoked_at IS NOT NULL))` so the two can never disagree — a half-applied
+revocation is rejected rather than stored.
+
+**Several `ACTIVE` keys per brand are allowed**, deliberately: rotation means
+issuing the new key, moving traffic, then revoking the old one, which is
+impossible if a brand may hold only one. **No index on `brand_id`** — listing a
+brand's keys is rare and the table is tiny; the hot path is the
+`UNIQUE(key_hash)` lookup.
+
+**The security rule no constraint can carry:** authentication looks up
+`WHERE key_hash = ?`, and the revoked row is still present, so it **must** add
+`AND status = 'ACTIVE'`. Without it a revoked key keeps working, which is the
+one thing revocation exists to prevent. This is a property of the query, not of
+the schema, so it is recorded here and belongs to the API phase.
+
 **Consequences:**
 - `users` reuses `bump_updated_at()` and the same email rules as `brands`.
 - For the API phase, not the schema: a lost signup race must surface as "email
@@ -3398,7 +3429,9 @@ skipped.
 | `stock_reservations` | status in the three states; `UNIQUE(order_id, flash_sale_item_id)` | the enum; idempotent reserve |
 | `products` | `UNIQUE(brand_id, name)` | — |
 | `brands`, `users` | email already lowercase and trimmed; `length(email) > 0`; an `@` with something on each side; `length(btrim(name)) > 0`; `UNIQUE(email)` | the entity's normalising setter; Bean Validation at the API |
-| `api_keys` (designed) | `status IN ('ACTIVE','REVOKED')`; `UNIQUE(key_hash)` | the enum |
+| `api_keys` | `status IN ('ACTIVE','REVOKED')`; `UNIQUE(key_hash)` | the enum |
+| `api_keys` | `key_hash ~ '^[0-9a-f]{64}$'` | **nothing** — the hashing code is the only other guard, and an uppercase hash or a bcrypt hash would otherwise fail silently at lookup time |
+| `api_keys` | `revoked_at` NULL iff `status = 'ACTIVE'` | the revocation code setting both together |
 
 **Two lessons recorded with it:**
 - **The ceiling matters more than the floor.** The floor has two guards (`reserve`'s
@@ -3545,7 +3578,7 @@ Neither check exercises behaviour.
 
 **Consequences:**
 Totals: Inventory 19 (17 entity and time-zone tests, the guard, a context test),
-Identity 24 (22, the guard, a context test), Order and Notification 2 each. All
+Identity 35 (33, the guard, a context test), Order and Notification 2 each. All
 persistence behaviour above is *tested*, not load-tested or verified under
 concurrency — no `reserve` exists to test.
 
