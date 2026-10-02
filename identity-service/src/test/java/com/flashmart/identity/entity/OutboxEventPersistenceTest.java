@@ -128,6 +128,22 @@ class OutboxEventPersistenceTest {
     }
 
     @Test
+    void databaseRejectsAnUnknownEventType() {
+        assertThrows(PersistenceException.class, () -> entityManager.createNativeQuery(
+                        "insert into outbox (aggregate_id, event_type, payload_json) "
+                                + "values (1, 'BrandUpdated', '{}'::jsonb)")
+                .executeUpdate());
+    }
+
+    @Test
+    void databaseRejectsAnEventTypeThatDiffersOnlyInCase() {
+        assertThrows(PersistenceException.class, () -> entityManager.createNativeQuery(
+                        "insert into outbox (aggregate_id, event_type, payload_json) "
+                                + "values (1, 'brandupserted', '{}'::jsonb)")
+                .executeUpdate());
+    }
+
+    @Test
     void databaseRejectsABlankEventType() {
         assertThrows(PersistenceException.class, () -> entityManager.createNativeQuery(
                         "insert into outbox (aggregate_id, event_type, payload_json) "

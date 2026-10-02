@@ -517,6 +517,9 @@ outbox(id, aggregate_id, event_type, payload_json, created_at, published_at, att
   -- the relay must claim rows with FOR UPDATE SKIP LOCKED, or two instances publish the same
   --   row twice; at-least-once regardless, since a crash after publishing re-sends
   -- aggregate_id is a brand id OR a user id, told apart by event_type -- no FK possible
+  -- CHECK (event_type IN ('BrandUpserted','UserUpserted')): aggregate_id is only
+  --   interpretable through event_type, so a typo'd name made it meaningless and went
+  --   unconsumed, silently. Not an aggregate_type column -- that would duplicate event_type
 ```
 
 ### 4.4 Notification Service
@@ -772,8 +775,8 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 | | |
 |---|---|
 | **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` through Revision 3 |
-| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** complete — `Brand`, `User`, `ApiKey` and `OutboxEvent`, Flyway V1–V6, including the `bump_updated_at` trigger attached to both identity tables. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
-| **Tested** | 17 entity and time-zone tests in Inventory and 43 in Identity (19 and 45 including a context test and the zone-less-timestamp guard every service carries; Order and Notification have those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
+| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** complete — `Brand`, `User`, `ApiKey` and `OutboxEvent`, Flyway V1–V7, including the `bump_updated_at` trigger attached to both identity tables. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
+| **Tested** | 17 entity and time-zone tests in Inventory and 45 in Identity (19 and 47 including a context test and the zone-less-timestamp guard every service carries; Order and Notification have those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
 | **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
 | **Verified under failure** | None |
 
