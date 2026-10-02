@@ -5,7 +5,7 @@
 Prepared by Akshansh · **Revision 4 — September 2026** (supersedes Revision 3, September 2026)
 
 > **Status of this document.** The design is **designed**; only the entity layer exists.
-> Implemented and persistence-tested: Inventory's four entities and Identity's `brands`, on Flyway
+> Implemented and persistence-tested: Inventory's four entities and Identity's `brands` and `users`, on Flyway
 > migrations. Order and Notification are scaffolded only; no repositories, services, controllers,
 > gateway, Kafka, Redis or security exist anywhere. Nothing is load-tested or verified under
 > failure. Section 8's metrics are **targets until measured**. Details in §9.
@@ -404,7 +404,7 @@ Kafka -> Notification : BrandUpserted -> upsert brand_contacts
 ## 4. Data Model Per Service
 
 All five schemas are final at design level. **Code exists for Inventory's four tables and
-Identity's `brands` only** (§9).
+Identity's `brands` and `users` only** (§9).
 Cross-service references are plain IDs with no DB-level foreign key.
 
 ### 4.1 Order Service
@@ -449,14 +449,19 @@ outbox(id, aggregate_id, event_type, payload_json, published, created_at)
 flash_sales(id, brand_id, name, start_time, end_time, status)
   -- status: ACTIVE | CANCELLED only -- SCHEDULED/LIVE/ENDED are COMPUTED, not stored,
   --   since only cancellation is a fact no timestamp implies
+  -- start_time/end_time are TIMESTAMPTZ (read as Instant): one absolute moment, fixed at
+  --   write time. A zone-less TIMESTAMP compared against now() is read using the
+  --   CONNECTION's TimeZone, so two pods could disagree about the same sale at the same
+  --   instant -- demonstrated: a 10:00 sale read as open from Asia/Kolkata, not from UTC
   -- liveness = status != 'CANCELLED' AND start_time <= now < end_time
   --   half-open (inclusive start, exclusive end -- SQL BETWEEN is wrong here);
   --   `now` is the DATABASE's clock, evaluated in the same statement as the stock
   --   decrement -- app-side clocks would disagree at the boundary
   -- CANCELLED is pre-start only: a sale cannot be cancelled once live, so
   --   "cancelled sale with live orders" is unreachable, not unhandled
-  -- everything about a sale (price, start_time, end_time, cancellation) is mutable
-  --   pre-open and frozen after -- a live sale always runs to end_time
+  -- everything about a sale (price, stock quantities, start_time, end_time,
+  --   cancellation) is mutable pre-open and frozen after -- a live sale always runs to
+  --   end_time. available_stock moves only through reserve/release/confirm, never an edit
 
 flash_sale_items(id, flash_sale_id, product_id, sale_price,
                  total_stock, available_stock, version)
@@ -563,6 +568,28 @@ Each index is derived from a **named** query, not added defensively.
 
 Every index slows writes — notably on `stock_reservations`, written on every reserve. The cost
 is to be **measured** during load testing, not assumed.
+
+### 4.7 Entity and migration conventions
+
+Rules applied to every entity, each recorded with its reasoning in `docs/decisions.md`:
+
+| Rule | Why |
+|---|---|
+| `BIGSERIAL` + `GenerationType.IDENTITY` | The database generates ids; the application never supplies one |
+| Flyway migrations are hand-written and **never edited once applied or pushed**; a fix is a new version | Flyway checksums each file; an edit fails on any database that already ran it |
+| Same-service FKs are real in the database but plain `Long` in Java, not `@ManyToOne`; cross-service ids are plain with no FK | Nothing needs an object graph yet; avoids fetch decisions with no query behind them |
+| Enums are `EnumType.STRING` **and** a `CHECK` | Ordinal storage silently corrupts when the enum is reordered |
+| Money is `DECIMAL(12,2)` / `BigDecimal` | Never floating point |
+| Every time column is `TIMESTAMPTZ` / `Instant`, enforced by a guard test in every service | A zone-less `TIMESTAMP` compared against `now()` is read using the connection's time zone; one sale read as open from one zone and closed from another |
+| A database-filled column is `insertable = false` (with `@Generated`) or Hibernate-generated | Hibernate sends an explicit `NULL` for an unset field, which overrides a column `DEFAULT` |
+| `CHECK`s are the last line of defence and are never removed for duplicating application logic | The ceiling `available_stock <= total_stock` has only application logic before it |
+| Who stamps a time column depends on who compares it: Java clock (audit only), DB default (compared against `now()`), strictly-increasing trigger (another service orders events by it) | A lagging pod clock must not be able to hide a stale reservation or discard a newer email |
+| Entity tests use real Postgres inside a rolled-back transaction and are each **shown to fail** by breaking what they guard | `validate` cannot see triggers, defaults or `CHECK`s, and a passing test proves nothing on its own |
+
+Service scaffolding: fixed ports identity `8081`, inventory `8082`, order `8083`, notification
+`8084` (8080 reserved for the Gateway); one shared credential pair against one Postgres instance
+with a separate database per service; Kafka, Feign, Resilience4j, Security and Validation
+deferred to their phases.
 
 ---
 
@@ -677,7 +704,7 @@ Mapped session-for-session to the Coding Shuttle Razorpay Clone cohort schedule.
 | 2 | Gateway internals & diagrams | Architecture + purchase-flow sequence diagrams | Done; current (§9) |
 | 3 | Requirement gathering | `docs/requirements.md` | Done; checked against Revision 3 on 2026-10-02 — behavioural only, no stale mechanism in it |
 | 4 | Schema design | All five schemas + ERDs | **Done** — ERDs regenerated and kept in sync as entities are written |
-| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities and Identity's `Brand` done; `users`, `api_keys`, `outbox`, all of Order, all of Notification remain. No repositories yet |
+| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities and Identity's `Brand` and `User` done; `api_keys`, `outbox`, all of Order, all of Notification remain. No repositories yet |
 | 7–8 | Merchant API — signup, API key | Identity Service: brand + buyer signup/login, brand API key generation, `BrandUpserted` / `UserUpserted` outbox rows | |
 | 9 | Order APIs with MapStruct | Order creation/status/list APIs, multi-item request/response, DTO↔entity mapping | |
 | 10 | Payment Initiate API, Strategy | Reserve endpoint + Order's per-item loop, all-or-nothing, contractual evaluation order | |
@@ -730,8 +757,8 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 | | |
 |---|---|
 | **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` through Revision 3 |
-| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V5. **Identity:** `Brand`, Flyway V1–V2, including the `bump_updated_at` trigger. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
-| **Tested** | 15 persistence tests in Inventory, 8 in Identity, each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
+| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** `Brand` and `User`, Flyway V1–V4, including the `bump_updated_at` trigger attached to both. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
+| **Tested** | 17 entity and time-zone tests in Inventory and 22 in Identity (19 and 24 including a context test and the zone-less-timestamp guard every service carries; Order and Notification have those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
 | **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
 | **Verified under failure** | None |
 
@@ -787,8 +814,8 @@ on prevention rather than independent correction.**
 - Identity, for the API phase: a lost signup race must read "email already taken", not a 500;
   the JWT must say whether its subject is a brand or a user; published `outbox` rows need a
   cleanup job.
-- Continue Sessions 5–6: Identity's `users`, `api_keys`, `outbox`; then Order's four tables and
-  Notification's three; then repositories. Inventory and Identity's `brands` are done.
+- Continue Sessions 5–6: Identity's `api_keys` and `outbox`; then Order's four tables and
+  Notification's three; then repositories. Inventory and Identity's `brands` and `users` are done.
 
 ---
 

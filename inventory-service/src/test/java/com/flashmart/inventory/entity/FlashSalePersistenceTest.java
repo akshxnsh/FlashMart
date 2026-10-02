@@ -6,7 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -15,8 +15,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 @Transactional
 class FlashSalePersistenceTest {
 
-    private static final LocalDateTime START = LocalDateTime.of(2030, 1, 1, 10, 0);
-    private static final LocalDateTime END = LocalDateTime.of(2030, 1, 1, 12, 0);
+    private static final Instant START = Instant.parse("2030-01-01T10:00:00Z");
+    private static final Instant END = Instant.parse("2030-01-01T12:00:00Z");
 
     @Autowired
     private EntityManager entityManager;

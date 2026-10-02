@@ -123,6 +123,11 @@ outbox(id, aggregate_id, event_type, payload_json, published, created_at)
 flash_sales(id, brand_id, name, start_time, end_time, status)
   -- status: ACTIVE | CANCELLED only — SCHEDULED/LIVE/ENDED are computed, not
   --   stored, since only cancellation is a fact no timestamp implies
+  -- start_time/end_time are TIMESTAMPTZ (Instant): one absolute moment fixed
+  --   at write time. A zone-less TIMESTAMP compared against now() is read
+  --   using the CONNECTION's TimeZone, so two pods could disagree about the
+  --   same sale at the same instant — hence "now is the database's clock"
+  --   alone was never sufficient; the column type has to agree too
   -- liveness = status != 'CANCELLED' AND start_time <= now < end_time
   --   half-open (inclusive start, exclusive end — SQL BETWEEN is wrong here);
   --   `now` is the DATABASE's clock, evaluated in the same statement as the
@@ -338,6 +343,12 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **Out-of-order `BrandUpserted`/`UserUpserted` is handled by a timestamp-conditional upsert**, not by requiring Kafka ordering — correctness never depends on delivery order.
 - **Notification's own retry is minimal by design** — capped backoff, a bare claim against concurrent instances, no fencing, no escalation; a missed email isn't a stuck refund.
 - **`brands`/`users` `updated_at` is database-generated and strictly increasing** — a `BEFORE UPDATE` trigger stamps `GREATEST(clock_timestamp(), old + 1 µs)`, because Notification's conditional upsert silently discards any event that looks older, so a lagging pod clock must never stamp a newer change with an older time. Emails are stored trimmed and lowercased with a CHECK, making `UNIQUE(email)` case-insensitive.
+- **Every time column is `TIMESTAMPTZ`/`Instant`, enforced by a guard test** — a zone-less `TIMESTAMP` compared against `now()` is read using the connection's time zone, so one sale read as open from one zone and closed from another. `NoZoneLessTimestampsTest` in every service fails, naming the column, if one appears.
+- **Who stamps a time column depends on who compares it** — Java clock for audit-only columns (`products`); database default with `insertable = false` where the database's `now()` is compared against it (`stock_reservations.reserved_at`); a strictly-increasing trigger where another service orders events by it (`brands`/`users.updated_at`).
+- **`CHECK` constraints are the last line of defence, each documented against the guard that comes first** — the ceiling `available_stock <= total_stock` matters more than the floor because only application logic stands before it. A `CHECK` is never removed for "duplicating" application logic.
+- **Entity and migration conventions** — `IDENTITY` ids; migrations never edited once applied or pushed; same-service FKs real in the database but plain `Long` in Java; enums as `EnumType.STRING` plus a `CHECK`; chosen constraint names; a database-filled column must be `insertable = false` or Hibernate-generated, because Hibernate sends an explicit `NULL` that overrides a `DEFAULT`; `validate` cannot see triggers, defaults or `CHECK`s.
+- **Entity tests use real Postgres, roll back, and must be shown to fail** — each guard was verified by breaking what it protects. No `reserve`, so nothing is load-tested or verified under concurrency.
+- **Service scaffolding** — fixed ports 8081–8084 (8080 reserved for the Gateway); one shared credential pair against one Postgres instance but a separate database per service; Kafka, Feign, Resilience4j, Security and Validation deferred to their phases.
 - **Every event-publishing service owns an outbox** — now Order and Identity only.
 - **Cross-service relationships are always an ID or an event, never a foreign key** — §5.
 - **Deadlines and leases are derived from the timeouts they race, never picked** — the `CREATED` deadline and refund claim lease stay open until real Feign/Resilience4j config exists.
@@ -351,16 +362,21 @@ through Revision 3.
 
 **Implemented:**
 - **Inventory Service** — all four entities (`Product`, `FlashSale`,
-  `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V5.
-- **Identity Service** — `Brand` on migrations V1–V2, including the
-  `bump_updated_at` trigger. `users`, `api_keys` and `outbox` are not written.
+  `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V6. Every time
+  column is `TIMESTAMPTZ`, read as `Instant` (V6 converted the original
+  zone-less `TIMESTAMP`; see §9).
+- **Identity Service** — `Brand` and `User` on migrations V1–V4, including the
+  `bump_updated_at` trigger attached to both. `api_keys` and `outbox` are not
+  written.
 - **Order, Notification** — scaffolded only: Spring Boot projects, own
   database, fixed port, empty `db/migration/`. No entities.
 - **Not built anywhere:** repositories, services, controllers, the API
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 15 persistence tests in Inventory and 8 in Identity, each saving
+**Tested:** 17 entity and time-zone tests in Inventory and 22 in Identity (19 and
+24 including a context test and the zone-less-timestamp guard that every service
+now carries; Order and Notification have the guard and a context test), each saving
 into real Postgres inside a rolled-back transaction; every CHECK, unique key
 and FK is verified to reject bad rows, not merely to exist. The tests can
 fail: weakening `reserved_at`'s mapping and the `updated_at` trigger each
@@ -407,16 +423,16 @@ each is blocked on something that doesn't exist yet, or is mechanical work.
 - Decide the locking strategy for `flash_sale_items` — optimistic alone,
   pessimistic, or Redis — and load-test it. Paired with it: the transaction
   isolation level on the same write path, undecided until now.
-- **Convert Inventory's timestamp columns to `TIMESTAMPTZ` — next piece.**
-  `flash_sales.start_time`/`end_time`, `stock_reservations.reserved_at` and
-  `products`' audit columns are zone-less `TIMESTAMP`. Comparing one against
-  `now()` (which is `TIMESTAMPTZ`) makes Postgres fill the gap from the
-  *connection's* `TimeZone` setting, so the same row at the same instant gives
-  different liveness answers on two connections — demonstrated on the live
-  schema: a sale starting `10:00` read as open in `Asia/Kolkata` and not open
-  in `UTC`. That is the two-clocks problem the DB-clock rule exists to remove,
-  reintroduced through the column type. Identity already uses
-  `TIMESTAMPTZ`/`Instant`; Inventory must match before `reserve` is built.
+- **Inventory's time columns are `TIMESTAMPTZ` — done (V6), recorded here
+  because it constrains `reserve`.** `flash_sales.start_time`/`end_time`,
+  `stock_reservations.reserved_at` and `products`' audit columns were zone-less
+  `TIMESTAMP`. Comparing one against `now()` (a `TIMESTAMPTZ`) makes Postgres
+  fill the gap from the *connection's* `TimeZone` setting, so the same row at
+  the same instant gave different liveness answers on two connections — a
+  sale starting `10:00` read as open in `Asia/Kolkata` and not open in `UTC`.
+  That was the two-clocks problem the DB-clock rule exists to remove,
+  reintroduced through the column type. Any new time column must be
+  `TIMESTAMPTZ`; never compare a zone-less column against `now()`.
 - **Settle how `reserve` writes the decrement.** Two decision entries specify
   it incompatibly: `WHERE id = ? AND version = ?` versus one statement
   checking `available_stock` and liveness against the database clock. Under
