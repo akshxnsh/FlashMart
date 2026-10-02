@@ -3054,6 +3054,70 @@ fixed by writing a new forward migration, not by reverting the old one.
 
 ---
 
+## Decision: `updated_at` on `brands`/`users` is database-generated and strictly increasing; emails are stored normalised
+
+**Context / Problem:**
+`BrandUpserted`/`UserUpserted` carry `updated_at` as a source-side timestamp, and
+Notification's conditional upsert accepts an event only if
+`brand_contacts.updated_at < EXCLUDED.updated_at`, silently discarding anything
+that looks older (see "Out-of-order `BrandUpserted`/`UserUpserted` delivery").
+That made `updated_at` load-bearing on Identity's two tables, which nothing had
+examined. Stamped from each Identity pod's own clock, a later change can carry
+an *earlier* time: pod A stamps a change 10:00:05, pod B — two seconds slow —
+stamps the next change 10:00:04, and Notification discards the newer email
+without error. `now()` does not fix it either, because it is the time the
+transaction *started*, so a transaction that waited on the row lock can commit
+with an older time than the one it overtook. Separately, a plain `UNIQUE(email)`
+is case-sensitive in Postgres: `Priya@x.com` and `priya@x.com` both insert,
+giving one mailbox two accounts.
+
+**Options Considered:**
+1. Let the application stamp `updated_at` (`@UpdateTimestamp`, as on `products`).
+2. Database `DEFAULT`/`now()` only, with no rule on the old value.
+3. A `BEFORE UPDATE` trigger that stamps
+   `GREATEST(clock_timestamp(), OLD.updated_at + 1 microsecond)`.
+4. Replace the timestamp comparison with an integer version counter on the row.
+   Bulletproof, but it changes both event payloads, Notification's contact
+   tables and its upsert.
+
+**Chosen Approach:**
+Option 3. The trigger function `bump_updated_at()` is created once and attached
+to each table; Java never writes the column, and Hibernate reads the value back
+(`@Generated`) so the outbox event can carry the exact stored timestamp. The
+columns are `TIMESTAMPTZ`, read as `Instant` — the event contract is UTC
+(`...Z`), and this comparison is the one place a zone-less timestamp could
+silently skew it. Emails are stored trimmed and lowercased, enforced by
+`CHECK (email = lower(btrim(email)))`, with the entity normalising in its setter
+so the check is a backstop rather than the first line of defence.
+
+**Why:**
+The row's own previous value is the only reference that cannot disagree with
+itself, and inside the trigger that value is read while the row is locked, so no
+concurrent writer can slip between the read and the write — the same reasoning
+as every other compare-and-set in this design, applied to a timestamp. It keeps
+the already-decided event shape and Notification's guard unchanged.
+
+**Trade-offs:**
+- The project's first trigger: logic that lives in the database and is invisible
+  from the Java side. Contained to one four-line function.
+- Every `UPDATE` bumps `updated_at`, including ones that change nothing a
+  consumer cares about. Harmless — only an email change publishes an event.
+- `products.created_at`/`updated_at` keep the application clock. Nothing
+  compares them across pods, so the weaker guarantee is sufficient there; the
+  difference is deliberate, not an oversight.
+
+**Consequences:**
+- `users` reuses `bump_updated_at()` unchanged; only the trigger is added.
+- Every write path must go through the normalising setter (or normalise
+  itself); a raw insert with a mixed-case email is rejected by the CHECK.
+- The signup path must turn the unique-violation into "email already taken",
+  not a 500 — an API-phase concern recorded here so it is not forgotten.
+- Verified, not assumed: a test seeds a row whose `updated_at` is an hour ahead
+  of the clock, updates it, and asserts the new time is still later; weakening
+  the function to plain `clock_timestamp()` fails exactly that test.
+
+---
+
 ## Open Items (not yet designed)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
