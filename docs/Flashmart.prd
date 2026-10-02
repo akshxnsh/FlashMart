@@ -525,11 +525,20 @@ outbox(id, aggregate_id, event_type, payload_json, created_at, published_at, att
 ### 4.4 Notification Service
 
 ```
-notification_log(..., order_id, event_type, recipient_type, channel, status,
-                 attempts, next_retry_at, sent_at)
+notification_log(id, order_id, event_type, recipient_type, channel, status,
+                 recipient_address, attempts, next_retry_at, sent_at, last_error)
   -- UNIQUE(order_id, event_type, recipient_type, channel) -- idempotent consumer for
-  --   at-least-once Kafka delivery
-  -- status: ... | FAILED | RETRYING. Capped backoff retry (5 attempts), then stays
+  --   at-least-once Kafka delivery. `reason` deliberately NOT in the key, so a second
+  --   OrderCancelled for one order dedupes instead of sending a second email
+  -- recipient_address: the address actually used, captured at send time -- the contact
+  --   caches hold only the current one, so the log could not otherwise say where a
+  --   message went once the buyer changed their email
+  -- last_error: why the last attempt failed; otherwise "mail server down" and "no
+  --   contact cached yet" look identical. Matches refunds and outbox
+  -- CHECKs pin event_type / recipient_type / channel / status; sent_at is non-null iff
+  --   SENT, and a SENT row must carry recipient_address
+  -- index: PARTIAL on (next_retry_at) WHERE status='FAILED'
+  -- status: PENDING | SENT | FAILED | RETRYING. Capped backoff retry (5 attempts), then stays
   --   FAILED permanently -- no escalation; a missed courtesy email needs nobody to act,
   --   unlike a stuck refund
   -- claim before send: UPDATE ... SET status='RETRYING' WHERE status='FAILED'
@@ -775,8 +784,8 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 | | |
 |---|---|
 | **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` through Revision 3 |
-| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** complete — `Brand`, `User`, `ApiKey` and `OutboxEvent`, Flyway V1–V7, including the `bump_updated_at` trigger attached to both identity tables. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
-| **Tested** | 17 entity and time-zone tests in Inventory and 45 in Identity (19 and 47 including a context test and the zone-less-timestamp guard every service carries; Order and Notification have those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
+| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** complete — `Brand`, `User`, `ApiKey` and `OutboxEvent`, Flyway V1–V7, including the `bump_updated_at` trigger attached to both identity tables. **Notification:** `NotificationLog`, Flyway V1; its two contact caches remain. **Order:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
+| **Tested** | 17 entity and time-zone tests in Inventory, 45 in Identity and 14 in Notification (19, 47 and 16 including a context test and the zone-less-timestamp guard every service carries; Order has just those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
 | **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
 | **Verified under failure** | None |
 
@@ -832,8 +841,8 @@ on prevention rather than independent correction.**
 - Identity, for the API phase: a lost signup race must read "email already taken", not a 500;
   the JWT must say whether its subject is a brand or a user; published `outbox` rows need a
   cleanup job.
-- Continue Sessions 5–6: Order's four tables and
-  Notification's three; then repositories. Inventory and Identity's `brands` and `users` are done.
+- Continue Sessions 5–6: Notification's two contact caches, then Order's four tables; then
+  repositories. Inventory, Identity and Notification's `notification_log` are done.
 
 ---
 

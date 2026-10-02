@@ -259,11 +259,35 @@ outbox(id, aggregate_id, event_type, payload_json, created_at,
 
 ### Notification Service
 ```
-notification_log(..., order_id, event_type, recipient_type, channel, status,
-                  attempts, next_retry_at, sent_at)
+notification_log(id, order_id, event_type, recipient_type, channel, status,
+                 recipient_address, attempts, next_retry_at, sent_at, last_error)
   -- UNIQUE(order_id, event_type, recipient_type, channel) — idempotent
-  --   consumer for at-least-once Kafka delivery
-  -- status: ... | FAILED | RETRYING. Capped backoff retry (5 attempts), then
+  --   consumer for at-least-once Kafka delivery. `reason` is deliberately NOT
+  --   in the key: OrderCancelled can be published twice for one order (the
+  --   death path and the late-reservation cleanup both do it), and the second
+  --   must dedupe rather than send a second email
+  -- recipient_address: the address ACTUALLY used, captured at send time. The
+  --   contact caches hold only the current address, so without this the log
+  --   cannot answer "where did this go?" once a buyer changes their email —
+  --   exactly when the question is asked. A log records what happened, not
+  --   what is now true
+  -- last_error: why the last attempt failed. Without it "the mail server is
+  --   down" and "I have no contact for this buyer yet" are indistinguishable,
+  --   and they need different responses. Matches refunds and outbox
+  -- CHECKs pin every vocabulary (event_type, recipient_type, channel, status),
+  --   as on outbox.event_type: a typo'd recipient_type would log a buyer's
+  --   receipt against the brand and defeat the unique key
+  -- CHECK ((status='SENT') = (sent_at IS NOT NULL)) and CHECK (status<>'SENT'
+  --   OR recipient_address IS NOT NULL) — the second is one-directional on
+  --   purpose: a SENT row must say where it went, a FAILED row legitimately
+  --   may not know. Same shape as api_keys.revoked_at
+  -- index: PARTIAL on (next_retry_at) WHERE status='FAILED' — almost every row
+  --   ends SENT, and the worker scans only failures, so it stays small
+  -- a missing contact (PaymentConfirmed arriving before UserUpserted) is
+  --   treated as an ordinary failed send: FAILED, last_error naming the cause,
+  --   picked up by the existing retry. No separate state — accepted cost is
+  --   that it burns one of the 5 attempts
+  -- status: PENDING | SENT | FAILED | RETRYING. Capped backoff retry (5 attempts), then
   --   stays FAILED permanently — no escalation; a missed courtesy email
   --   needs nobody to act, unlike a stuck refund
   -- claim before send: UPDATE ... SET status='RETRYING' WHERE status='FAILED'
@@ -413,15 +437,17 @@ through Revision 3.
 - **Identity Service** — complete: `Brand`, `User`, `ApiKey` and
   `OutboxEvent` on migrations V1–V7, including the `bump_updated_at` trigger
   attached to both identity tables.
-- **Order, Notification** — scaffolded only: Spring Boot projects, own
-  database, fixed port, empty `db/migration/`. No entities.
+- **Notification Service** — `NotificationLog` on migration V1. Its
+  `brand_contacts`/`buyer_contacts` caches are not written.
+- **Order Service** — scaffolded only: a Spring Boot project, own database,
+  fixed port, empty `db/migration/`. No entities.
 - **Not built anywhere:** repositories, services, controllers, the API
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 17 entity and time-zone tests in Inventory and 45 in Identity (19 and
-47 including a context test and the zone-less-timestamp guard that every service
-now carries; Order and Notification have the guard and a context test), each saving
+**Tested:** 17 entity and time-zone tests in Inventory, 45 in Identity and 14 in
+Notification (19, 47 and 16 including a context test and the zone-less-timestamp
+guard that every service carries; Order has just those two), each saving
 into real Postgres inside a rolled-back transaction; every CHECK, unique key
 and FK is verified to reject bad rows, not merely to exist. The tests can
 fail: weakening `reserved_at`'s mapping and the `updated_at` trigger each

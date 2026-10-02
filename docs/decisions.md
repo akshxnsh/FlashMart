@@ -3502,6 +3502,9 @@ skipped.
 | `stock_reservations` | `quantity > 0` | `400 INVALID_QUANTITY` |
 | `stock_reservations` | status in the three states; `UNIQUE(order_id, flash_sale_item_id)` | the enum; idempotent reserve |
 | `products` | `UNIQUE(brand_id, name)` | — |
+| `notification_log` | `event_type`/`recipient_type`/`channel`/`status` vocabularies | **nothing** — a typo'd `recipient_type` would both mislabel the row and defeat the unique key that stops duplicate emails |
+| `notification_log` | `sent_at` non-null iff `SENT`; a `SENT` row has a `recipient_address` | the sending code setting them together |
+| `notification_log` | `attempts >= 0` | the retry worker's own increment |
 | `brands`, `users` | email already lowercase and trimmed; `length(email) > 0`; an `@` with something on each side; `length(btrim(name)) > 0`; `UNIQUE(email)` | the entity's normalising setter; Bean Validation at the API |
 | `api_keys` | `status IN ('ACTIVE','REVOKED')`; `UNIQUE(key_hash)` | the enum |
 | `api_keys` | `key_hash ~ '^[0-9a-f]{64}$'` | **nothing** — the hashing code is the only other guard, and an uppercase hash or a bcrypt hash would otherwise fail silently at lookup time |
@@ -3674,9 +3677,79 @@ Neither check exercises behaviour.
 
 **Consequences:**
 Totals: Inventory 19 (17 entity and time-zone tests, the guard, a context test),
-Identity 47 (45, the guard, a context test), Order and Notification 2 each. All
+Identity 47 (45, the guard, a context test), Notification 16 (14, the guard, a
+context test), Order 2. All
 persistence behaviour above is *tested*, not load-tested or verified under
 concurrency — no `reserve` exists to test.
+
+---
+
+## Decision: `notification_log` records what happened, not what is currently true — `recipient_address` and `last_error` added
+
+**Context / Problem:**
+The documented shape —
+`notification_log(..., order_id, event_type, recipient_type, channel, status, attempts, next_retry_at, sent_at)`
+— opened with `...`, the same stub that hid `quantity` on `stock_reservations`.
+Reasoning through what the table is actually *for* turned up two genuine gaps
+and two underspecified areas. The `...` itself was only `id`.
+
+**Chosen Approach:**
+
+1. **`recipient_address` added.** The row said a receipt was sent to the buyer
+   but not **to which address** — that lives in `buyer_contacts`, which is
+   *overwritten* whenever the buyer changes their email. So "I never got my
+   receipt" was unanswerable: the log says `SENT`, and the only address on hand
+   is the current one, which may not be the one used. A delivery log must record
+   what happened, not what is now true. Written at send time. Nullable, because
+   a send that never happened has no address, with
+   `CHECK (status <> 'SENT' OR recipient_address IS NOT NULL)` — one-directional
+   on purpose.
+2. **`last_error` added**, matching `refunds` and `outbox`. Without it a row
+   sits at `FAILED` after five attempts with no diagnosis, and — more
+   importantly — "the mail server is down" and "I have no contact cached for
+   this buyer yet" are *indistinguishable in the data* while calling for
+   different responses.
+3. **Every vocabulary pinned by a `CHECK`** (`event_type`, `recipient_type`,
+   `channel`, `status`), as decided for `outbox.event_type`. Here it is
+   load-bearing twice over: a typo'd `recipient_type` would log the buyer's
+   receipt against the brand *and* defeat the unique key, so the duplicate it
+   exists to stop would get through.
+4. **`status` is `PENDING | SENT | FAILED | RETRYING`** — the documented
+   "`... | FAILED | RETRYING`" never named the first two. A row is inserted
+   `PENDING` before the send is attempted, so the unique key claims idempotency
+   *before* any mail leaves.
+5. **`CHECK ((status = 'SENT') = (sent_at IS NOT NULL))`** so the two can never
+   disagree, the same shape as `api_keys.revoked_at`.
+6. **Partial index on `(next_retry_at) WHERE status = 'FAILED'`.** The index
+   list named only the unique key, yet the retry worker scans failures exactly
+   as the refund worker does. Almost every row ends `SENT`, so a partial index
+   stays small — the same reasoning as the outbox's.
+
+**A missing contact is treated as an ordinary failed send.** `PaymentConfirmed`
+can arrive before `UserUpserted`, leaving Notification without an address. The
+row is written `FAILED` with `last_error` naming the cause and is picked up by
+the existing retry, by which time the contact has usually landed. No separate
+state and no new machinery, in keeping with this service being deliberately
+minimal. **Accepted cost:** it consumes one of the five attempts, and a contact
+that arrives after all five leaves the row permanently `FAILED`. Acceptable
+because a missed courtesy email needs nobody to act — the same premise as the
+no-escalation decision.
+
+**Trade-offs:**
+- Two columns beyond the documented schema, one of which (`recipient_address`)
+  duplicates data that also exists in the contact cache — deliberately, because
+  the cache is mutable and the log must not be.
+- Adding an event type, channel or recipient type now needs a migration. Same
+  trade as `outbox.event_type`, and proportionate for the same reason.
+
+**Consequences:**
+- The claim before sending (`status='FAILED' → 'RETRYING'`, rows-affected
+  checked) is unchanged and remains a query-shape rule no constraint can carry.
+  Without it two Notification instances on the same retry schedule double-send.
+- Order's `notification`-adjacent tables are unaffected; Notification's two
+  contact caches are still to be written.
+- Verified: dropping the `sent_at`/`recipient_address`/`recipient_type` CHECKs
+  failed exactly the four tests guarding them and nothing else.
 
 ---
 
