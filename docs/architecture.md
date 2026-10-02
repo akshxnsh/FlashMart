@@ -112,10 +112,13 @@ refunds(id, order_id, payment_ref, amount, status, attempts,
   -- claimed_at: claim lease + fence token for the worker's finishing write
   -- index: (status, next_retry_at)
 
-outbox(id, aggregate_id, event_type, payload_json, published, created_at)
-  -- index: PARTIAL on (created_at) WHERE published = false — the relay only
-  --   ever reads unpublished rows, so indexing the ever-growing published
-  --   ones is wasted size. payload_json as JSONB. Same shape as Identity's
+outbox(id, aggregate_id, event_type, payload_json, created_at,
+       published_at, attempts, last_error)
+  -- same shape as Identity's, built there first: published_at (NULL = unsent)
+  --   instead of a boolean, attempts + last_error so one unpublishable row
+  --   cannot stall the relay, JSONB payload, and a PARTIAL index on
+  --   (created_at) WHERE published_at IS NULL. The relay claims rows with
+  --   FOR UPDATE SKIP LOCKED
 ```
 
 ### Inventory Service
@@ -220,13 +223,31 @@ users(id, name, email UNIQUE, password_hash, created_at, updated_at)
   --   employee may also shop). The consequence is that there can be no single
   --   login endpoint — brand and buyer login must be separate, since one
   --   address could match a row in either table
-outbox(id, aggregate_id, event_type, payload_json, published, created_at)
+outbox(id, aggregate_id, event_type, payload_json, created_at,
+       published_at, attempts, last_error)
+  -- published_at REPLACES the `published` boolean: NULL means not yet sent.
+  --   A boolean says whether a row went out but never when, so relay lag is
+  --   invisible and the cleanup job has nothing to delete by age
+  -- attempts + last_error: a row that can never be published (an oversized
+  --   payload) would otherwise be retried forever, silently, holding up
+  --   every row behind it. Same shape as refunds and notification_log
   -- payload_json is JSONB: Postgres rejects invalid JSON at write time
-  -- index: PARTIAL on (created_at) WHERE published = false, not (published,
-  --   created_at) over every row — published rows pile up forever and the
-  --   relay never reads them, so the index stays tiny. Same shape applies to
-  --   Order's outbox
-  -- aggregate_id has no FK: it names a brand OR a user
+  -- index: PARTIAL on (created_at) WHERE published_at IS NULL, not over every
+  --   row — published rows pile up forever and the relay never reads them, so
+  --   the index stays tiny. Same shape applies to Order's outbox
+  -- aggregate_id has no FK: it names a brand OR a user, told apart by
+  --   event_type, so a query by aggregate_id alone is wrong
+  -- THE RELAY MUST CLAIM WITH `FOR UPDATE SKIP LOCKED`. Two relay instances
+  --   is ordinary scaling, and without a claim both read the same unsent rows
+  --   and both publish them. SKIP LOCKED makes the second step over rows the
+  --   first already holds instead of waiting. A query-shape rule; no
+  --   constraint can carry it
+  -- At-least-once by construction: a relay that crashes between publishing
+  --   and stamping published_at republishes on restart. Unavoidable without a
+  --   distributed transaction, and why every consumer is idempotent
+  -- Ordering is NOT guaranteed: ids are assigned before commit, so a later id
+  --   can commit first. Nothing depends on order — the contact-cache upsert
+  --   compares timestamps precisely so it does not have to
 ```
 
 ### Notification Service
@@ -382,17 +403,17 @@ through Revision 3.
   `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V6. Every time
   column is `TIMESTAMPTZ`, read as `Instant` (V6 converted the original
   zone-less `TIMESTAMP`; see §9).
-- **Identity Service** — `Brand`, `User` and `ApiKey` on migrations V1–V5,
-  including the `bump_updated_at` trigger attached to both identity tables.
-  `outbox` is not written.
+- **Identity Service** — complete: `Brand`, `User`, `ApiKey` and
+  `OutboxEvent` on migrations V1–V6, including the `bump_updated_at` trigger
+  attached to both identity tables.
 - **Order, Notification** — scaffolded only: Spring Boot projects, own
   database, fixed port, empty `db/migration/`. No entities.
 - **Not built anywhere:** repositories, services, controllers, the API
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 17 entity and time-zone tests in Inventory and 33 in Identity (19 and
-35 including a context test and the zone-less-timestamp guard that every service
+**Tested:** 17 entity and time-zone tests in Inventory and 43 in Identity (19 and
+45 including a context test and the zone-less-timestamp guard that every service
 now carries; Order and Notification have the guard and a context test), each saving
 into real Postgres inside a rolled-back transaction; every CHECK, unique key
 and FK is verified to reject bad rows, not merely to exist. The tests can

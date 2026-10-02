@@ -1140,7 +1140,10 @@ updating to remove `StockReserved`.
 >
 > **Second note (2026-10-02):** the `(published, created_at)` index this entry
 > and the index-list entry call for is replaced by a *partial* index, and
-> `payload_json` is `JSONB` — see "Identity's remaining tables" below.
+> `payload_json` is `JSONB` — see "Identity's remaining tables" below. The
+> `published` boolean named in the schema line below is also gone: it is now
+> `published_at TIMESTAMPTZ` (NULL = unsent), plus `attempts`/`last_error`, so
+> the partial index is `WHERE published_at IS NULL`.
 
 **Context / Problem:**
 Originally only Order Service had an `outbox`. Two more services now publish
@@ -1442,8 +1445,9 @@ an email change and its event being applied.
 > shows the composite index being declined.
 >
 > **A fifth, decided 2026-10-02:** both outboxes' `(published, created_at)`
-> index becomes a partial index on `(created_at) WHERE published = false`.
-> See "Identity's remaining tables".
+> index becomes a partial index on `(created_at) WHERE published_at IS NULL`
+> — the `published` boolean itself was replaced by a nullable timestamp when
+> the table was written. See "Identity's remaining tables".
 
 **Context / Problem:**
 Every brand API request looks up an API key by its hash, and none of the
@@ -3074,7 +3078,7 @@ fixed by writing a new forward migration, not by reverting the old one.
 **Consequences:**
 - Every future `@Entity` in every service pairs 1:1 with a migration file.
   *(Done for Inventory: migrations V1–V6 for its four entities; for Identity,
-  V1–V5 for `brands`, `users`, `api_keys` and the `bump_updated_at` trigger function. Order and
+  V1–V6 for `brands`, `users`, `api_keys`, `outbox` and the `bump_updated_at` trigger function. Order and
   Notification have an empty `db/migration/` and no entities yet.)*
 - `db/migration/` exists in every service, establishing the convention.
 - **Correction found when this was first booted:** the Flyway *library*
@@ -3269,7 +3273,9 @@ and unbuilt, so they are not rediscovered.
 2. **Revoking a key.** **Chosen: keep the row, set `status = 'REVOKED'`.** The
    row is the audit trail and keeps the hash reserved, so a revoked key can
    never be re-issued by collision. `CHECK (status IN ('ACTIVE','REVOKED'))`.
-3. **Outbox index.** The documented `(published, created_at)` indexes every
+3. **Outbox index.** *(Written as `WHERE published_at IS NULL` once the
+   boolean was replaced — see the extension below.)* The documented
+   `(published, created_at)` indexes every
    row, including the ever-growing pile already published, which the relay
    never reads. **Chosen: a partial index on `(created_at) WHERE published =
    false`.** Publishing a row removes it from the index, so it stays tiny
@@ -3317,6 +3323,44 @@ issuing the new key, moving traffic, then revoking the old one, which is
 impossible if a brand may hold only one. **No index on `brand_id`** — listing a
 brand's keys is rare and the table is tiny; the hot path is the
 `UNIQUE(key_hash)` lookup.
+
+**Extended again when `outbox` was written (2026-10-02), on two points the
+earlier entry got wrong by omission:**
+
+- **`published` becomes `published_at TIMESTAMPTZ`, NULL meaning unsent.** A
+  boolean answers *whether* a row went out but never *when*, so relay lag is
+  invisible and the cleanup job has nothing to delete by. The partial index
+  becomes `WHERE published_at IS NULL`. Same shape as `revoked_at` above: a
+  nullable timestamp carries the flag *and* the time for the same storage.
+- **`attempts` and `last_error` added.** The relay reads oldest-first, so a row
+  that can never be published — an oversized payload, say — would be retried
+  forever and silently, **holding up every row behind it**: stock never
+  confirmed, no receipt sent, because of one bad row. `refunds` and
+  `notification_log` both count attempts; the outbox had nothing. With a count
+  and the error recorded, a persistently failing row can be set aside and
+  looked at. The retry/threshold logic itself belongs to the outbox phase.
+
+**Three properties of the relay, none of which a constraint can enforce:**
+
+- **It must claim rows with `SELECT ... FOR UPDATE SKIP LOCKED`.** Running two
+  relay instances is ordinary scaling, not an edge case; without a claim both
+  read the same unsent rows and both publish them. `SKIP LOCKED` makes the
+  second instance step over rows the first already holds rather than block.
+- **Delivery is at-least-once, by construction.** A relay that crashes after
+  publishing but before stamping `published_at` republishes on restart. That is
+  unavoidable short of a distributed transaction between Postgres and Kafka,
+  and it is precisely why every consumer in this design is idempotent. Nothing
+  here may ever be described as exactly-once.
+- **Ordering is not guaranteed and nothing depends on it.** `BIGSERIAL` ids are
+  assigned before commit, so a transaction with a lower id can commit after one
+  with a higher id, and the relay can therefore publish out of order. This is
+  safe only because the contact-cache upsert compares timestamps rather than
+  trusting arrival order (see "Out-of-order `BrandUpserted`/`UserUpserted`
+  delivery"). If a future consumer ever needs order, that is a new decision.
+
+**`aggregate_id` holds a brand id or a user id**, told apart by `event_type`.
+No FK is possible, and any query by `aggregate_id` alone is wrong without
+`event_type` beside it. A test asserts brand 7 and user 7 can coexist.
 
 **The security rule no constraint can carry:** authentication looks up
 `WHERE key_hash = ?`, and the revoked row is still present, so it **must** add
@@ -3432,6 +3476,9 @@ skipped.
 | `api_keys` | `status IN ('ACTIVE','REVOKED')`; `UNIQUE(key_hash)` | the enum |
 | `api_keys` | `key_hash ~ '^[0-9a-f]{64}$'` | **nothing** — the hashing code is the only other guard, and an uppercase hash or a bcrypt hash would otherwise fail silently at lookup time |
 | `api_keys` | `revoked_at` NULL iff `status = 'ACTIVE'` | the revocation code setting both together |
+| `outbox` | `attempts >= 0` | the relay's own increment |
+| `outbox` | `length(btrim(event_type)) > 0` | the publishing code |
+| `outbox` | `payload_json` is `JSONB`, so invalid JSON is rejected at write time | the serializer |
 
 **Two lessons recorded with it:**
 - **The ceiling matters more than the floor.** The floor has two guards (`reserve`'s
@@ -3578,7 +3625,7 @@ Neither check exercises behaviour.
 
 **Consequences:**
 Totals: Inventory 19 (17 entity and time-zone tests, the guard, a context test),
-Identity 35 (33, the guard, a context test), Order and Notification 2 each. All
+Identity 45 (43, the guard, a context test), Order and Notification 2 each. All
 persistence behaviour above is *tested*, not load-tested or verified under
 concurrency — no `reserve` exists to test.
 

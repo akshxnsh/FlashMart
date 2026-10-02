@@ -440,7 +440,8 @@ refunds(id, order_id, payment_ref, amount, status, attempts,
   -- amount  : DECIMAL, from the webhook's reported amount
   -- claimed_at : claim lease + fence token for the worker's finishing write
 
-outbox(id, aggregate_id, event_type, payload_json, published, created_at)
+outbox(id, aggregate_id, event_type, payload_json, created_at, published_at, attempts, last_error)
+  -- same shape as Identity's (built there first); see §4.3
 ```
 
 ### 4.2 Inventory Service
@@ -507,8 +508,15 @@ api_keys(id, brand_id, key_hash UNIQUE, status ACTIVE|REVOKED, created_at, revok
   -- several ACTIVE keys per brand -- that is how rotation avoids downtime
   -- auth MUST add `AND status = 'ACTIVE'`: the revoked row is still there, and no
   --   constraint can enforce a query's shape
-outbox(id, aggregate_id, event_type, payload_json, published, created_at)
-  -- payload_json JSONB; partial index on (created_at) WHERE published = false
+outbox(id, aggregate_id, event_type, payload_json, created_at, published_at, attempts, last_error)
+  -- published_at replaces a `published` boolean: NULL = unsent, and it also answers *when*,
+  --   so relay lag is measurable and cleanup can delete by age
+  -- attempts + last_error: one permanently unpublishable row would otherwise be retried
+  --   forever and silently, holding up everything behind it
+  -- payload_json JSONB; partial index on (created_at) WHERE published_at IS NULL
+  -- the relay must claim rows with FOR UPDATE SKIP LOCKED, or two instances publish the same
+  --   row twice; at-least-once regardless, since a crash after publishing re-sends
+  -- aggregate_id is a brand id OR a user id, told apart by event_type -- no FK possible
 ```
 
 ### 4.4 Notification Service
@@ -567,7 +575,7 @@ Each index is derived from a **named** query, not added defensively.
 | Order | `orders(status, payment_reconciled_at)` | Reconciliation sweep |
 | Order | `UNIQUE(buyer_id, idempotency_key)` | Idempotent retries; also "list my orders" |
 | Order | `refunds(status, next_retry_at)` | Refund worker's claim scan |
-| Order, Identity | `outbox(created_at) WHERE published = false` (partial) | Outbox relay: unpublished events in order; stays small because published rows are never indexed |
+| Order, Identity | `outbox(created_at) WHERE published_at IS NULL` (partial) | Outbox relay: unpublished events in order; stays small because published rows are never indexed |
 | Inventory | `flash_sales(start_time, end_time)` | Liveness / sale listing |
 | Inventory | `stock_reservations(status, reserved_at)` | Stale-reservation reconciler |
 | Identity | `UNIQUE(api_keys.key_hash)` | API-key lookup on every brand API request |
@@ -711,7 +719,7 @@ Mapped session-for-session to the Coding Shuttle Razorpay Clone cohort schedule.
 | 2 | Gateway internals & diagrams | Architecture + purchase-flow sequence diagrams | Done; current (§9) |
 | 3 | Requirement gathering | `docs/requirements.md` | Done; checked against Revision 3 on 2026-10-02 — behavioural only, no stale mechanism in it |
 | 4 | Schema design | All five schemas + ERDs | **Done** — ERDs regenerated and kept in sync as entities are written |
-| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities done, and Identity's `Brand`, `User` and `ApiKey`; `outbox`, all of Order and all of Notification remain. No repositories yet |
+| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities done and Identity complete (`Brand`, `User`, `ApiKey`, `OutboxEvent`); all of Order and all of Notification remain. No repositories yet |
 | 7–8 | Merchant API — signup, API key | Identity Service: brand + buyer signup/login, brand API key generation, `BrandUpserted` / `UserUpserted` outbox rows | |
 | 9 | Order APIs with MapStruct | Order creation/status/list APIs, multi-item request/response, DTO↔entity mapping | |
 | 10 | Payment Initiate API, Strategy | Reserve endpoint + Order's per-item loop, all-or-nothing, contractual evaluation order | |
@@ -764,8 +772,8 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 | | |
 |---|---|
 | **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` through Revision 3 |
-| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** `Brand`, `User` and `ApiKey`, Flyway V1–V5, including the `bump_updated_at` trigger attached to both identity tables. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
-| **Tested** | 17 entity and time-zone tests in Inventory and 33 in Identity (19 and 35 including a context test and the zone-less-timestamp guard every service carries; Order and Notification have those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
+| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** complete — `Brand`, `User`, `ApiKey` and `OutboxEvent`, Flyway V1–V6, including the `bump_updated_at` trigger attached to both identity tables. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
+| **Tested** | 17 entity and time-zone tests in Inventory and 43 in Identity (19 and 45 including a context test and the zone-less-timestamp guard every service carries; Order and Notification have those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
 | **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
 | **Verified under failure** | None |
 
@@ -821,7 +829,7 @@ on prevention rather than independent correction.**
 - Identity, for the API phase: a lost signup race must read "email already taken", not a 500;
   the JWT must say whether its subject is a brand or a user; published `outbox` rows need a
   cleanup job.
-- Continue Sessions 5–6: Identity's `outbox`; then Order's four tables and
+- Continue Sessions 5–6: Order's four tables and
   Notification's three; then repositories. Inventory and Identity's `brands` and `users` are done.
 
 ---
