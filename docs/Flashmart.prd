@@ -449,14 +449,19 @@ outbox(id, aggregate_id, event_type, payload_json, published, created_at)
 flash_sales(id, brand_id, name, start_time, end_time, status)
   -- status: ACTIVE | CANCELLED only -- SCHEDULED/LIVE/ENDED are COMPUTED, not stored,
   --   since only cancellation is a fact no timestamp implies
+  -- start_time/end_time are TIMESTAMPTZ (read as Instant): one absolute moment, fixed at
+  --   write time. A zone-less TIMESTAMP compared against now() is read using the
+  --   CONNECTION's TimeZone, so two pods could disagree about the same sale at the same
+  --   instant -- demonstrated: a 10:00 sale read as open from Asia/Kolkata, not from UTC
   -- liveness = status != 'CANCELLED' AND start_time <= now < end_time
   --   half-open (inclusive start, exclusive end -- SQL BETWEEN is wrong here);
   --   `now` is the DATABASE's clock, evaluated in the same statement as the stock
   --   decrement -- app-side clocks would disagree at the boundary
   -- CANCELLED is pre-start only: a sale cannot be cancelled once live, so
   --   "cancelled sale with live orders" is unreachable, not unhandled
-  -- everything about a sale (price, start_time, end_time, cancellation) is mutable
-  --   pre-open and frozen after -- a live sale always runs to end_time
+  -- everything about a sale (price, stock quantities, start_time, end_time,
+  --   cancellation) is mutable pre-open and frozen after -- a live sale always runs to
+  --   end_time. available_stock moves only through reserve/release/confirm, never an edit
 
 flash_sale_items(id, flash_sale_id, product_id, sale_price,
                  total_stock, available_stock, version)

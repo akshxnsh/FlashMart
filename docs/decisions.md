@@ -3125,7 +3125,9 @@ to each table; Java never writes the column, and Hibernate reads the value back
 (`@Generated`) so the outbox event can carry the exact stored timestamp. The
 columns are `TIMESTAMPTZ`, read as `Instant` — the event contract is UTC
 (`...Z`), and this comparison is the one place a zone-less timestamp could
-silently skew it. Emails are stored trimmed and lowercased, enforced by
+silently skew it *(wrong: Inventory's liveness check is the same class of
+comparison and was the worse instance — see "Every time column is
+`TIMESTAMPTZ`/`Instant`")*. Emails are stored trimmed and lowercased, enforced by
 `CHECK (email = lower(btrim(email)))`, with the entity normalising in its setter
 so the check is a backstop rather than the first line of defence.
 
