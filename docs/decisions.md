@@ -3129,6 +3129,27 @@ silently skew it. Emails are stored trimmed and lowercased, enforced by
 `CHECK (email = lower(btrim(email)))`, with the entity normalising in its setter
 so the check is a backstop rather than the first line of defence.
 
+**Extended when `users` was written (2026-10-02).** That normalisation CHECK is
+necessary but not sufficient: `''` satisfies it, because an empty string *is*
+already lowercase and trimmed, so an empty email was insertable — demonstrated
+against the live schema, not reasoned about. `name` had no check at all, and
+nothing required an `@`, so `notanemail` stored happily and Notification would
+mail nowhere. Three guards added to both tables (`users` from the start,
+`brands` via a follow-up migration): `length(email) > 0`, an `@` with something
+on each side, and `length(btrim(name)) > 0`. The `@` test is deliberately a
+*minimal sanity gate*, not email validation — the real rules are famously messy
+and the only true test is whether mail arrives, so proper checking belongs in
+Bean Validation at the API plus a verification flow. A whitespace-only email was
+already rejected by the original CHECK, since `btrim('   ')` is `''`.
+
+**One address may be both a brand and a buyer.** `UNIQUE(email)` is per table,
+so `contact@puma.com` can exist in each — two accounts, two password hashes.
+Allowed deliberately: a brand's staff may also shop. The consequence is
+load-bearing for the API phase — there can be **no single login endpoint**,
+because one address and password could match a row in either table. Brand login
+and buyer login must be separate, which the existing "the JWT must say whether
+its subject is a brand or a user" item already implies.
+
 **Why:**
 The row's own previous value is the only reference that cannot disagree with
 itself, and inside the trigger that value is read while the row is locked, so no

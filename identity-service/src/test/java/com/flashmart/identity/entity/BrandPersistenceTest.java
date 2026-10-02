@@ -98,11 +98,32 @@ class BrandPersistenceTest {
         assertEquals("contact@puma.com", brand.getEmail());
     }
 
+    private void insertRaw(String name, String email) {
+        entityManager.createNativeQuery(
+                        "insert into brands (name, email, password_hash) values (:n, :e, 'x')")
+                .setParameter("n", name)
+                .setParameter("e", email)
+                .executeUpdate();
+    }
+
     @Test
     void databaseRejectsAnEmailThatWasNotNormalized() {
-        assertThrows(PersistenceException.class, () -> entityManager.createNativeQuery(
-                        "insert into brands (name, email, password_hash) values ('X', 'Mixed@Case.com', 'x')")
-                .executeUpdate());
+        assertThrows(PersistenceException.class, () -> insertRaw("X", "Mixed@Case.com"));
+    }
+
+    @Test
+    void databaseRejectsAnEmptyEmail() {
+        assertThrows(PersistenceException.class, () -> insertRaw("X", ""));
+    }
+
+    @Test
+    void databaseRejectsAnEmailWithNoAtSign() {
+        assertThrows(PersistenceException.class, () -> insertRaw("X", "notanemail"));
+    }
+
+    @Test
+    void databaseRejectsABlankName() {
+        assertThrows(PersistenceException.class, () -> insertRaw("   ", "blank@puma.com"));
     }
 
     @Test
