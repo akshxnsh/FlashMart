@@ -185,13 +185,30 @@ brands(id, name, email UNIQUE, password_hash, created_at, updated_at)
   --   conditional upsert (WHERE updated_at < EXCLUDED.updated_at) silently
   --   discards any event that looks older, so a lagging pod clock must never
   --   be able to stamp a newer change with an older time
-api_keys(id, brand_id, key_hash UNIQUE, status ACTIVE|REVOKED, created_at)
+api_keys(id, brand_id, key_hash UNIQUE, status ACTIVE|REVOKED, created_at,
+         revoked_at)
   -- key_hash is a FAST, DETERMINISTIC hash (SHA-256), not bcrypt: the key is
   --   found with WHERE key_hash = ?, so the same key must always hash the
   --   same way. bcrypt salts randomly and the lookup would never match.
   --   Safe because API keys are long random values, unlike passwords
+  -- CHECK (key_hash ~ '^[0-9a-f]{64}$') — 64 LOWERCASE hex chars. Postgres
+  --   compares text exactly, so an uppercase hash is a different string: the
+  --   key would never be found and UNIQUE would never see the duplicate, the
+  --   same class of bug as the case-sensitive email. It also rejects a raw
+  --   unhashed key and a bcrypt hash ('$2a$…', 60 chars)
   -- CHECK (status IN ('ACTIVE','REVOKED')); revoked rows are kept, not
   --   deleted — the row is the audit trail and keeps the hash reserved
+  -- revoked_at: NULL while ACTIVE, set when revoked, tied together by
+  --   CHECK ((ACTIVE AND revoked_at IS NULL) OR (REVOKED AND revoked_at IS
+  --   NOT NULL)) so status and the timestamp can never disagree
+  -- several ACTIVE keys per brand are allowed, so a key can be rotated
+  --   (issue the new one, then revoke the old) without downtime
+  -- no index on brand_id: listing a brand's keys is rare and this table is
+  --   tiny; the hot path is the UNIQUE(key_hash) lookup
+  -- AUTH MUST FILTER ON STATUS. The lookup is WHERE key_hash = ?, and the
+  --   revoked row is still there, so `AND status = 'ACTIVE'` is what makes
+  --   revocation mean anything. No constraint can enforce this — it is a
+  --   query-shape rule, and it is the whole point of revocation
   -- separate from JWT session auth: long-lived machine credential vs short-lived session
 users(id, name, email UNIQUE, password_hash, created_at, updated_at)
   -- same email/name guards and the same DB-generated, strictly increasing
@@ -365,17 +382,17 @@ through Revision 3.
   `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V6. Every time
   column is `TIMESTAMPTZ`, read as `Instant` (V6 converted the original
   zone-less `TIMESTAMP`; see §9).
-- **Identity Service** — `Brand` and `User` on migrations V1–V4, including the
-  `bump_updated_at` trigger attached to both. `api_keys` and `outbox` are not
-  written.
+- **Identity Service** — `Brand`, `User` and `ApiKey` on migrations V1–V5,
+  including the `bump_updated_at` trigger attached to both identity tables.
+  `outbox` is not written.
 - **Order, Notification** — scaffolded only: Spring Boot projects, own
   database, fixed port, empty `db/migration/`. No entities.
 - **Not built anywhere:** repositories, services, controllers, the API
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 17 entity and time-zone tests in Inventory and 22 in Identity (19 and
-24 including a context test and the zone-less-timestamp guard that every service
+**Tested:** 17 entity and time-zone tests in Inventory and 33 in Identity (19 and
+35 including a context test and the zone-less-timestamp guard that every service
 now carries; Order and Notification have the guard and a context test), each saving
 into real Postgres inside a rolled-back transaction; every CHECK, unique key
 and FK is verified to reject bad rows, not merely to exist. The tests can

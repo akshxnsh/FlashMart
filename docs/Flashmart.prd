@@ -496,10 +496,17 @@ users(id, name, email UNIQUE, password_hash, created_at, updated_at)
   -- created_at/updated_at are TIMESTAMPTZ, database-generated, never written by Java; a
   --   BEFORE UPDATE trigger sets updated_at = GREATEST(clock_timestamp(), old + 1 µs) so it only
   --   moves forward — Notification discards any event that looks older than what it holds
-api_keys(id, brand_id, key_hash UNIQUE, status ACTIVE|REVOKED, created_at)
+api_keys(id, brand_id, key_hash UNIQUE, status ACTIVE|REVOKED, created_at, revoked_at)
   -- separate from JWT session auth: long-lived machine credential vs. short-lived session
   -- key_hash is a fast, deterministic hash (SHA-256), looked up by WHERE key_hash = ?;
   --   bcrypt would salt randomly and the lookup would never match. Revoked rows are kept
+  -- CHECK (key_hash ~ '^[0-9a-f]{64}$') -- 64 lowercase hex. An uppercase hash is a
+  --   different string to Postgres, so the lookup would silently find nothing; also
+  --   rejects a raw unhashed key and a bcrypt hash
+  -- revoked_at is NULL iff status is ACTIVE, enforced by a CHECK, so the two agree
+  -- several ACTIVE keys per brand -- that is how rotation avoids downtime
+  -- auth MUST add `AND status = 'ACTIVE'`: the revoked row is still there, and no
+  --   constraint can enforce a query's shape
 outbox(id, aggregate_id, event_type, payload_json, published, created_at)
   -- payload_json JSONB; partial index on (created_at) WHERE published = false
 ```
@@ -704,7 +711,7 @@ Mapped session-for-session to the Coding Shuttle Razorpay Clone cohort schedule.
 | 2 | Gateway internals & diagrams | Architecture + purchase-flow sequence diagrams | Done; current (§9) |
 | 3 | Requirement gathering | `docs/requirements.md` | Done; checked against Revision 3 on 2026-10-02 — behavioural only, no stale mechanism in it |
 | 4 | Schema design | All five schemas + ERDs | **Done** — ERDs regenerated and kept in sync as entities are written |
-| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities and Identity's `Brand` and `User` done; `api_keys`, `outbox`, all of Order, all of Notification remain. No repositories yet |
+| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities done, and Identity's `Brand`, `User` and `ApiKey`; `outbox`, all of Order and all of Notification remain. No repositories yet |
 | 7–8 | Merchant API — signup, API key | Identity Service: brand + buyer signup/login, brand API key generation, `BrandUpserted` / `UserUpserted` outbox rows | |
 | 9 | Order APIs with MapStruct | Order creation/status/list APIs, multi-item request/response, DTO↔entity mapping | |
 | 10 | Payment Initiate API, Strategy | Reserve endpoint + Order's per-item loop, all-or-nothing, contractual evaluation order | |
@@ -757,8 +764,8 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 | | |
 |---|---|
 | **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` through Revision 3 |
-| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** `Brand` and `User`, Flyway V1–V4, including the `bump_updated_at` trigger attached to both. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
-| **Tested** | 17 entity and time-zone tests in Inventory and 22 in Identity (19 and 24 including a context test and the zone-less-timestamp guard every service carries; Order and Notification have those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
+| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** `Brand`, `User` and `ApiKey`, Flyway V1–V5, including the `bump_updated_at` trigger attached to both identity tables. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
+| **Tested** | 17 entity and time-zone tests in Inventory and 33 in Identity (19 and 35 including a context test and the zone-less-timestamp guard every service carries; Order and Notification have those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
 | **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
 | **Verified under failure** | None |
 
@@ -814,7 +821,7 @@ on prevention rather than independent correction.**
 - Identity, for the API phase: a lost signup race must read "email already taken", not a 500;
   the JWT must say whether its subject is a brand or a user; published `outbox` rows need a
   cleanup job.
-- Continue Sessions 5–6: Identity's `api_keys` and `outbox`; then Order's four tables and
+- Continue Sessions 5–6: Identity's `outbox`; then Order's four tables and
   Notification's three; then repositories. Inventory and Identity's `brands` and `users` are done.
 
 ---
