@@ -2,7 +2,8 @@
 
 > Current design per `docs/decisions.md` through Revision 3. Supersedes the
 > PRD wherever they conflict (see `CLAUDE.md`). Design document — Section 8
-> is what actually has code behind it (currently nothing).
+> is what actually has code behind it: Inventory's four entities and Identity's
+> `brands`, all on Flyway migrations and covered by persistence tests.
 
 ## 1. System Overview
 
@@ -112,7 +113,9 @@ refunds(id, order_id, payment_ref, amount, status, attempts,
   -- index: (status, next_retry_at)
 
 outbox(id, aggregate_id, event_type, payload_json, published, created_at)
-  -- index: (published, created_at)
+  -- index: PARTIAL on (created_at) WHERE published = false — the relay only
+  --   ever reads unpublished rows, so indexing the ever-growing published
+  --   ones is wasted size. payload_json as JSONB. Same shape as Identity's
 ```
 
 ### Inventory Service
@@ -172,11 +175,23 @@ brands(id, name, email UNIQUE, password_hash, created_at, updated_at)
   --   discards any event that looks older, so a lagging pod clock must never
   --   be able to stamp a newer change with an older time
 api_keys(id, brand_id, key_hash UNIQUE, status ACTIVE|REVOKED, created_at)
+  -- key_hash is a FAST, DETERMINISTIC hash (SHA-256), not bcrypt: the key is
+  --   found with WHERE key_hash = ?, so the same key must always hash the
+  --   same way. bcrypt salts randomly and the lookup would never match.
+  --   Safe because API keys are long random values, unlike passwords
+  -- CHECK (status IN ('ACTIVE','REVOKED')); revoked rows are kept, not
+  --   deleted — the row is the audit trail and keeps the hash reserved
   -- separate from JWT session auth: long-lived machine credential vs short-lived session
 users(id, name, email UNIQUE, password_hash, created_at, updated_at)
   -- same email normalisation and the same DB-generated, strictly increasing
   --   updated_at as brands (shared bump_updated_at trigger function)
 outbox(id, aggregate_id, event_type, payload_json, published, created_at)
+  -- payload_json is JSONB: Postgres rejects invalid JSON at write time
+  -- index: PARTIAL on (created_at) WHERE published = false, not (published,
+  --   created_at) over every row — published rows pile up forever and the
+  --   relay never reads them, so the index stays tiny. Same shape applies to
+  --   Order's outbox
+  -- aggregate_id has no FK: it names a brand OR a user
 ```
 
 ### Notification Service
@@ -199,7 +214,8 @@ buyer_contacts(user_id, email, updated_at)      -- fed by UserUpserted
   --   — correctness never depends on Kafka delivery order
 ```
 
-No service's schema has code behind it yet — see §8.
+Code behind these schemas so far: all four Inventory tables and Identity's
+`brands` — see §8 for exactly what is and is not built.
 
 ## 5. Cross-Service Relationships: IDs vs. Events
 
@@ -299,7 +315,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **Webhook-never-arrives is closed by a reconciliation sweep** querying the gateway by idempotency key, not `payment_ref` — a second, independent producer of `refunds` rows.
 - **All-or-nothing reservation, sequential per-item Feign loop** — not a batch endpoint; Inventory stays unaware of multi-item orders.
 - **`reserve`'s evaluation order is contractual** — an existing reservation is returned before the liveness/stock gates, so a post-deadline retry can't wrongly cancel an order whose stock is already held.
-- **Optimistic-lock `version` on `flash_sale_items`, not `stock_reservations`** — the contended row is the shared counter, not a per-buyer insert-only row.
+- **Optimistic-lock `version` on `flash_sale_items`, not `stock_reservations`** — the contended row is the shared counter, not a per-buyer insert-only row. The column and `@Version` exist; **how `reserve` writes the decrement is still open** — `WHERE version = ?` versus a value-based `WHERE available_stock >= ? AND <liveness>` behave very differently under READ COMMITTED, and two decision entries specify them differently (§9).
 - **Sale terms are immutable once live** — price, stock quantities (`total_stock`), `start_time`/`end_time`, and cancellation all share one boundary: mutable pre-open, frozen after. `available_stock` moves only through reserve/release/confirm, never through an edit. A live sale always runs to its end; there is no emergency stop.
 - **Liveness is computed, never stored** — `status` shrinks to `ACTIVE|CANCELLED`; the drift problem is removed, not solved, by asking the two timestamps fresh every time, against the database's clock.
 - **An order keeps exactly one payment** — one CAS-enforced invariant, replacing an enumerated guard that had a hole.
@@ -308,6 +324,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **Every event is a flat payload; money always crosses as a string** — no envelope, no version field, no `event_id`; discipline (add, never repurpose) does the job a version number would.
 - **Out-of-order `BrandUpserted`/`UserUpserted` is handled by a timestamp-conditional upsert**, not by requiring Kafka ordering — correctness never depends on delivery order.
 - **Notification's own retry is minimal by design** — capped backoff, a bare claim against concurrent instances, no fencing, no escalation; a missed email isn't a stuck refund.
+- **`brands`/`users` `updated_at` is database-generated and strictly increasing** — a `BEFORE UPDATE` trigger stamps `GREATEST(clock_timestamp(), old + 1 µs)`, because Notification's conditional upsert silently discards any event that looks older, so a lagging pod clock must never stamp a newer change with an older time. Emails are stored trimmed and lowercased with a CHECK, making `UNIQUE(email)` case-insensitive.
 - **Every event-publishing service owns an outbox** — now Order and Identity only.
 - **Cross-service relationships are always an ID or an event, never a foreign key** — §5.
 - **Deadlines and leases are derived from the timeouts they race, never picked** — the `CREATED` deadline and refund claim lease stay open until real Feign/Resilience4j config exists.
@@ -319,11 +336,27 @@ Full context and trade-offs live in `docs/decisions.md`.
 machine, every communication pattern, every decision in `docs/decisions.md`
 through Revision 3.
 
-**Implemented:** none. The repository contains `CLAUDE.md` and the three
-`docs/` files only — no service modules, entities, migrations, or build files.
+**Implemented:**
+- **Inventory Service** — all four entities (`Product`, `FlashSale`,
+  `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V5.
+- **Identity Service** — `Brand` on migrations V1–V2, including the
+  `bump_updated_at` trigger. `users`, `api_keys` and `outbox` are not written.
+- **Order, Notification** — scaffolded only: Spring Boot projects, own
+  database, fixed port, empty `db/migration/`. No entities.
+- **Not built anywhere:** repositories, services, controllers, the API
+  Gateway, Kafka, Redis, security. All four services share one local Postgres
+  credential pair but each owns a separate database.
 
-**Tested / load-tested:** none — nothing exists to test. NFR-P1–P4 remain
+**Tested:** 15 persistence tests in Inventory and 8 in Identity, each saving
+into real Postgres inside a rolled-back transaction; every CHECK, unique key
+and FK is verified to reject bad rows, not merely to exist. The tests can
+fail: weakening `reserved_at`'s mapping and the `updated_at` trigger each
+broke exactly the tests meant to catch it. **Not load-tested, not verified
+under concurrency or failure** — no `reserve` exists yet. NFR-P1–P4 remain
 unverified targets by explicit decision, not by omission.
+
+**Ports:** identity `8081`, inventory `8082`, order `8083`, notification
+`8084`; `8080` is reserved for the API Gateway.
 
 **Diagrams and ERDs: current.** All sequence diagrams (including the two that
 were pre-Revision-3 and the two that never existed — reconciliation sweep,
@@ -332,12 +365,14 @@ as Mermaid blocks, matching the current design. `docs/Flashmart.prd`
 (Revision 4) also matches, with one known gap: §6.5 undercounts Razorpay
 Clone's requirements (see §9).
 
-**Notion log cross-check:** its "API & Event Contracts" through "Load
-Testing & Verification" sections remain present but empty — consistent with
-the repo, since no code exists yet either. Its design sections (§1–5) are
-current as of this update; they are a personal engineering log, not
-themselves a second source of truth — `docs/decisions.md` remains authoritative
-on conflict.
+**Notion log cross-check:** its "JPA Entities & Repositories" section (§7)
+now records every entity written so far, and §9 records the project setup.
+Its "API & Event Contracts", "Feature Implementation", "Testing Per Feature"
+and "Load Testing & Verification" sections remain present but empty,
+consistent with the repo — none of that exists yet. Its design sections
+(§1–5) are current as of this update; they are a personal engineering log,
+not themselves a second source of truth — `docs/decisions.md` remains
+authoritative on conflict.
 
 ## 9. Known Open Items / Next Steps
 
@@ -359,6 +394,21 @@ each is blocked on something that doesn't exist yet, or is mechanical work.
 - Decide the locking strategy for `flash_sale_items` — optimistic alone,
   pessimistic, or Redis — and load-test it. Paired with it: the transaction
   isolation level on the same write path, undecided until now.
+- **Settle how `reserve` writes the decrement.** Two decision entries specify
+  it incompatibly: `WHERE id = ? AND version = ?` versus one statement
+  checking `available_stock` and liveness against the database clock. Under
+  READ COMMITTED a value-based clause re-checks fresh stock after a blocked
+  UPDATE unblocks and needs no retry; a `version = ?` clause fails after any
+  concurrent write. A native `UPDATE` also does not bump `version`, so mixing
+  it with an entity save can silently clobber a decrement. Must be settled
+  before `reserve` is built; recorded, not decided.
+- Enforce "frozen once the sale opens" (price, `total_stock`, times,
+  cancellation) in the service layer, against the database clock, in the same
+  transaction as the write. A CHECK cannot express it. Not built.
+- Identity, for the API phase: a lost signup race must surface as "email
+  already taken", not a 500; the JWT must say whether its subject is a brand
+  or a user (brand 7 and user 7 share an id); published `outbox` rows need a
+  cleanup job.
 - Build Razorpay Clone with the three behaviours this design leans on:
   idempotency on `initiate` and `refund`, and a payment-status lookup
   queryable by our idempotency key or order reference. Not built yet;

@@ -7,7 +7,12 @@
 > superseded it.
 >
 > **Status note:** everything here is *designed*, not implemented or tested,
-> unless an entry says otherwise.
+> unless an entry says otherwise. As of 2026-10-02 the exceptions are the
+> schema decisions for Inventory's four tables and Identity's `brands`, which
+> are implemented as entities on Flyway migrations and persistence-tested
+> against real Postgres; their entries are marked where that changed the
+> record. Nothing is load-tested, and no `reserve`, API, Kafka or Redis code
+> exists — every decision about those remains *designed*.
 
 ---
 
@@ -807,6 +812,15 @@ what makes it possible for a `reserve()` call to return the order's `brand_id`
 > **Note:** the counter this protects is now `available_stock`, not
 > `total_stock` — see "`total_stock` stays fixed; `available_stock` is the
 > decremented counter" below. The reasoning is unchanged.
+>
+> **Second note (2026-10-02) — the Consequences below are not settled.** The
+> `version` column and `@Version` exist on the entity as designed. But the
+> claim that reserve "becomes a conditional update ... `WHERE id = ? AND
+> version = ?`" contradicts "Inventory's `reserve` API contract", which has
+> liveness and the stock check/decrement in one statement against the
+> database clock. Under READ COMMITTED those differ sharply (see Open Items:
+> "The reserve write path is specified two different ways"). Read the
+> Consequences here as one candidate, not the decision.
 
 **Context / Problem:**
 The PRD carried `version` on `stock_reservations` as a placeholder without
@@ -1123,6 +1137,10 @@ updating to remove `StockReserved`.
 > `ReservationExpired`, was removed), so it no longer has an outbox. Current
 > publishers: **Order and Identity only**. Order's outbox now also carries
 > `OrderCancelled`. See "Inventory publishes nothing" in Revision 3 below.
+>
+> **Second note (2026-10-02):** the `(published, created_at)` index this entry
+> and the index-list entry call for is replaced by a *partial* index, and
+> `payload_json` is `JSONB` — see "Identity's remaining tables" below.
 
 **Context / Problem:**
 Originally only Order Service had an `outbox`. Two more services now publish
@@ -1393,7 +1411,11 @@ an email change and its event being applied.
 - Identity needs an outbox (see "Every service that publishes events owns an
   outbox").
 - Out-of-order upsert events are not handled yet (deliberately deferred — see
-  Open Items).
+  Open Items). *(Superseded: handled by a timestamp-conditional upsert — see
+  "Out-of-order `BrandUpserted`/`UserUpserted` delivery is handled by a
+  timestamp-conditional upsert". That guard in turn depends on `updated_at`
+  moving strictly forward — see "`updated_at` on `brands`/`users` is
+  database-generated and strictly increasing".)*
 
 ---
 
@@ -1418,6 +1440,10 @@ an email change and its event being applied.
 > schema, each traceable to a named query); it applies it — the query has an
 > index, just not a dedicated one. To be revisited only if a real query plan
 > shows the composite index being declined.
+>
+> **A fifth, decided 2026-10-02:** both outboxes' `(published, created_at)`
+> index becomes a partial index on `(created_at) WHERE published = false`.
+> See "Identity's remaining tables".
 
 **Context / Problem:**
 Every brand API request looks up an API key by its hash, and none of the
@@ -2184,7 +2210,11 @@ though nothing reads it yet: `updated_at` must be the **source-side** timestamp
 thing that could ever guard against out-of-order delivery. The out-of-order
 guard itself stays deferred (see "Deliberately deferred" in Open Items), but
 the field has to carry the real timestamp now, or a future guard would need a
-shape change to add it retroactively.
+shape change to add it retroactively. *(Superseded: the guard is now decided —
+"Out-of-order `BrandUpserted`/`UserUpserted` delivery is handled by a
+timestamp-conditional upsert" — and "`updated_at` on `brands`/`users` is
+database-generated and strictly increasing" settles how the timestamp is
+produced, since "source-side" alone did not say which clock.)*
 
 *No `event_version`.* Adding a field is harmless by default — old consumers
 ignore what they were never told to read. The two ways a payload change
@@ -3043,10 +3073,19 @@ fixed by writing a new forward migration, not by reverting the old one.
 
 **Consequences:**
 - Every future `@Entity` in every service pairs 1:1 with a migration file.
-  The `flash_sales` entity (next piece) is the first real one written.
-- `inventory-service/src/main/resources/db/migration/` now exists as an
-  empty, tracked directory establishing the convention; no `.sql` files yet
-  since no entities exist.
+  *(Done for Inventory: migrations V1–V5 for its four entities; for Identity,
+  V1–V2 for `brands` and the `bump_updated_at` trigger function. Order and
+  Notification have an empty `db/migration/` and no entities yet.)*
+- `db/migration/` exists in every service, establishing the convention.
+- **Correction found when this was first booted:** the Flyway *library*
+  (`flyway-database-postgresql`) alone does nothing under Spring Boot 4 —
+  Spring's auto-configuration lives in a separate module. The first commit
+  added only the library, compiled fine, and never ran a migration; `mvn
+  compile` proves classes are on the classpath, not that Spring wires them
+  into boot. The fix is `spring-boot-starter-flyway` (which pulls the
+  auto-configuration module) **plus** `flyway-database-postgresql`, now the
+  dependency pair in all four services. Verified by booting against
+  Postgres, not by compiling.
 - The locking-strategy decision for `flash_sale_items`
   (`@Version`/pessimistic/Redis — still open, see Open Items) will itself
   eventually need a migration once settled; Flyway doesn't resolve that
@@ -3118,6 +3157,58 @@ the already-decided event shape and Notification's guard unchanged.
 
 ---
 
+## Decision: Identity's remaining tables — a fast hash for `api_keys.key_hash`, revoked keys kept, a partial index and `JSONB` for the outbox
+
+**Context / Problem:**
+`api_keys`, `users` and `outbox` are not written yet, but reasoning through the
+four Identity tables (while writing `brands`) turned up choices that, got wrong
+in the API phase, fail silently or only under load. Recorded now, as designed
+and unbuilt, so they are not rediscovered.
+
+**Options Considered and Chosen:**
+1. **`key_hash` hashing.** A brand sends its API key on every request and the
+   row is found with `WHERE key_hash = ?`, so hashing the same key must always
+   give the same hash. A salted password hash (bcrypt) gives a different value
+   every time: the lookup never matches and `UNIQUE(key_hash)` means nothing.
+   **Chosen: a fast, deterministic hash (SHA-256).** Safe because API keys are
+   long random values nobody can guess, which is exactly what bcrypt's slowness
+   defends against and what passwords, being human-chosen, need.
+2. **Revoking a key.** **Chosen: keep the row, set `status = 'REVOKED'`.** The
+   row is the audit trail and keeps the hash reserved, so a revoked key can
+   never be re-issued by collision. `CHECK (status IN ('ACTIVE','REVOKED'))`.
+3. **Outbox index.** The documented `(published, created_at)` indexes every
+   row, including the ever-growing pile already published, which the relay
+   never reads. **Chosen: a partial index on `(created_at) WHERE published =
+   false`.** Publishing a row removes it from the index, so it stays tiny
+   however old the system gets. Applies to Order's outbox as well.
+4. **`outbox.payload_json`.** **Chosen: `JSONB`** — Postgres rejects invalid
+   JSON when it is written, so a serialisation bug fails where it happened
+   instead of at the consumer. Needs a Hibernate JSON mapping on the entity.
+5. **`outbox.aggregate_id` has no foreign key** — it names a brand *or* a user,
+   so no single FK can express it. Deliberate, not an omission.
+
+**Why:**
+Each is cheap to get right in the schema and expensive to retrofit: a wrong
+`key_hash` scheme invalidates every issued key, and an index over published
+rows is a cost that grows forever.
+
+**Trade-offs:**
+- SHA-256 without a salt means two identical keys would hash identically — made
+  harmless by keys being random and `UNIQUE(key_hash)` rejecting a collision.
+- A partial index can be used only by queries whose `WHERE` implies
+  `published = false`; the relay's query does, and nothing else reads this table.
+- `JSONB` normalises key order and whitespace, so the stored text is not
+  byte-identical to what was written. Nothing reads it as text.
+
+**Consequences:**
+- `users` reuses `bump_updated_at()` and the same email rules as `brands`.
+- For the API phase, not the schema: a lost signup race must surface as "email
+  already taken", not a 500; the JWT must say whether its subject is a brand or
+  a user, since brand 7 and user 7 share an id; and published `outbox` rows
+  accumulate, so they need a cleanup job in the outbox phase.
+
+---
+
 ## Open Items (not yet designed)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -3179,7 +3270,22 @@ the already-decided event shape and Notification's guard unchanged.
   the opposite of what the 5,000-concurrent target needs. Must be settled
   before `reserve` is implemented; belongs with the locking-strategy and
   isolation-level items above, which it interacts with directly. Recorded, not
-  decided — the strategy is to be load-tested, not assumed.
+  decided — the strategy is to be load-tested, not assumed. A related trap:
+  a native or `@Modifying` `UPDATE` does not bump `version`, so mixing one with
+  an entity save of the same row can silently overwrite a concurrent decrement
+  with a stale in-memory `available_stock`; any raw SQL must do
+  `version = version + 1` itself.
+- **Enforcing "frozen once the sale opens" (designed, not built).** Price,
+  `total_stock`, `start_time`, `end_time` and cancellation are mutable until
+  `start_time` and frozen after. A `CHECK` cannot express it (it would have to
+  know "now" relative to the row's own `start_time` at update time), so it is a
+  service-layer rule: reject any edit once `now >= start_time`, evaluated
+  against the database clock in the same transaction as the write — otherwise
+  an edit landing at the boundary races the first reservation.
+- **Identity, API phase (designed, not built):** a lost signup race must read
+  "email already taken", not a 500; the JWT must say whether its subject is a
+  brand or a user; published `outbox` rows need a cleanup job. See "Identity's
+  remaining tables".
 - **Razorpay Clone is not built yet**, and three of its behaviours are
   requirements FlashMart's design leans on: idempotency keys honoured on
   `initiate`, idempotency keys honoured on `refund`, and a payment-status
