@@ -343,6 +343,12 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **Out-of-order `BrandUpserted`/`UserUpserted` is handled by a timestamp-conditional upsert**, not by requiring Kafka ordering — correctness never depends on delivery order.
 - **Notification's own retry is minimal by design** — capped backoff, a bare claim against concurrent instances, no fencing, no escalation; a missed email isn't a stuck refund.
 - **`brands`/`users` `updated_at` is database-generated and strictly increasing** — a `BEFORE UPDATE` trigger stamps `GREATEST(clock_timestamp(), old + 1 µs)`, because Notification's conditional upsert silently discards any event that looks older, so a lagging pod clock must never stamp a newer change with an older time. Emails are stored trimmed and lowercased with a CHECK, making `UNIQUE(email)` case-insensitive.
+- **Every time column is `TIMESTAMPTZ`/`Instant`, enforced by a guard test** — a zone-less `TIMESTAMP` compared against `now()` is read using the connection's time zone, so one sale read as open from one zone and closed from another. `NoZoneLessTimestampsTest` in every service fails, naming the column, if one appears.
+- **Who stamps a time column depends on who compares it** — Java clock for audit-only columns (`products`); database default with `insertable = false` where the database's `now()` is compared against it (`stock_reservations.reserved_at`); a strictly-increasing trigger where another service orders events by it (`brands`/`users.updated_at`).
+- **`CHECK` constraints are the last line of defence, each documented against the guard that comes first** — the ceiling `available_stock <= total_stock` matters more than the floor because only application logic stands before it. A `CHECK` is never removed for "duplicating" application logic.
+- **Entity and migration conventions** — `IDENTITY` ids; migrations never edited once applied or pushed; same-service FKs real in the database but plain `Long` in Java; enums as `EnumType.STRING` plus a `CHECK`; chosen constraint names; a database-filled column must be `insertable = false` or Hibernate-generated, because Hibernate sends an explicit `NULL` that overrides a `DEFAULT`; `validate` cannot see triggers, defaults or `CHECK`s.
+- **Entity tests use real Postgres, roll back, and must be shown to fail** — each guard was verified by breaking what it protects. No `reserve`, so nothing is load-tested or verified under concurrency.
+- **Service scaffolding** — fixed ports 8081–8084 (8080 reserved for the Gateway); one shared credential pair against one Postgres instance but a separate database per service; Kafka, Feign, Resilience4j, Security and Validation deferred to their phases.
 - **Every event-publishing service owns an outbox** — now Order and Identity only.
 - **Cross-service relationships are always an ID or an event, never a foreign key** — §5.
 - **Deadlines and leases are derived from the timeouts they race, never picked** — the `CREATED` deadline and refund claim lease stay open until real Feign/Resilience4j config exists.
@@ -368,7 +374,9 @@ through Revision 3.
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 17 persistence tests in Inventory and 22 in Identity, each saving
+**Tested:** 17 entity and time-zone tests in Inventory and 22 in Identity (19 and
+24 including a context test and the zone-less-timestamp guard that every service
+now carries; Order and Notification have the guard and a context test), each saving
 into real Postgres inside a rolled-back transaction; every CHECK, unique key
 and FK is verified to reject bad rows, not merely to exist. The tests can
 fail: weakening `reserved_at`'s mapping and the `updated_at` trigger each

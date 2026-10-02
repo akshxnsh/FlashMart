@@ -3234,7 +3234,13 @@ forms a habit the rule exists to prevent.
 
 **Consequences:**
 - A new time column must be `TIMESTAMPTZ`. Comparing a zone-less column against
-  `now()` is never acceptable.
+  `now()` is never acceptable. **Enforced, not just stated:**
+  `NoZoneLessTimestampsTest` in every service fails, naming the column, if any
+  `public` column is `timestamp without time zone`. Without it the fix covered
+  five columns and nothing would have stopped the sixth. Order's, Notification's
+  and Identity's remaining tables must be created `TIMESTAMPTZ` from the start,
+  including `api_keys.created_at` and `outbox.created_at`, which the ERDs draw
+  as plain `timestamp`.
 - `TimeZoneConsistencyTest` pins the behaviour: an open and a not-yet-started
   sale are read identically from `Asia/Kolkata`, `UTC`, `America/Los_Angeles`
   and `Pacific/Auckland` connections, and a control on a zone-less temporary
@@ -3293,6 +3299,255 @@ rows is a cost that grows forever.
   already taken", not a 500; the JWT must say whether its subject is a brand or
   a user, since brand 7 and user 7 share an id; and published `outbox` rows
   accumulate, so they need a cleanup job in the outbox phase.
+
+---
+
+## Decision: Entity and migration conventions, applied to every service
+
+**Context / Problem:**
+Inventory's four entities and Identity's two were written one piece at a time,
+and the same small choices were made repeatedly and implicitly — several of
+them only because an earlier piece had been bitten. None was recorded, so
+Order, Notification and the rest of Identity would have re-derived them, or
+quietly differed. Written down once, as rules, with the failure each prevents.
+
+**Chosen Approach:**
+1. **Identity columns:** `BIGSERIAL` with `GenerationType.IDENTITY` — the
+   database generates the id; the application never supplies one.
+2. **Migrations:** hand-written Flyway SQL, one file per schema change, with
+   `ddl-auto: validate`. A migration is **never edited once it has been applied
+   or pushed**; a fix is a *new* version. That is why `flash_sale_items` is
+   V3 *and* V4, `brands` has V4 backfilling a guard, and Inventory's time
+   columns were fixed by V6 and not by editing V1/V3/V5. Flyway checksums every
+   file, so an edit fails on any database that already ran it.
+3. **Foreign keys:** a same-service FK is a real `REFERENCES` in the database
+   but is modelled in Java as a plain `Long` column, not `@ManyToOne` — nothing
+   yet needs object-graph navigation, and this avoids fetch-type and N+1
+   decisions before there is a query to base them on. A cross-service id is a
+   plain `Long` with no FK at all.
+4. **Enums:** `@Enumerated(EnumType.STRING)` *and* a database `CHECK` listing the
+   values. Ordinal storage saves 0 or 1, so reordering the enum later silently
+   corrupts every stored row; the CHECK means a bad value is rejected by the
+   database even if the application is wrong.
+5. **Money:** `DECIMAL(12,2)` / `BigDecimal`, never floating point.
+6. **Time:** `TIMESTAMPTZ` / `Instant` — see "Every time column is
+   `TIMESTAMPTZ`/`Instant`", enforced by a guard test in every service.
+7. **Constraint names are chosen, not generated:** `uk_<table>_<columns>`,
+   `ck_<table>_<rule>`, `idx_<table>_<columns>`, `trg_<table>_<purpose>`, so a
+   violation names the rule in the error. A Java `@UniqueConstraint` repeats the
+   name so the mapping and the schema visibly agree.
+8. **Lombok:** `@Getter @Setter @NoArgsConstructor`. `@AllArgsConstructor` is
+   **omitted where a setter normalises** (`Brand`, `User` lowercase the email),
+   because the constructor would let a caller bypass the setter.
+9. **A database-filled column must be told to Hibernate.** Hibernate puts every
+   insertable column into its `INSERT`, sending an explicit `NULL` for an unset
+   field — and a column `DEFAULT` only fires when the column is *omitted*. So
+   `created_at TIMESTAMPTZ NOT NULL DEFAULT now()` plus a plain `@Column` fails
+   on the first save with a not-null violation. The options are
+   `insertable = false` (the database fills it; add `@Generated` to read it
+   back) or a Hibernate generator (`@CreationTimestamp`). `insertable = false`
+   alone is wrong for a column that must change on UPDATE.
+10. **What `validate` does not check:** it compares table, column and type. It
+    does not check triggers, `CHECK`s, defaults or indexes. A trigger attached to
+    one table and forgotten on the next boots cleanly and fails silently, so
+    anything `validate` cannot see needs a test.
+11. **A rule a constraint cannot express is a service-layer rule, recorded as an
+    open item** — e.g. "frozen once the sale opens" — never silently dropped.
+12. **Workflow:** one branch per piece; one focused commit whose message
+    explains *why*; merge with `--no-ff` so the piece stays visible in history;
+    delete the branch; never amend a published commit unless asked.
+
+**Why:**
+Each rule exists because breaking it was either observed or cheaply
+demonstrable here: the `NULL`-over-`DEFAULT` failure, the case-sensitive unique
+email, the zone-less comparison, the trigger `validate` cannot see.
+
+**Trade-offs:**
+- No `@ManyToOne` means joins and navigation are explicit queries later; revisit
+  when a query needs a graph.
+- Hand-written SQL is more work than inferred DDL and cannot be rolled back
+  automatically (Flyway Community has no down-migrations).
+- Conventions are not enforced by tooling, with one exception (the time-column
+  guard test). Drift is caught by review and by the tests below.
+
+**Consequences:**
+Order, Notification and the rest of Identity follow these without re-deciding
+them. A convention that proves wrong is changed here first.
+
+---
+
+## Decision: Database `CHECK` constraints are the last line of defence — each one documented against the guard that comes first
+
+**Context / Problem:**
+Several invariants are enforced twice, in application logic and in a `CHECK`,
+and which is primary was never written down. Without that, a `CHECK` looks
+redundant and gets removed, or looks sufficient and the application check gets
+skipped.
+
+**Chosen Approach and the full list:**
+
+| Table | Constraint | Primary guard (the `CHECK` is the backstop) |
+|---|---|---|
+| `flash_sales` | `status IN ('ACTIVE','CANCELLED')` | the enum type |
+| `flash_sale_items` | `available_stock >= 0` (floor) | `reserve`'s `WHERE available_stock >= qty` |
+| `flash_sale_items` | `available_stock <= total_stock` (**ceiling**) | the reservation status flip `RESERVED → RELEASED` — **application logic only, so this CHECK is the only database-level guard** |
+| `flash_sale_items` | `total_stock > 0` | creation-time validation (not built) |
+| `flash_sale_items` | `sale_price >= 0` | creation-time validation (not built) |
+| `flash_sale_items` | `UNIQUE(flash_sale_id, product_id)` | — |
+| `stock_reservations` | `quantity > 0` | `400 INVALID_QUANTITY` |
+| `stock_reservations` | status in the three states; `UNIQUE(order_id, flash_sale_item_id)` | the enum; idempotent reserve |
+| `products` | `UNIQUE(brand_id, name)` | — |
+| `brands`, `users` | email already lowercase and trimmed; `length(email) > 0`; an `@` with something on each side; `length(btrim(name)) > 0`; `UNIQUE(email)` | the entity's normalising setter; Bean Validation at the API |
+| `api_keys` (designed) | `status IN ('ACTIVE','REVOKED')`; `UNIQUE(key_hash)` | the enum |
+
+**Two lessons recorded with it:**
+- **The ceiling matters more than the floor.** The floor has two guards (`reserve`'s
+  `WHERE`, then the `CHECK`). The ceiling has one application-level guard and
+  the `CHECK`, so a duplicate release — a redelivered Kafka event, a bug — is
+  caught only by the database.
+- **A "value equals its own normalised form" check lets already-normalised junk
+  through.** `email = lower(btrim(email))` asks "are you identical to your
+  cleaned-up self?" An empty string is, because trimming it changes nothing, so
+  `''` was insertable until `length(email) > 0` was added. A whitespace-only
+  string was always rejected, but only because `btrim` turns it into `''`, which
+  differs from the input.
+
+**What a `CHECK` cannot do:** express "now" relative to the row at update time —
+which is why "frozen once the sale opens" is a service-layer rule — or validate
+an email properly. The `@` test is a minimal sanity gate, not validation; real
+checking is Bean Validation plus a verification flow.
+
+**Consequences:**
+A `CHECK` is never removed because it "duplicates" application logic. Every new
+`CHECK` is entered in this table with its primary guard, and is exercised by a
+test that tries to violate it.
+
+---
+
+## Decision: Who stamps a time column depends on who compares it
+
+**Context / Problem:**
+Four time columns were stamped three different ways, which looked inconsistent
+and was easy to "tidy" into one wrong rule. The difference is deliberate.
+
+**Chosen Approach:**
+Ask: *does anything compare this value across pods or services?*
+
+| Pattern | Used for | Why |
+|---|---|---|
+| **Java clock** — `@CreationTimestamp` / `@UpdateTimestamp` | `products.created_at`, `updated_at` | Audit only; nothing compares them across pods, so a slightly skewed pod clock harms nothing |
+| **Database default**, `insertable = false` | `stock_reservations.reserved_at` | The reconciler compares it against the database's `now()`; a pod clock could write a future value and hide a stale reservation |
+| **Database trigger, strictly increasing** | `brands.updated_at`, `users.updated_at` | Notification discards any event whose `updated_at` is not newer than what it holds; a later change stamped earlier is lost silently |
+
+All three are `TIMESTAMPTZ`/`Instant`. `flash_sales.start_time`/`end_time` are
+written by the application (they are business data, not audit stamps) but are
+`TIMESTAMPTZ` for the reason in the time-zone entry.
+
+**Why `insertable = false` alone was not the fix for `products`:** it fixes the
+INSERT but leaves the UPDATE broken, since Postgres never bumps `updated_at` by
+itself. And with `@CreationTimestamp` the column must stay insertable, because
+Hibernate generates the value and has to write it.
+
+**Consequences:**
+A new time column is placed in this table before it is written. Changing a row's
+pattern is a real decision, not a tidy-up.
+
+---
+
+## Decision: Service scaffolding — fixed ports, one shared credential pair, a separate database per service, and deferred dependencies
+
+**Context / Problem:**
+Identity, Order and Notification were added beside Inventory. The choices made
+while doing so were recorded only in `.env.example` and a commit message.
+
+**Chosen Approach:**
+1. **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
+   `8084`; `8080` reserved for the API Gateway. Every Spring Boot app defaults to
+   8080, so without fixed ports only one service could run at a time.
+2. **One `DB_USERNAME`/`DB_PASSWORD` pair for all four**, against one local
+   Postgres instance, supplied through each IDE run configuration and never
+   committed (`.env.example` documents the shape). A deliberate call for a
+   portfolio project; **each service still owns a separate *database***, so the
+   "services never share a schema" rule is intact.
+3. **Same dependency set in all four:** webmvc, data-jpa, actuator, Postgres,
+   Lombok, `spring-boot-starter-flyway` and `flyway-database-postgresql`. The
+   library alone is not enough under Spring Boot 4 — see the Flyway entry.
+4. **Deferred on purpose:** Kafka, OpenFeign, Resilience4j, Spring Security,
+   Validation. Each belongs to a later phase, and adding one early makes Spring
+   try to reach infrastructure that does not exist.
+5. **YAML configuration** (`application.yml`), matching Inventory; generated
+   `static/` and `templates/` folders are left in place — empty and harmless in
+   JSON-API services.
+6. **IntelliJ must be told about each Maven project.** A folder added from
+   outside shows a plain class icon and a disabled run button until its
+   `pom.xml` is added as a Maven project; the IDE saves that state lazily, so
+   the `.idea` files can lag the window.
+
+**Trade-offs:**
+- A shared credential weakens isolation between services — accepted for a
+  portfolio project; split into per-service variables only if the services ever
+  get separate credentials.
+- Ports are a convention in each `application.yml`, not enforced centrally.
+
+**Consequences:**
+The four services boot independently and can run together. The API Gateway
+takes 8080 when it exists.
+
+---
+
+## Decision: Entity tests run against real Postgres, roll back, and must be shown to fail
+
+**Context / Problem:**
+Hibernate's `validate` proved insufficient the first time a mapping was valid on
+paper and failed on a real save (the `NULL`-over-`DEFAULT` bug in `products`).
+`mvn compile` proved insufficient the first time Flyway silently never ran.
+Neither check exercises behaviour.
+
+**Chosen Approach:**
+1. **Persistence tests save into the real local Postgres inside a rolled-back
+   transaction**, so nothing persists. Per entity: round-trip of every field;
+   enums stored as text; generated and trigger-maintained columns populated; and
+   every constraint tried and shown to *reject* a bad row, not merely to exist.
+2. **A passing test is not evidence; a test shown to fail is.** Each guard is
+   checked by deliberately breaking the thing it protects and confirming the
+   right test fails and nothing else:
+
+   | Broken on purpose | Failed, exactly |
+   |---|---|
+   | removed `insertable = false` from `reserved_at` | all five reservation tests |
+   | trigger weakened to plain `clock_timestamp()` | the "row ahead of the clock" test |
+   | `users` trigger dropped | the two `updated_at` tests |
+   | `start_time` returned to zone-less | both time-zone tests, with the wrong answers |
+   | a zone-less column added to `products` | the guard test, naming `products.promo_starts_at` |
+
+3. **A control accompanies any test that asserts the absence of a bug.**
+   `TimeZoneConsistencyTest` includes a zone-less temporary table asserting the
+   bug *does* reproduce there, so the real assertions cannot pass for the wrong
+   reason.
+4. **Tests that depend on a database property use an adversarial input.** The
+   trigger test seeds a row whose `updated_at` is an hour *ahead* of the clock;
+   an ordinary row cannot distinguish "old + 1 µs" from "copy the clock".
+5. **`NoZoneLessTimestampsTest` exists in all four services.** It reads
+   `information_schema` and fails, naming the column, if any `public` column is
+   `timestamp without time zone` (excluding Flyway's own table). It turns the
+   `TIMESTAMPTZ` rule from a convention into a check, and applies to Order and
+   Notification from their first migration.
+
+**Trade-offs:**
+- Tests need a running local Postgres and the credentials in the environment;
+  there is no Testcontainers setup, so a test that leaked rows could disturb
+  another. Rollback is what prevents that, and a check for leftover rows was run
+  after each piece.
+- The guard test reads the whole schema, so it also fails on a column added by
+  an unrelated piece — which is its purpose.
+- `validate`, triggers and defaults remain invisible to Hibernate; these tests
+  are what see them.
+
+**Consequences:**
+Totals: Inventory 19 (17 entity and time-zone tests, the guard, a context test),
+Identity 24 (22, the guard, a context test), Order and Notification 2 each. All
+persistence behaviour above is *tested*, not load-tested or verified under
+concurrency — no `reserve` exists to test.
 
 ---
 
