@@ -4,10 +4,11 @@
 **Backend Engineering — Spring Boot Microservices**
 Prepared by Akshansh · **Revision 4 — September 2026** (supersedes Revision 3, September 2026)
 
-> **Status of this document.** Everything here is **designed**, not implemented, tested, or
-> load-tested. No service module, entity, migration, or build file exists yet; the repository
-> contains `CLAUDE.md` and the `docs/` files only. Section 8's metrics are **targets until
-> measured**.
+> **Status of this document.** The design is **designed**; only the entity layer exists.
+> Implemented and persistence-tested: Inventory's four entities and Identity's `brands`, on Flyway
+> migrations. Order and Notification are scaffolded only; no repositories, services, controllers,
+> gateway, Kafka, Redis or security exist anywhere. Nothing is load-tested or verified under
+> failure. Section 8's metrics are **targets until measured**. Details in §9.
 >
 > **Source of truth.** `docs/architecture.md` (reflecting `docs/decisions.md` through
 > Revision 3) is authoritative. This document is regenerated from it and is subordinate to it
@@ -295,7 +296,8 @@ loop over each item:
   Inventory           : ONE local tx --
                           1. existing reservation for (orderId, item)? -> return it
                           2. liveness gate  (DB clock, computed, same statement)
-                          3. version-checked UPDATE of available_stock
+                          3. conditional UPDATE of available_stock (write path still
+                             open: `version = ?` vs value-based `available_stock >= ?` — §10)
                           4. INSERT stock_reservations (UNIQUE(order_id, flash_sale_item_id))
   Inventory --> Order : { success, reservationId, salePrice, brandId, productName }
   Order               : fill product_name / unit_price / subtotal on that order_item
@@ -401,7 +403,8 @@ Kafka -> Notification : BrandUpserted -> upsert brand_contacts
 
 ## 4. Data Model Per Service
 
-All five schemas are final at design level. **No schema has code behind it yet** (§9).
+All five schemas are final at design level. **Code exists for Inventory's four tables and
+Identity's `brands` only** (§9).
 Cross-service references are plain IDs with no DB-level foreign key.
 
 ### 4.1 Order Service
@@ -483,9 +486,17 @@ No `outbox` — Inventory publishes nothing.
 ```
 brands(id, name, email UNIQUE, password_hash, created_at, updated_at)
 users(id, name, email UNIQUE, password_hash, created_at, updated_at)
+  -- email stored trimmed + lowercased; CHECK (email = lower(btrim(email))) makes UNIQUE
+  --   case-insensitive in practice
+  -- created_at/updated_at are TIMESTAMPTZ, database-generated, never written by Java; a
+  --   BEFORE UPDATE trigger sets updated_at = GREATEST(clock_timestamp(), old + 1 µs) so it only
+  --   moves forward — Notification discards any event that looks older than what it holds
 api_keys(id, brand_id, key_hash UNIQUE, status ACTIVE|REVOKED, created_at)
   -- separate from JWT session auth: long-lived machine credential vs. short-lived session
+  -- key_hash is a fast, deterministic hash (SHA-256), looked up by WHERE key_hash = ?;
+  --   bcrypt would salt randomly and the lookup would never match. Revoked rows are kept
 outbox(id, aggregate_id, event_type, payload_json, published, created_at)
+  -- payload_json JSONB; partial index on (created_at) WHERE published = false
 ```
 
 ### 4.4 Notification Service
@@ -544,7 +555,7 @@ Each index is derived from a **named** query, not added defensively.
 | Order | `orders(status, payment_reconciled_at)` | Reconciliation sweep |
 | Order | `UNIQUE(buyer_id, idempotency_key)` | Idempotent retries; also "list my orders" |
 | Order | `refunds(status, next_retry_at)` | Refund worker's claim scan |
-| Order, Identity | `outbox(published, created_at)` | Outbox relay: unpublished events in order |
+| Order, Identity | `outbox(created_at) WHERE published = false` (partial) | Outbox relay: unpublished events in order; stays small because published rows are never indexed |
 | Inventory | `flash_sales(start_time, end_time)` | Liveness / sale listing |
 | Inventory | `stock_reservations(status, reserved_at)` | Stale-reservation reconciler |
 | Identity | `UNIQUE(api_keys.key_hash)` | API-key lookup on every brand API request |
@@ -662,11 +673,11 @@ Mapped session-for-session to the Coding Shuttle Razorpay Clone cohort schedule.
 
 | Session(s) | Cohort topic | FlashMart equivalent | State |
 |---|---|---|---|
-| 1 | Orientation | Repo setup, base Spring Boot app per service, docker-compose skeleton | Not started |
-| 2 | Gateway internals & diagrams | Architecture + purchase-flow sequence diagrams | Partly stale (§9) |
-| 3 | Requirement gathering | `docs/requirements.md` | Needs a Revision-3 pass |
-| 4 | Schema design | All five schemas + ERDs | **Design done**; ERDs need regenerating |
-| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **Next** |
+| 1 | Orientation | Repo setup, base Spring Boot app per service, docker-compose skeleton | **Partly done** — all four services scaffolded (own database, fixed port, Flyway); docker-compose skeleton not started |
+| 2 | Gateway internals & diagrams | Architecture + purchase-flow sequence diagrams | Done; current (§9) |
+| 3 | Requirement gathering | `docs/requirements.md` | Done; checked against Revision 3 on 2026-10-02 — behavioural only, no stale mechanism in it |
+| 4 | Schema design | All five schemas + ERDs | **Done** — ERDs regenerated and kept in sync as entities are written |
+| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities and Identity's `Brand` done; `users`, `api_keys`, `outbox`, all of Order, all of Notification remain. No repositories yet |
 | 7–8 | Merchant API — signup, API key | Identity Service: brand + buyer signup/login, brand API key generation, `BrandUpserted` / `UserUpserted` outbox rows | |
 | 9 | Order APIs with MapStruct | Order creation/status/list APIs, multi-item request/response, DTO↔entity mapping | |
 | 10 | Payment Initiate API, Strategy | Reserve endpoint + Order's per-item loop, all-or-nothing, contractual evaluation order | |
@@ -719,9 +730,14 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 | | |
 |---|---|
 | **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` through Revision 3 |
-| **Implemented** | **None.** The repository contains `CLAUDE.md` and the four `docs/` files only — no service modules, entities, migrations, or build files |
-| **Tested / load-tested** | **None** — nothing exists to test. The §8 targets remain unverified by explicit decision, not by omission |
+| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V5. **Identity:** `Brand`, Flyway V1–V2, including the `bump_updated_at` trigger. **Order, Notification:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
+| **Tested** | 15 persistence tests in Inventory, 8 in Identity, each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
+| **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
 | **Verified under failure** | None |
+
+**Ports:** identity `8081`, inventory `8082`, order `8083`, notification `8084`; `8080` is
+reserved for the API Gateway. All four services share one local Postgres credential pair but
+each owns a separate database.
 
 **Diagrams and ERDs: current.** All sequence diagrams (including the two that were
 pre-Revision-3 and the two that never existed — reconciliation sweep, partial-item failure)
@@ -729,9 +745,11 @@ and all four ERDs now live in the Notion FlashMart page as Mermaid blocks, match
 current design. This document is the Revision-4 pass over the PRD that `architecture.md`
 flagged as outstanding — also current.
 
-**Notion log cross-check:** its "API & Event Contracts" through "Load Testing & Verification"
-sections remain present but empty — consistent with the repo, since no code exists yet
-either. Its design sections (§1–5) are current as of this update.
+**Notion log cross-check:** its "JPA Entities & Repositories" section records every entity
+written so far and its "Infra Wiring" section records the project setup. "API & Event
+Contracts", "Feature Implementation", "Testing Per Feature" and "Load Testing & Verification"
+remain present but empty, consistent with the repo. Its design sections (§1–5) are current as
+of this update.
 
 ---
 
@@ -759,7 +777,18 @@ on prevention rather than independent correction.**
   (buyer pays on the gateway's side), now stated explicitly in `docs/requirements.md` §8.
   Outbound brand webhooks (§7, session 19–20) is resolved: dropped, no replacement — see
   `docs/decisions.md`.
-- Begin Sessions 5–6: JPA entities and repositories, starting with Inventory Service.
+- **Settle how `reserve` writes the decrement.** Two decision entries specify it incompatibly —
+  `WHERE version = ?` versus one statement checking `available_stock` and liveness against the
+  database clock. Under READ COMMITTED the value-based clause needs no retry; the version-based
+  one fails after any concurrent write. A native `UPDATE` also does not bump `version`. Must be
+  settled before `reserve` is built; recorded, not decided.
+- Enforce "frozen once the sale opens" (price, `total_stock`, times, cancellation) in the
+  service layer against the database clock — a CHECK cannot express it.
+- Identity, for the API phase: a lost signup race must read "email already taken", not a 500;
+  the JWT must say whether its subject is a brand or a user; published `outbox` rows need a
+  cleanup job.
+- Continue Sessions 5–6: Identity's `users`, `api_keys`, `outbox`; then Order's four tables and
+  Notification's three; then repositories. Inventory and Identity's `brands` are done.
 
 ---
 
@@ -796,5 +825,5 @@ on prevention rather than independent correction.**
 | `docs/architecture.md` | **Source of truth** — current design, supersedes this document on conflict |
 | `docs/decisions.md` | Per-decision context, options, trade-offs, consequences |
 | `docs/requirements.md` | `FR-*` / `NFR-*` requirement IDs |
-| `FlashMart_PRD_v4.md` (this) | Narrative plan: overview, concepts, flows, build plan, status |
+| `docs/Flashmart.prd` (this) | Narrative plan: overview, concepts, flows, build plan, status. Status, build-plan states and open items last synced 2026-10-02 |
 | `CLAUDE.md` | Working agreement and precedence rules |
