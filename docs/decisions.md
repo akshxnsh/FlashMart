@@ -3505,6 +3505,7 @@ skipped.
 | `notification_log` | `event_type`/`recipient_type`/`channel`/`status` vocabularies | **nothing** — a typo'd `recipient_type` would both mislabel the row and defeat the unique key that stops duplicate emails |
 | `notification_log` | `sent_at` non-null iff `SENT`; a `SENT` row has a `recipient_address` | the sending code setting them together |
 | `notification_log` | `attempts >= 0` | the retry worker's own increment |
+| `brand_contacts`, `buyer_contacts` | email normalised, non-empty, an `@` | the publishing service's own guards — which a separate database cannot assume were applied |
 | `brands`, `users` | email already lowercase and trimmed; `length(email) > 0`; an `@` with something on each side; `length(btrim(name)) > 0`; `UNIQUE(email)` | the entity's normalising setter; Bean Validation at the API |
 | `api_keys` | `status IN ('ACTIVE','REVOKED')`; `UNIQUE(key_hash)` | the enum |
 | `api_keys` | `key_hash ~ '^[0-9a-f]{64}$'` | **nothing** — the hashing code is the only other guard, and an uppercase hash or a bcrypt hash would otherwise fail silently at lookup time |
@@ -3677,7 +3678,7 @@ Neither check exercises behaviour.
 
 **Consequences:**
 Totals: Inventory 19 (17 entity and time-zone tests, the guard, a context test),
-Identity 47 (45, the guard, a context test), Notification 16 (14, the guard, a
+Identity 47 (45, the guard, a context test), Notification 29 (27, the guard, a
 context test), Order 2. All
 persistence behaviour above is *tested*, not load-tested or verified under
 concurrency — no `reserve` exists to test.
@@ -3753,6 +3754,66 @@ no-escalation decision.
 
 ---
 
+## Decision: the contact caches are keyed by the *other* service's id, and the conditional upsert's strict `<` depends on Identity's trigger
+
+**Context / Problem:**
+`brand_contacts`/`buyer_contacts` exist so Notification never has to ask
+Identity for an address at send time — Identity being down must not stop
+receipts. Writing them raised three questions the schema line never answered:
+what the key is, whether one table or two, and whether the documented
+`WHERE updated_at < EXCLUDED.updated_at` is actually safe.
+
+**Chosen Approach:**
+1. **The primary key is the other service's id** (`brand_id`, `user_id`), with
+   no surrogate — the project's first deliberate exception to
+   `BIGSERIAL`/`IDENTITY`. There is exactly one cache row per brand, so the
+   brand's own id *is* the natural key; a generated id would permit two rows
+   for one brand unless a `UNIQUE(brand_id)` were added as well, which is
+   strictly worse for the same result.
+2. **Two tables, not one with a `type` column.** A single table would need
+   `(type, id)` as its key, reintroducing exactly the ambiguity that
+   `outbox.aggregate_id` has — brand 7 and user 7 are different things that
+   share a number. Two tables make the confusion unrepresentable.
+3. **The same email guards as `brands`/`users`** (normalised, non-empty, an
+   `@` with something each side). Notification is a *separate database* and
+   cannot assume an event honoured the publisher's rules; without them a
+   malformed address sits in the cache until a send fails.
+4. **No `received_at`.** "Has my consumer stopped?" is a monitoring question,
+   and Kafka consumer lag answers it for every topic at once rather than for
+   one table by query. Rejected as a column that duplicates a better tool.
+
+**Why the strict `<` is correct, and what it rests on:**
+An equal timestamp is *skipped*. That is right only because Identity's
+`bump_updated_at` trigger makes `updated_at` strictly increasing **per row**:
+two genuine changes can never carry the same timestamp, so equal always means
+a redelivery. **This is the payoff for that trigger** — had `updated_at` been
+allowed to repeat, `<` would silently drop a real change and `<=` would
+reinstate the lost-update problem the guard exists to prevent.
+
+Verified rather than argued: with the `WHERE`, a stale event arriving after a
+newer one leaves the cache holding the newer address; with an unconditional
+upsert, the same two events leave it holding the **old** one. A
+changed-then-changed-back pair also lands correctly in either arrival order.
+
+**Trade-offs and limits, both recorded rather than closed:**
+- **The conditional upsert is a *query*, not a constraint.** Nothing in the
+  schema stops a future consumer writing an unconditional upsert; the tests
+  pin the statement's behaviour, not the consumer's choice of statement. Same
+  class as the "auth must filter on `status='ACTIVE'`" rule.
+- **Rows are simply absent for brands and buyers that existed before
+  Notification was deployed**, because nothing re-sends their upsert events.
+  The first receipt for such a brand fails, retries five times and stays
+  failed. The cure is a **one-off backfill republish from Identity** at
+  deployment — no column fixes it, and a synchronous fallback to Identity on a
+  cache miss would undo the entire reason the cache exists. Belongs to the
+  Kafka phase; recorded here so it is not discovered in production.
+
+**Consequences:**
+Notification Service's three tables are complete. The deployment backfill is
+now an Open Item.
+
+---
+
 ## Open Items (not yet designed)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -3819,6 +3880,13 @@ no-escalation decision.
   an entity save of the same row can silently overwrite a concurrent decrement
   with a stale in-memory `available_stock`; any raw SQL must do
   `version = version + 1` itself.
+- **A backfill republish for the contact caches (designed, not built).**
+  Nothing re-sends `BrandUpserted`/`UserUpserted` for brands and buyers that
+  existed before Notification was deployed, so their cache rows are absent and
+  their first receipt fails, retries five times and stays failed. Identity must
+  republish an upsert event for every existing brand and user as a one-off
+  deployment step. No schema change fixes it, and a synchronous fallback to
+  Identity on a cache miss would undo the reason the cache exists. Kafka phase.
 - **Enforcing "frozen once the sale opens" (designed, not built).** Price,
   `total_stock`, `start_time`, `end_time` and cancellation are mutable until
   `start_time` and frozen after. A `CHECK` cannot express it (it would have to

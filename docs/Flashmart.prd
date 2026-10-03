@@ -547,7 +547,17 @@ notification_log(id, order_id, event_type, recipient_type, channel, status,
 
 brand_contacts(brand_id, email, updated_at)   -- fed by BrandUpserted
 buyer_contacts(user_id,  email, updated_at)   -- fed by UserUpserted
-  -- upsert is conditional: ON CONFLICT ... WHERE updated_at < EXCLUDED.updated_at
+  -- PK is the other service's id (no surrogate): exactly one row per brand/buyer. Two
+  --   tables, not one with a type column -- brand 7 and user 7 are different things
+  -- updated_at is Identity's timestamp, carried on the event, not write time
+  -- upsert is conditional: ON CONFLICT ... WHERE updated_at < EXCLUDED.updated_at, so
+  --   correctness never depends on delivery order. The strict `<` works only because
+  --   bump_updated_at makes updated_at strictly increasing, so equal means redelivery
+  -- same email guards as brands/users: a separate database cannot assume the event
+  --   honoured the publisher's rules
+  -- the conditional upsert is a QUERY, so no constraint can force a future consumer to
+  --   use it; and brands existing before Notification was deployed have no row at all
+  --   until a one-off backfill republish (§10)
 ```
 
 ### 4.5 Cross-Service Relationships: IDs vs. Events
@@ -731,7 +741,7 @@ Mapped session-for-session to the Coding Shuttle Razorpay Clone cohort schedule.
 | 2 | Gateway internals & diagrams | Architecture + purchase-flow sequence diagrams | Done; current (§9) |
 | 3 | Requirement gathering | `docs/requirements.md` | Done; checked against Revision 3 on 2026-10-02 — behavioural only, no stale mechanism in it |
 | 4 | Schema design | All five schemas + ERDs | **Done** — ERDs regenerated and kept in sync as entities are written |
-| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory's four entities done and Identity complete (`Brand`, `User`, `ApiKey`, `OutboxEvent`); all of Order and all of Notification remain. No repositories yet |
+| 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **In progress** — Inventory, Identity and Notification complete; all of Order remains. No repositories yet |
 | 7–8 | Merchant API — signup, API key | Identity Service: brand + buyer signup/login, brand API key generation, `BrandUpserted` / `UserUpserted` outbox rows | |
 | 9 | Order APIs with MapStruct | Order creation/status/list APIs, multi-item request/response, DTO↔entity mapping | |
 | 10 | Payment Initiate API, Strategy | Reserve endpoint + Order's per-item loop, all-or-nothing, contractual evaluation order | |
@@ -784,8 +794,8 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 | | |
 |---|---|
 | **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` through Revision 3 |
-| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** complete — `Brand`, `User`, `ApiKey` and `OutboxEvent`, Flyway V1–V7, including the `bump_updated_at` trigger attached to both identity tables. **Notification:** `NotificationLog`, Flyway V1; its two contact caches remain. **Order:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
-| **Tested** | 17 entity and time-zone tests in Inventory, 45 in Identity and 14 in Notification (19, 47 and 16 including a context test and the zone-less-timestamp guard every service carries; Order has just those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
+| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V6, every time column `TIMESTAMPTZ`. **Identity:** complete — `Brand`, `User`, `ApiKey` and `OutboxEvent`, Flyway V1–V7, including the `bump_updated_at` trigger attached to both identity tables. **Notification:** complete — `NotificationLog`, `BrandContact`, `BuyerContact`, Flyway V1–V2. **Order:** scaffolded only (project, own database, port, empty `db/migration/`). **Nowhere:** repositories, services, controllers, gateway, Kafka, Redis, security |
+| **Tested** | 17 entity and time-zone tests in Inventory, 45 in Identity and 27 in Notification (19, 47 and 29 including a context test and the zone-less-timestamp guard every service carries; Order has just those two), each saving into real Postgres inside a rolled-back transaction; every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken |
 | **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
 | **Verified under failure** | None |
 
@@ -841,8 +851,11 @@ on prevention rather than independent correction.**
 - Identity, for the API phase: a lost signup race must read "email already taken", not a 500;
   the JWT must say whether its subject is a brand or a user; published `outbox` rows need a
   cleanup job.
-- Continue Sessions 5–6: Notification's two contact caches, then Order's four tables; then
-  repositories. Inventory, Identity and Notification's `notification_log` are done.
+- A one-off **backfill republish** from Identity when Notification is deployed: brands and
+  buyers that existed beforehand have no cached contact, so their first receipt fails and
+  stays failed. No schema change fixes it; a synchronous fallback would undo the cache.
+- Continue Sessions 5–6: Order's four tables, then repositories. Inventory, Identity and
+  Notification are done.
 
 ---
 

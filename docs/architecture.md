@@ -297,8 +297,31 @@ notification_log(id, order_id, event_type, recipient_type, channel, status,
 
 brand_contacts(brand_id, email, updated_at)     -- fed by BrandUpserted
 buyer_contacts(user_id, email, updated_at)      -- fed by UserUpserted
+  -- PK is the OTHER service's id, deliberately breaking the BIGSERIAL rule:
+  --   there is exactly one row per brand, so the brand's id IS the key. A
+  --   surrogate id would allow two rows per brand unless a UNIQUE were added
+  -- two tables, not one with a type column: brand 7 and user 7 are different
+  --   things, so one table would need (type, id) and would reintroduce
+  --   outbox.aggregate_id's ambiguity
+  -- updated_at is IDENTITY'S timestamp, carried on the event — not when this
+  --   row was written
   -- upsert is conditional: ON CONFLICT ... WHERE updated_at < EXCLUDED.updated_at
-  --   — correctness never depends on Kafka delivery order
+  --   — correctness never depends on Kafka delivery order. The strict `<` is
+  --   right ONLY because bump_updated_at makes updated_at strictly increasing
+  --   per row: two real changes can never share a timestamp, so equal always
+  --   means redelivery. Demonstrated: with the WHERE, a late stale event is
+  --   ignored; without it, the old address overwrites the new one
+  -- same email guards as brands/users (normalised, non-empty, an '@'):
+  --   Notification is a separate database and cannot assume an event honoured
+  --   the publisher's rules
+  -- NOT ENFORCEABLE BY SCHEMA: the conditional upsert is a query, so nothing
+  --   stops a future consumer writing an unconditional one. Tests pin the
+  --   statement's behaviour, not the consumer's choice of statement
+  -- DEPLOYMENT GAP: nothing re-sends BrandUpserted/UserUpserted for brands and
+  --   buyers that existed before Notification was deployed, so their rows are
+  --   simply absent and their first receipt fails. Needs a one-off backfill
+  --   republish from Identity — no column fixes it, and falling back to a
+  --   synchronous Identity lookup would undo the reason the cache exists
 ```
 
 Code behind these schemas so far: all four Inventory tables and Identity's
@@ -411,6 +434,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **Every event is a flat payload; money always crosses as a string** — no envelope, no version field, no `event_id`; discipline (add, never repurpose) does the job a version number would.
 - **Out-of-order `BrandUpserted`/`UserUpserted` is handled by a timestamp-conditional upsert**, not by requiring Kafka ordering — correctness never depends on delivery order.
 - **Notification's own retry is minimal by design** — capped backoff, a bare claim against concurrent instances, no fencing, no escalation; a missed email isn't a stuck refund.
+- **The contact caches are keyed by the other service's id, and their conditional upsert's strict `<` rests on that trigger** — equal timestamps are skipped, which is correct only because two real changes can never share one. The upsert is a *query*, so no constraint can force a future consumer to use it, and rows are absent entirely for brands that predate Notification's deployment until a backfill republish (§9).
 - **`brands`/`users` `updated_at` is database-generated and strictly increasing** — a `BEFORE UPDATE` trigger stamps `GREATEST(clock_timestamp(), old + 1 µs)`, because Notification's conditional upsert silently discards any event that looks older, so a lagging pod clock must never stamp a newer change with an older time. Emails are stored trimmed and lowercased with a CHECK, making `UNIQUE(email)` case-insensitive.
 - **Every time column is `TIMESTAMPTZ`/`Instant`, enforced by a guard test** — a zone-less `TIMESTAMP` compared against `now()` is read using the connection's time zone, so one sale read as open from one zone and closed from another. `NoZoneLessTimestampsTest` in every service fails, naming the column, if one appears.
 - **Who stamps a time column depends on who compares it** — Java clock for audit-only columns (`products`); database default with `insertable = false` where the database's `now()` is compared against it (`stock_reservations.reserved_at`); a strictly-increasing trigger where another service orders events by it (`brands`/`users.updated_at`).
@@ -437,16 +461,16 @@ through Revision 3.
 - **Identity Service** — complete: `Brand`, `User`, `ApiKey` and
   `OutboxEvent` on migrations V1–V7, including the `bump_updated_at` trigger
   attached to both identity tables.
-- **Notification Service** — `NotificationLog` on migration V1. Its
-  `brand_contacts`/`buyer_contacts` caches are not written.
+- **Notification Service** — complete: `NotificationLog`, `BrandContact` and
+  `BuyerContact` on migrations V1–V2.
 - **Order Service** — scaffolded only: a Spring Boot project, own database,
   fixed port, empty `db/migration/`. No entities.
 - **Not built anywhere:** repositories, services, controllers, the API
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 17 entity and time-zone tests in Inventory, 45 in Identity and 14 in
-Notification (19, 47 and 16 including a context test and the zone-less-timestamp
+**Tested:** 17 entity and time-zone tests in Inventory, 45 in Identity and 27 in
+Notification (19, 47 and 29 including a context test and the zone-less-timestamp
 guard that every service carries; Order has just those two), each saving
 into real Postgres inside a rolled-back transaction; every CHECK, unique key
 and FK is verified to reject bad rows, not merely to exist. The tests can
