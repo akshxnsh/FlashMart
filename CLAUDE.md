@@ -27,15 +27,27 @@ The Notion engineering log is Akshansh's personal record, not a source of truth.
 
 ## Working style (non-negotiable)
 
-1. **Understanding before code.** For anything non-trivial: what problem, why FlashMart needs it, what breaks without it, trade-offs. Then code.
-2. **One piece at a time, each growing on the last.** No roadmap of upcoming pieces. Akshansh names the next piece (build order below governs eligibility). After each piece, explain every file and every line written, including annotations, config and boilerplate. Do not move on until he can explain the piece back unaided.
-3. **He reasons first, every piece.** Before writing anything, ask what he expects it to look like and where it could break. Write it only after he answers, then compare his version with the real code. The comparison is the point.
-4. **Socratic on design, concurrency and failure modes.** Pose the failure scenario, let him reason, correct, guide, then build. Do not skip this because handing over code is faster.
+1. **Depth follows decisions.** The more design a piece carries, the slower and more Socratic you go; the more it is simply derived from decisions already in the docs, the faster you move. The test: *could this reasonably be written two ways that behave differently under concurrency, failure or retry, or that trade one property for another?* If yes, it carries a decision. If the docs already settle it and only typing remains, it is derived. Most pieces are a mix: slow down for the decision-bearing part and move fast through the rest.
+2. **Say which it is, in one line, before starting** ("derived from architecture.md §4" or "this carries a decision: X vs Y"), so Akshansh can overrule the call in either direction. When unsure, treat it as a decision.
+3. **Decision-bearing work:** understanding before code (what problem, why FlashMart needs it, what breaks without it, trade-offs). Ask what he expects it to look like and where it could break, and only after he answers write it, then compare his version with the real code; the comparison is the point. For design, concurrency and failure modes pose the failure scenario, let him reason, correct, guide, then build. One decision at a time, no roadmap handed over up front. Explain every line that carries behavior (annotations, constraints, queries, transaction boundaries). Do not skip this because handing over code is faster.
+4. **Derived work:** plan briefly, then batch it. Several entities, repositories or migrations in one pass is fine. No line-by-line walkthrough unless he asks. End with: what was built, the constraints or decisions it quietly carries, and 2-3 questions he should be able to answer about it. He is expected to read the migration SQL, since that is where the design lives.
 5. **Open decisions stop the work.** Locking strategy and isolation level on `flash_sale_items` are undecided (see Open decisions). When a piece would force either, stop and decide together before writing code that bakes one in.
 6. **Derive, don't copy.** Schema, boundaries and API shapes come from access patterns, failure isolation and the current docs. Check `decisions.md` / `architecture.md` before deriving from a diagram; Notion diagrams are snapshots.
 7. **Never claim untested things work.** Keep the labels distinct: designed / implemented / tested / load-tested / verified-under-failure. No invented numbers. Zero overselling under 5,000 concurrent requests against 500 units and p99 < 500 ms are **targets** until measured.
 8. **Don't silently improve the architecture.** If something looks off, flag it and discuss; do not refactor unasked.
 9. **Review means reading the code.** When reviewing an implementation, read the actual code. Separate real bugs (correctness, concurrency, transaction boundaries, security) from optional style points.
+
+## Verification (applies to every piece, derived or not)
+
+These rules do not scale down with depth. They are what let derived work move fast safely, and each exists because skipping it already cost a bug.
+
+1. **Every guard is shown to fail.** For each CHECK, unique key, trigger, CAS or conditional write, deliberately break what it protects (drop the constraint, remove the annotation, weaken the clause), run the suite, and confirm that **exactly the tests meant to catch it** fail. Then restore it. Report each break and its result. A passing test is not evidence; a test that has never failed has not been shown able to.
+2. **A test must exercise the path production uses.** A test that does `clear()` then `find()` reads a fresh row and passes with or without `@Generated`, so it cannot catch a field left null on the instance that was just persisted (the `StockReservation.reservedAt` bug). Before trusting a test, ask what it structurally cannot see.
+3. **Concurrency claims need a concurrent test.** Reasoning that something is race-safe is a hypothesis. Back it with a test that actually races (two threads on the last unit, a webhook against the sweep) and say what was and was not exercised. Never state a load or overselling result that was not measured.
+4. **Sweep siblings for the same gap.** When a rule is introduced or a bug fixed, grep every sibling table, entity and service for the same gap in the same piece. Inventory's V6/V7 were backfills for rules Identity already had; they should have been found when Identity was written. Services of the same shape must stay identical (poms, config, base tests) unless a difference is documented.
+5. **Pre-flight a migration before it ships.** Adding a constraint to a table that may hold rows: check what is there first and say what you found. Never edit an applied or pushed migration; add a new version.
+6. **Run the whole suite before committing, and report real numbers.** Say how many tests ran and passed. Do not write "green" in a commit message or summary unless it was run in this session.
+7. **A lesson that is general goes in the rules.** If a bug teaches something that applies beyond its own file, add one line here or to the conventions below, not only to the commit message. Keep this file lean: one line, not a story.
 
 ## Load-bearing design rules
 
@@ -66,11 +78,11 @@ Reasoning is in `decisions.md` ("Entity and migration conventions", "Database CH
 - **`validate` cannot see triggers, defaults or CHECKs.** Only a test catches a missing one.
 - **Constraint names are chosen:** `uk_`, `ck_`, `idx_`, `trg_` + table + purpose. Omit `@AllArgsConstructor` where a setter normalises.
 - **Raw SQL trap:** a native or `@Modifying` `UPDATE` does **not** bump `@Version`. Mixed with an entity save of the same row it can overwrite a concurrent decrement, so raw SQL must do `version = version + 1` itself.
-- **Tests** run against real Postgres in a rolled-back transaction, and **each guard is shown to fail** by deliberately breaking what it protects. A passing test is not evidence.
+- **Tests** run against real Postgres in a rolled-back transaction. The rules for trusting them are in "Verification" above.
 
 ## Git and engineering discipline
 
-- One branch per piece, **one focused commit** that explains *why*, merge `--no-ff`, delete the branch. Never amend a published commit unless asked. No unrelated changes in a feature commit.
+- One branch per piece (a derived batch counts as one piece), **one focused commit per logical unit** that explains *why*, merge `--no-ff`, delete the branch. Never amend a published commit unless asked. No unrelated changes in a feature commit.
 - No secrets committed. Keep `.env.example` current.
 - Only meaningful decisions go in `docs/decisions.md` (Decision / Context / Options Considered / Chosen Approach / Why / Trade-offs / Consequences). No entry for mechanical changes.
 - Before calling a feature done: implemented, tests added, failure cases considered, reviewed, committed, decision documented if warranted, **and Akshansh can explain it unaided**.
