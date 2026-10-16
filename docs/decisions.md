@@ -3814,6 +3814,117 @@ now an Open Item.
 
 ---
 
+## Decision: The payment webhook finds its order by our order id, never by `payment_ref`; `payment_ref` gets a partial `UNIQUE`
+
+**Context / Problem:**
+No document said how an incoming payment webhook locates its `orders` row. The
+obvious key, `payment_ref`, is `NULL` whenever Order crashed after the gateway
+accepted `initiate` but before the reference was saved. That is exactly the
+window in which a webhook is most likely to arrive for an order that "has no
+payment", so a lookup by `payment_ref` would fail where it matters most.
+
+**Options Considered:**
+1. **By `payment_ref`.** Fails in the crash window above.
+2. **By our order id, echoed back by the gateway.** A primary-key lookup that
+   always works, because Order created the id before any call went out.
+3. **By the idempotency key.** Works, but it is a function of the order id, so
+   it is option 2 with an extra column read.
+
+**Chosen Approach:**
+Option 2. The webhook carries our order reference (the order id). The handler
+loads the order by id, then applies the unchanged one-payment invariant: CAS to
+`PAID` only if `status='PENDING_PAYMENT' AND payment_ref=X`; already `PAID` with
+`payment_ref=X` is a redelivery no-op; otherwise refund `X`, taking `X` from the
+webhook. With `payment_ref` still `NULL` the CAS matches zero rows and the
+payment is refunded: the designed safe path, not a new case.
+
+`orders.payment_ref` also gets a **partial unique index**, `UNIQUE (payment_ref)
+WHERE payment_ref IS NOT NULL` (`uk_orders_payment_ref`). It is a safety net,
+not a lookup path: one payment must never belong to two orders, and this makes
+that a database fact, matching `refunds.UNIQUE(payment_ref)`. A bug that tried
+it would fail loudly instead of mixing two orders up.
+
+**Why:**
+The lookup must work in the one state where `payment_ref` is known to be
+absent. The order id is the only reference Order always has.
+
+**Trade-offs:**
+- A new requirement on Razorpay Clone: payments and webhooks must carry our
+  order reference. Razorpay's own payments carry an `order_id`, so this is
+  realistic, but the Clone is unbuilt, so it is **designed, not verified**.
+- One more index on `orders`, written once per `PENDING_PAYMENT` transition.
+
+**Consequences:**
+- A webhook naming an order id that does not exist cannot insert a `refunds`
+  row (`refunds.order_id` is a real FK). How that case is handled is **not yet
+  decided**; it belongs to the webhook-handler piece, and must alert and never
+  guess.
+- The test that exercises this must cover a webhook arriving while
+  `payment_ref IS NULL`, and a second order trying to save an already-used
+  `payment_ref`.
+
+---
+
+## Decision: Order Service's guards ship in its first migration, and the database clock stamps every time column that is compared
+
+**Context / Problem:**
+Two things were open for the Order tables, which do not exist yet: which
+`CHECK`s to add, and which clock writes each time column. Inventory's V1–V6
+predated its `CHECK` philosophy, so V7 had to backfill guards as a separate
+migration. Adding a constraint to a table that may hold rows costs a new
+version, a pre-flight for bad rows and extra tests.
+
+**Chosen Approach:**
+*Guards, all in Order's first migration:*
+- `order_items.quantity > 0`.
+- `product_name`, `unit_price` and `subtotal` are all `NULL` or all non-`NULL`
+  (an item is either unpriced or fully priced), and
+  `subtotal = unit_price * quantity` when filled.
+- `unit_price >= 0`, `subtotal >= 0`, `orders.amount >= 0`.
+- `refunds.amount > 0`, `refunds.attempts >= 0`, and a `CHECK` on
+  `refunds.status` for `PENDING | PROCESSING | SUCCEEDED | NEEDS_MANUAL_REVIEW`.
+- `outbox.event_type IN ('PaymentConfirmed','OrderCancelled')` and
+  `outbox.attempts >= 0`.
+- `orders.status` `CHECK` for the seven states, and `orders.expires_at NOT NULL`
+  (a `NULL` deadline is never "less than now", so that order would be invisible
+  to the expiry sweep and hold stock forever).
+- The existing `CHECK (status NOT IN ('PENDING_PAYMENT','PAID') OR amount IS NOT NULL)`
+  and the `UNIQUE`s in `architecture.md` §4.
+
+*Clocks (the rule from "Who stamps a time column depends on who compares it"):*
+- **Database clock, written inside the SQL:** `expires_at` (`now() + <interval>`,
+  Java supplies only the duration), `refunds.claimed_at` and `next_retry_at`,
+  `payment_reconciled_at`, `outbox.published_at`. `expires_at` has no column
+  `DEFAULT`, because a default would hard-code a deadline.
+- **Database default, `insertable = false` + `@Generated`:** every `created_at`.
+- **Database trigger:** `updated_at` on `orders` and `refunds`. Order's CAS
+  writes are raw SQL, which skips Hibernate's `@UpdateTimestamp`, so a Java-side
+  `updated_at` would silently stop moving on every status change. The trigger
+  function is the same body as Identity's `bump_updated_at`, created again in
+  Order's own migration because a function lives in one database. A trigger
+  cannot be forgotten by a new code path; `validate` cannot see it, so a test
+  must (and must be shown to fail without it).
+
+The deadline *values* (the `CREATED` deadline, the payment window, the sweep
+interval, the refund claim lease) stay open until the Feign/Resilience4j
+timeouts exist. This entry fixes only which clock writes them.
+
+**Why:**
+Every guard is cheapest before the table exists. Every compared time must come
+from the one clock the sweeps compare it against, or two pods can disagree at
+the boundary, the two-clocks problem again.
+
+**Trade-offs:**
+A longer first migration, and each guard needs a test shown to fail. A guard
+that duplicates application logic is kept anyway (`CHECK`s are the last line of
+defence).
+
+**Consequences:**
+A racing test is required for the `CREATED → PENDING_PAYMENT` statement against
+the expiry sweep (status, `payment_ref` and `expires_at` in one CAS).
+
+---
+
 ## Open Items (not yet designed)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -3903,7 +4014,10 @@ now an Open Item.
   `initiate`, idempotency keys honoured on `refund`, and a payment-status
   lookup endpoint — which must be queryable by *our* idempotency key or
   merchant order reference, not only by the gateway's own payment ID, since
-  the reconciliation sweep has no payment ID to offer. These are specified in that project's own requirements and
+  the reconciliation sweep has no payment ID to offer. A fourth: payments and
+  their webhooks must carry **our order id**, since that is how the webhook
+  finds its order (see "The payment webhook finds its order by our order id").
+  These are specified in that project's own requirements and
   are **designed, not verified** — no FlashMart code or doc may treat them as
   proven. Correctness does not depend on them (the one-payment invariant and
   the already-refunded check cover the failure), but the duplicate-prevention

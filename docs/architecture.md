@@ -45,14 +45,15 @@ proceeding.
 - **Inventory → Order** — `GET /internal/orders/{orderId}/status` → `{ orderId, status }`, used by Inventory's stale-reservation reconciler. `PAID` → confirm; terminal failure → release; `CREATED`/`PENDING_PAYMENT` → do nothing **and alert** (an hours-old reservation on a live order means Order's sweep has died); `404`/unreachable → do nothing and alert, never guess. Safe without locking: every answer acted on is terminal and can't change after being read. Internal only. The reconciler scans a bounded number of rows per pass, so a systemic backlog (e.g. Kafka down for hours) can't flood Order.
 
 > **Cross-project caveat:** Razorpay Clone is not built yet. Idempotency on
-> `initiate` and `refund`, and a payment-status lookup by our key, are
+> `initiate` and `refund`, a payment-status lookup by our key, and payments and
+> webhooks that carry our order id, are
 > requirements placed on it — designed, not verified. Correctness never
 > depends on them: the one-payment invariant (§6) and the already-refunded
 > check catch the failure either way. Prevention and correction are
 > deliberately independent.
 
 **Asynchronous — inbound webhook:**
-- **Razorpay Clone → Order** — payment result, signature-verified (FR-P2). Applies the one-payment invariant (§6); returns 200 only after its transaction commits, so a pre-commit crash is replayed by the gateway's own retry.
+- **Razorpay Clone → Order** — payment result, signature-verified (FR-P2). Carries **our order id**, by which Order loads the row (never by `payment_ref`, which may be `NULL`; §6). Applies the one-payment invariant (§6); returns 200 only after its transaction commits, so a pre-commit crash is replayed by the gateway's own retry.
 
 **Asynchronous — Kafka** (each publisher owns an `outbox`, same local
 transaction as the business change):
@@ -83,17 +84,29 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
        payment_ref, expires_at, failure_detail, payment_reconciled_at,
        created_at, updated_at)
   -- flash_sale_id: order-level — one order = exactly one brand's sale
-  -- amount: SUM(order_items.subtotal), DECIMAL, NULL until the last item priced
+  -- amount: SUM(order_items.subtotal), DECIMAL, stored (the price the buyer
+  --   agreed to, frozen). NULL until the last item is priced; set once by a CAS
+  --   guarded on status = CREATED; a test checks it equals SUM(subtotal)
   -- status: CREATED | PENDING_PAYMENT | PAID | PAYMENT_FAILED
   --         | ORDER_EXPIRED | PAYMENT_UNAVAILABLE | RESERVATION_FAILED
+  --         (CHECK on the seven values)
   -- idempotency_key: UNIQUE(buyer_id, idempotency_key)
-  -- payment_ref: NULL until initiate is saved; what the one-payment CAS matches on
-  -- expires_at: means two things by status — bounds the reserve loop while
-  --   CREATED, reset to the payment window on entering PENDING_PAYMENT
+  -- payment_ref: NULL until initiate is saved; what the one-payment CAS matches on.
+  --   NOT how a webhook finds its order — that is the order id (§3, §6).
+  --   Partial UNIQUE (payment_ref) WHERE payment_ref IS NOT NULL: one payment
+  --   never belongs to two orders (safety net, not a lookup path)
+  -- expires_at: NOT NULL; means two things by status — bounds the reserve loop
+  --   while CREATED, reset to the payment window on entering PENDING_PAYMENT.
+  --   One column, because an order has exactly one live deadline. The move is
+  --   ONE statement (status + payment_ref + expires_at), so no gap lets the
+  --   sweep expire a healthy order. Written as now() + interval in SQL (DB clock)
   -- failure_detail: nullable, debug only — never drives state
   -- payment_reconciled_at: nullable; set once the reconciliation sweep has
-  --   settled this order. Bounds and idempotency-guards the sweep
+  --   settled this order (DB clock). Bounds and idempotency-guards the sweep
   -- CHECK (status NOT IN ('PENDING_PAYMENT','PAID') OR amount IS NOT NULL)
+  -- CHECK (amount IS NULL OR amount >= 0)
+  -- created_at: DB default. updated_at: DB trigger (CAS writes are raw SQL and
+  --   skip Hibernate's @UpdateTimestamp)
   -- index: (status, expires_at) expiry sweep; (status, payment_reconciled_at) reconciliation sweep
 
 order_items(id, order_id, product_id, product_name, quantity, unit_price, subtotal)
@@ -102,14 +115,20 @@ order_items(id, order_id, product_id, product_name, quantity, unit_price, subtot
   --   stay NULL until that item's reserve() returns them
   -- product_name: snapshotted at reservation time, never resynced — a
   --   receipt shows what was bought, not the product's current name
+  -- CHECK (quantity > 0); CHECK unit_price >= 0 AND subtotal >= 0
+  -- CHECK product_name, unit_price, subtotal all NULL or all non-NULL
+  -- CHECK subtotal = unit_price * quantity when filled
 
 refunds(id, order_id, payment_ref, amount, status, attempts,
         next_retry_at, claimed_at, last_error, created_at, updated_at)
   -- a command outbox (only consumer is Order itself) — not an event outbox
   -- UNIQUE(payment_ref) — refunds are per payment, not per order
   -- status: PENDING | PROCESSING | SUCCEEDED | NEEDS_MANUAL_REVIEW
-  -- amount: DECIMAL, from the webhook's reported amount
+  -- amount: DECIMAL, from the webhook's reported amount; CHECK amount > 0
+  -- CHECK on status (the four values); CHECK attempts >= 0
   -- claimed_at: claim lease + fence token for the worker's finishing write
+  --   (DB clock, set inside the claim SQL; so is next_retry_at)
+  -- created_at: DB default. updated_at: DB trigger
   -- index: (status, next_retry_at)
 
 outbox(id, aggregate_id, event_type, payload_json, created_at,
@@ -119,7 +138,14 @@ outbox(id, aggregate_id, event_type, payload_json, created_at,
   --   cannot stall the relay, JSONB payload, and a PARTIAL index on
   --   (created_at) WHERE published_at IS NULL. The relay claims rows with
   --   FOR UPDATE SKIP LOCKED
+  -- CHECK event_type IN ('PaymentConfirmed','OrderCancelled') — Order's own
+  --   vocabulary, as Identity's is pinned (V7); CHECK attempts >= 0
+  -- created_at: DB default; published_at: DB clock, set in the UPDATE
 ```
+All of the above guards ship in Order's first migration, not as a later
+backfill (see decisions.md, "Order Service's guards ship in its first
+migration"). The `updated_at` trigger function is Identity's `bump_updated_at`
+body, created again in Order's own database.
 
 ### Inventory Service
 ```
@@ -396,7 +422,9 @@ exists.
 
 **One invariant governs every late or duplicate payment:** *an order keeps
 exactly one payment; every other captured payment is refunded.* For a
-`SUCCESS` webhook carrying reference `X`: CAS to `PAID` only if
+`SUCCESS` webhook carrying reference `X` (the handler first loads the order by
+the **order id** the webhook carries; `payment_ref` is no lookup key, and is
+partial-`UNIQUE` only as a safety net): CAS to `PAID` only if
 `status='PENDING_PAYMENT' AND payment_ref=X`; if that fails and the order is
 already `PAID` with `payment_ref=X`, it's a redelivery (no-op); otherwise
 refund `X` (from the webhook, not `orders.payment_ref`, which may be `NULL`
@@ -455,23 +483,28 @@ through Revision 3.
 
 **Implemented:**
 - **Inventory Service** — all four entities (`Product`, `FlashSale`,
-  `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V6. Every time
+  `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V7. Every time
   column is `TIMESTAMPTZ`, read as `Instant` (V6 converted the original
-  zone-less `TIMESTAMP`; see §9).
+  zone-less `TIMESTAMP`; see §9). V7 backfilled the window-ordering and
+  non-blank-name `CHECK`s, and `StockReservation.reservedAt` carries
+  `@Generated` so the saved instance reads the database's value back.
 - **Identity Service** — complete: `Brand`, `User`, `ApiKey` and
   `OutboxEvent` on migrations V1–V7, including the `bump_updated_at` trigger
   attached to both identity tables.
 - **Notification Service** — complete: `NotificationLog`, `BrandContact` and
   `BuyerContact` on migrations V1–V2.
 - **Order Service** — scaffolded only: a Spring Boot project, own database,
-  fixed port, empty `db/migration/`. No entities.
+  fixed port, empty `db/migration/`. No entities. **Schema design is closed**
+  (§4, plus the two decisions on webhook lookup and on guards and clocks); the
+  entities and first migration are the next piece.
 - **Not built anywhere:** repositories, services, controllers, the API
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 17 entity and time-zone tests in Inventory, 45 in Identity and 27 in
-Notification (19, 47 and 29 including a context test and the zone-less-timestamp
-guard that every service carries; Order has just those two), each saving
+**Tested:** 22 entity and time-zone tests in Inventory, 45 in Identity and 27 in
+Notification (24, 47 and 29 including a context test and the zone-less-timestamp
+guard that every service carries; Order has just those two). Counted from the
+`@Test` methods in the repo, not from a run in this session, each saving
 into real Postgres inside a rolled-back transaction; every CHECK, unique key
 and FK is verified to reject bad rows, not merely to exist. The tests can
 fail: weakening `reserved_at`'s mapping and the `updated_at` trigger each
