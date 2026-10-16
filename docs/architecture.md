@@ -493,24 +493,44 @@ through Revision 3.
   attached to both identity tables.
 - **Notification Service** — complete: `NotificationLog`, `BrandContact` and
   `BuyerContact` on migrations V1–V2.
-- **Order Service** — scaffolded only: a Spring Boot project, own database,
-  fixed port, empty `db/migration/`. No entities. **Schema design is closed**
-  (§4, plus the two decisions on webhook lookup and on guards and clocks); the
-  entities and first migration are the next piece.
+- **Order Service** — all four tables (`orders`, `order_items`, `refunds`,
+  `outbox`) on migrations V1–V5, with `Order`, `OrderItem`, `Refund`,
+  `OutboxEvent` and the two status enums. Every guard in §4 shipped in this
+  first migration rather than as a backfill, including the partial
+  `UNIQUE (payment_ref) WHERE payment_ref IS NOT NULL`, the seven-state
+  `orders.status` `CHECK`, `expires_at NOT NULL` with no `DEFAULT`, the
+  `order_items` all-or-none pricing and `subtotal = unit_price * quantity`
+  guards, and an `outbox.event_type` `CHECK` pinned to Order's two events.
+  `bump_updated_at` is recreated in Order's own database and attached to
+  `orders` and `refunds`. **Still no repositories, services or controllers**,
+  so nothing yet writes a CAS.
 - **Not built anywhere:** repositories, services, controllers, the API
   Gateway, Kafka, Redis, security. All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested:** 22 entity and time-zone tests in Inventory, 45 in Identity and 27 in
-Notification (24, 47 and 29 including a context test and the zone-less-timestamp
-guard that every service carries; Order has just those two). Counted from the
-`@Test` methods in the repo, not from a run in this session, each saving
-into real Postgres inside a rolled-back transaction; every CHECK, unique key
-and FK is verified to reject bad rows, not merely to exist. The tests can
-fail: weakening `reserved_at`'s mapping and the `updated_at` trigger each
-broke exactly the tests meant to catch it. **Not load-tested, not verified
-under concurrency or failure** — no `reserve` exists yet. NFR-P1–P4 remain
-unverified targets by explicit decision, not by omission.
+**Tested: 159 tests, all passing, run in this session** — 59 in Order, 47 in
+Identity, 29 in Notification, 24 in Inventory (each count includes a context
+test and the zone-less-timestamp guard every service carries). Each saves into
+real Postgres inside a rolled-back transaction; every CHECK, unique key and FK
+is verified to reject bad rows, not merely to exist.
+
+The tests are shown able to fail, not assumed to be. Order's 30 mutations —
+25 applied to the database, 5 stripping an `@Generated` — killed exactly the
+intended tests, with three documented exceptions where one constraint masks
+another (the two `order_items` non-negative checks mask each other; the
+`outbox` blank-`event_type` check is strictly weaker than the known-value
+check, as Identity's is). Dropping each masked pair together does fail its
+test, so none is dead. Earlier, weakening `reserved_at`'s mapping and the
+`updated_at` trigger each broke exactly the tests meant to catch them.
+
+One known limit on `NOT NULL`: an entity-level `nullable = false` makes
+Hibernate reject a null before Postgres sees it, so such a test passes with or
+without the column constraint. `orders.expires_at` therefore has a native-SQL
+test as well; no other `NOT NULL` in any service is guarded this way.
+
+**Not load-tested, not verified under concurrency or failure** — no `reserve`
+exists yet. NFR-P1–P4 remain unverified targets by explicit decision, not by
+omission.
 
 **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
 `8084`; `8080` is reserved for the API Gateway.

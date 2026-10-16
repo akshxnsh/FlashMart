@@ -3077,9 +3077,9 @@ fixed by writing a new forward migration, not by reverting the old one.
 
 **Consequences:**
 - Every future `@Entity` in every service pairs 1:1 with a migration file.
-  *(Done for Inventory: migrations V1–V6 for its four entities; for Identity,
-  V1–V7 for `brands`, `users`, `api_keys`, `outbox` and the `bump_updated_at` trigger function. Order and
-  Notification have an empty `db/migration/` and no entities yet.)*
+  *(Held in all four services. Per-service migration ranges and entity lists
+  live in `architecture.md` §8, the status source of truth — they are not
+  repeated here, because this note had gone stale twice.)*
 - `db/migration/` exists in every service, establishing the convention.
 - **Correction found when this was first booted:** the Flyway *library*
   (`flyway-database-postgresql`) alone does nothing under Spring Boot 4 —
