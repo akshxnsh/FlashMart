@@ -88,6 +88,25 @@ class StockReservationPersistenceTest {
         assertNotNull(loaded.getReservedAt());
     }
 
+    /**
+     * Deliberately no clear()/find(): this asserts on the instance that was just
+     * persisted, not on a fresh read of the row. The test above passes either
+     * way, because a fresh read always sees what the DEFAULT wrote; only this
+     * one fails if @Generated is missing and Hibernate never reads the value
+     * back onto the object the caller is still holding.
+     */
+    @Test
+    void reservedAtIsReadBackOntoTheInstanceThatWasPersisted() {
+        persistParents();
+        StockReservation reservation = newReservation(42L, 3);
+
+        entityManager.persist(reservation);
+        entityManager.flush();
+
+        assertNotNull(reservation.getReservedAt(),
+                "reserved_at was not read back after insert — is @Generated missing?");
+    }
+
     @Test
     void statusIsStoredAsTextNotAsANumber() {
         persistParents();

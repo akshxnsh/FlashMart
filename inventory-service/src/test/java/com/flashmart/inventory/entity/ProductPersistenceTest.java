@@ -71,4 +71,21 @@ class ProductPersistenceTest {
             entityManager.flush();
         });
     }
+
+    /**
+     * A blank name is snapshotted into order_items.product_name at reservation
+     * time and printed on the receipt, so it survives into a permanent record
+     * of a completed purchase. NOT NULL stops NULL; only the CHECK stops '   '.
+     */
+    @Test
+    void aBlankNameIsRejected() {
+        Product product = new Product();
+        product.setBrandId(1L);
+        product.setName("   ");
+
+        assertThrows(PersistenceException.class, () -> {
+            entityManager.persist(product);
+            entityManager.flush();
+        });
+    }
 }

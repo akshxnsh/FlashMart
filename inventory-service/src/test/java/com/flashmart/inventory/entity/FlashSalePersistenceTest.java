@@ -1,6 +1,7 @@
 package com.flashmart.inventory.entity;
 
 import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceException;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -10,6 +11,7 @@ import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @SpringBootTest
 @Transactional
@@ -60,5 +62,47 @@ class FlashSalePersistenceTest {
                 .getSingleResult();
 
         assertEquals("ACTIVE", raw);
+    }
+
+    /**
+     * Liveness is half-open — start_time <= now < end_time — so an end_time at
+     * or before start_time makes the interval empty and the sale can never
+     * open. It then cannot be edited (terms freeze at start_time) or cancelled
+     * (a started sale can't be), so the row is unreachable in every direction.
+     */
+    @Test
+    void anEndTimeBeforeTheStartTimeIsRejected() {
+        FlashSale sale = newSale();
+        sale.setStartTime(END);
+        sale.setEndTime(START);
+
+        assertThrows(PersistenceException.class, () -> {
+            entityManager.persist(sale);
+            entityManager.flush();
+        });
+    }
+
+    /** The boundary case: [start, start) is empty too, hence a strict `>`. */
+    @Test
+    void anEndTimeEqualToTheStartTimeIsRejected() {
+        FlashSale sale = newSale();
+        sale.setStartTime(START);
+        sale.setEndTime(START);
+
+        assertThrows(PersistenceException.class, () -> {
+            entityManager.persist(sale);
+            entityManager.flush();
+        });
+    }
+
+    @Test
+    void aBlankNameIsRejected() {
+        FlashSale sale = newSale();
+        sale.setName("   ");
+
+        assertThrows(PersistenceException.class, () -> {
+            entityManager.persist(sale);
+            entityManager.flush();
+        });
     }
 }
