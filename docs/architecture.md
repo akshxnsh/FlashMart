@@ -581,6 +581,21 @@ each is blocked on something that doesn't exist yet, or is mechanical work.
   That was the two-clocks problem the DB-clock rule exists to remove,
   reintroduced through the column type. Any new time column must be
   `TIMESTAMPTZ`; never compare a zone-less column against `now()`.
+- **Two database clock functions are in use for the same job (recorded, not
+  decided).** `stock_reservations.reserved_at` defaults to `now()`
+  (`transaction_timestamp()` — when the transaction began); Identity's
+  `updated_at` trigger and Order's DB-stamped columns use `clock_timestamp()`
+  (when the statement runs). Neither is a bug: a strictly increasing
+  `updated_at` *must* use `clock_timestamp()`, since `now()` is constant within
+  a transaction and two updates would tie. But for `reserved_at`, which the
+  reconciler compares against the database's `now()`, a long transaction stamps
+  an earlier time than the write — a silent offset nobody chose. "Who stamps a
+  time column" fixes which *clock* and not which *function*, so decide it on
+  purpose and write it into that rule before the next such column is added.
+  Separately, and not a defect: `products` uses
+  `@CreationTimestamp`/`@UpdateTimestamp`, so its `DEFAULT now()` is
+  unreachable from the app (correct under "Java clock for audit-only", and
+  therefore untested). Found by the Order piece's sibling sweep.
 - **Settle how `reserve` writes the decrement.** Two decision entries specify
   it incompatibly: `WHERE id = ? AND version = ?` versus one statement
   checking `available_stock` and liveness against the database clock. Under

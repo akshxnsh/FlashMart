@@ -3998,6 +3998,38 @@ the expiry sweep (status, `payment_ref` and `expires_at` in one CAS).
   republish an upsert event for every existing brand and user as a one-off
   deployment step. No schema change fixes it, and a synchronous fallback to
   Identity on a cache miss would undo the reason the cache exists. Kafka phase.
+- **Two database clock functions are in use for the same job (recorded, not
+  decided).** `stock_reservations.reserved_at` defaults to `now()`, which is
+  `transaction_timestamp()` — the moment the transaction *began*. Identity's
+  `bump_updated_at` trigger and every DB-stamped column in Order use
+  `clock_timestamp()`, the moment the *statement* runs. Neither is a bug, and
+  each is defensible where it sits: a strictly increasing `updated_at` requires
+  `clock_timestamp()`, because `now()` is constant within a transaction and two
+  updates in one transaction would tie, which is exactly what the strict `<` in
+  Notification's conditional upsert cannot survive.
+
+  The gap is that "Who stamps a time column depends on who compares it" settles
+  *which clock* (Java, DB default, DB trigger) but is silent on *which DB
+  function*, so the choice has been made twice by accident rather than once on
+  purpose. It has a real consequence for `reserved_at`, which the
+  stale-reservation reconciler compares against the database's `now()`: under a
+  long transaction, `now()` stamps a time earlier than the write actually
+  happened, so the reservation reads as older than it is and becomes eligible
+  for reconciliation sooner. Harmless at current transaction lengths and
+  arguably the conservative direction, but it is a silent offset nobody chose.
+
+  To settle before the next "compared against `now()`" column is added: pick
+  the function deliberately and write it into the third column of that
+  decision's table, so the next such column inherits a rule instead of a
+  precedent.
+
+  Noted alongside it, and **not** a defect: `products` uses
+  `@CreationTimestamp`/`@UpdateTimestamp`, so its `DEFAULT now()` is
+  unreachable from the application — Hibernate always sends an explicit value.
+  That is correct under "Java clock for audit-only"; the default only matters
+  to a raw-SQL insert, and is therefore untested.
+
+  Found by the sibling sweep the Order schema piece ran, not by a failure.
 - **Enforcing "frozen once the sale opens" (designed, not built).** Price,
   `total_stock`, `start_time`, `end_time` and cancellation are mutable until
   `start_time` and frozen after. A `CHECK` cannot express it (it would have to
