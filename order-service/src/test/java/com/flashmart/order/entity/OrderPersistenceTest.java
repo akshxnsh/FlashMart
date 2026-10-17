@@ -193,10 +193,15 @@ class OrderPersistenceTest {
     }
 
     /**
-     * The half of the partial unique index that a total UNIQUE would break.
-     * Every order sits at payment_ref IS NULL until initiate is saved, so if
-     * the index were not partial only one unpaid order could exist at a time,
-     * which is to say the system would stop working under its own load.
+     * Pins a requirement, not the index's shape: every order sits at
+     * payment_ref IS NULL until initiate is saved, so many must coexist there.
+     *
+     * <p>This passes because Postgres treats NULLs in a unique index as
+     * distinct — which means a <em>total</em> UNIQUE would pass it too. It is
+     * therefore not a test of {@code uk_orders_payment_ref} being partial;
+     * nothing can be, since the two behave identically. What it does catch is
+     * the assumption underneath changing: {@code NULLS NOT DISTINCT}, or a
+     * move to a database that folds NULLs together.
      */
     @Test
     void manyOrdersMayHaveNoPaymentRefAtAll() {

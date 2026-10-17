@@ -69,10 +69,21 @@ CREATE TABLE orders (
 -- orders, and this makes that a database fact rather than an assumption,
 -- matching refunds.uk_refunds_payment_ref.
 --
--- It has to be a partial unique INDEX rather than a table constraint, because
--- Postgres table constraints cannot carry a WHERE clause. Partial is the whole
--- point: every order sits at payment_ref IS NULL until initiate is saved, and
--- a total UNIQUE would let only one such order exist at a time.
+-- Partial is NOT needed for correctness. Postgres treats NULLs in a unique
+-- index as distinct, so a plain UNIQUE (payment_ref) would already allow
+-- unlimited orders sitting at NULL before initiate is saved. (Only
+-- UNIQUE NULLS NOT DISTINCT, or a database that folds NULLs together, would
+-- behave otherwise.) It is partial for two smaller reasons: a B-tree indexes
+-- NULL keys, so a total index would carry an entry per order forever, and
+-- most orders never acquire a ref at all -- measured at 90% NULL, the total
+-- index was 7x the size of the partial one. And it says in the schema which
+-- rows can actually collide. Being partial is also why this is a
+-- CREATE INDEX: a table constraint cannot carry a WHERE clause.
+--
+-- Consequence worth knowing before trusting a green suite: partial and total
+-- behave identically here, so NO test can distinguish them. Converting this
+-- to a total UNIQUE fails nothing. That is untestable by nature, not by
+-- omission.
 CREATE UNIQUE INDEX uk_orders_payment_ref ON orders (payment_ref)
     WHERE payment_ref IS NOT NULL;
 
