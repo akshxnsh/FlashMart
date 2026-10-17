@@ -47,7 +47,8 @@ These rules do not scale down with depth. They are what let derived work move fa
 4. **Sweep siblings for the same gap.** When a rule is introduced or a bug fixed, grep every sibling table, entity and service for the same gap in the same piece. Inventory's V6/V7 were backfills for rules Identity already had; they should have been found when Identity was written. Services of the same shape must stay identical (poms, config, base tests) unless a difference is documented.
 5. **Pre-flight a migration before it ships.** Adding a constraint to a table that may hold rows: check what is there first and say what you found. Never edit an applied or pushed migration; add a new version.
 6. **Run the whole suite before committing, and report real numbers.** Say how many tests ran and passed. Do not write "green" in a commit message or summary unless it was run in this session.
-7. **A lesson that is general goes in the rules.** If a bug teaches something that applies beyond its own file, add one line here or to the conventions below, not only to the commit message. Keep this file lean: one line, not a story.
+7. **A rationale is a claim, and nothing tests a comment.** The mutation pass shows a test can fail; no pass shows a *reason* is true, and a wrong reason in a migration outlives the code it explains. Check the behaviour you are about to assert — the `payment_ref` partial index was justified by a NULL collision Postgres does not have (NULLs in a unique index are distinct), and that wrong reason shipped in the migration comment, a test javadoc and a commit message.
+8. **A lesson that is general goes in the rules.** If a bug teaches something that applies beyond its own file, add one line here or to the conventions below, not only to the commit message. Keep this file lean: one line, not a story.
 
 ## Load-bearing design rules
 
