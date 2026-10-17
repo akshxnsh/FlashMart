@@ -6,7 +6,7 @@ Instructions for Claude Code in this repo. This file holds **rules and pointers 
 
 FlashMart is a flash-sale **infrastructure platform for brands** (Puma, Nike), not a multi-vendor marketplace. There is no settlement, payout or vendor KYC (removed on purpose).
 
-The point of the repo is **not** a shipped app. It is a vehicle for Akshansh to learn backend and distributed-systems engineering (Spring Boot, Redis, Kafka, outbox, idempotency, resilience, gateway, load testing) around one real problem: many buyers racing for a small fixed stock pool. Success means he can explain and rebuild every decision unaided.
+The point of the repo is **not** a shipped app. It is a vehicle for Akshansh to learn backend and distributed-systems engineering (Spring Boot, Redis, Kafka, outbox, idempotency, resilience, gateway, load testing) around one real problem: many buyers racing for a small fixed stock pool. Success means he understands every decision well enough to explain it.
 
 ## Where things live (read on demand, not up front)
 
@@ -30,25 +30,23 @@ The Notion engineering log is Akshansh's personal record, not a source of truth.
 1. **Depth follows decisions.** The more design a piece carries, the slower and more Socratic you go; the more it is simply derived from decisions already in the docs, the faster you move. The test: *could this reasonably be written two ways that behave differently under concurrency, failure or retry, or that trade one property for another?* If yes, it carries a decision. If the docs already settle it and only typing remains, it is derived. Most pieces are a mix: slow down for the decision-bearing part and move fast through the rest.
 2. **Say which it is, in one line, before starting** ("derived from architecture.md §4" or "this carries a decision: X vs Y"), so Akshansh can overrule the call in either direction. When unsure, treat it as a decision.
 3. **Decision-bearing work:** understanding before code (what problem, why FlashMart needs it, what breaks without it, trade-offs). Ask what he expects it to look like and where it could break, and only after he answers write it, then compare his version with the real code; the comparison is the point. For design, concurrency and failure modes pose the failure scenario, let him reason, correct, guide, then build. One decision at a time, no roadmap handed over up front. Explain every line that carries behavior (annotations, constraints, queries, transaction boundaries). Do not skip this because handing over code is faster.
-4. **Derived work:** plan briefly, then batch it. Several entities, repositories or migrations in one pass is fine. No line-by-line walkthrough unless he asks. End with: what was built, the constraints or decisions it quietly carries, and 2-3 questions he should be able to answer about it. He is expected to read the migration SQL, since that is where the design lives.
+4. **Derived work:** plan briefly, then batch it. Several entities, repositories or migrations in one pass is fine. No line-by-line walkthrough unless he asks. End with a short, point-wise summary of what matters: what was built, the constraints or decisions it quietly carries, and anything surprising or left open. No questions or quiz at the end. He is expected to read the migration SQL, since that is where the design lives.
 5. **Open decisions stop the work.** Locking strategy and isolation level on `flash_sale_items` are undecided (see Open decisions). When a piece would force either, stop and decide together before writing code that bakes one in.
 6. **Derive, don't copy.** Schema, boundaries and API shapes come from access patterns, failure isolation and the current docs. Check `decisions.md` / `architecture.md` before deriving from a diagram; Notion diagrams are snapshots.
 7. **Never claim untested things work.** Keep the labels distinct: designed / implemented / tested / load-tested / verified-under-failure. No invented numbers. Zero overselling under 5,000 concurrent requests against 500 units and p99 < 500 ms are **targets** until measured.
 8. **Don't silently improve the architecture.** If something looks off, flag it and discuss; do not refactor unasked.
 9. **Review means reading the code.** When reviewing an implementation, read the actual code. Separate real bugs (correctness, concurrency, transaction boundaries, security) from optional style points.
 
-## Verification (applies to every piece, derived or not)
+10. **Keep the language simple and easy to understand.** Plain words, short sentences, no jargon without a one-line meaning. Connect every explanation to FlashMart with a concrete example where it helps (two buyers on the last unit, a webhook arriving as the sweep expires the order), not a generic textbook one. Explain *why*, not only *what*.
 
-These rules do not scale down with depth. They are what let derived work move fast safely, and each exists because skipping it already cost a bug.
+## Verification (proportional: a learning and resume project, so prove what matters and skip the ceremony)
 
-1. **Every guard is shown to fail.** For each CHECK, unique key, trigger, CAS or conditional write, deliberately break what it protects (drop the constraint, remove the annotation, weaken the clause), run the suite, and confirm that **exactly the tests meant to catch it** fail. Then restore it. Report each break and its result. A passing test is not evidence; a test that has never failed has not been shown able to.
-2. **A test must exercise the path production uses.** A test that does `clear()` then `find()` reads a fresh row and passes with or without `@Generated`, so it cannot catch a field left null on the instance that was just persisted (the `StockReservation.reservedAt` bug). Same trap, other direction: an entity-level `nullable = false` makes Hibernate reject a null before Postgres sees it, so the test passes with or without the column's `NOT NULL` — guard a `NOT NULL` with native SQL. Before trusting a test, ask what it structurally cannot see.
+1. **Prove the guards that carry correctness.** For the load-bearing ones (CAS and conditional writes, unique keys that stop duplicates or double payments, triggers, `@Generated` columns), break the rule once, confirm the intended test fails, then restore it. Routine CHECKs (non-negative, non-blank) need a test that rejects a bad row, not a break-and-restore. Mention a break in the summary only if it surprised you.
+2. **A test must exercise the path production uses.** `clear()` then `find()` reads a fresh row and misses a field left null on the instance that was just saved (the `StockReservation.reservedAt` bug). A null set through the entity can be rejected by Hibernate before the database sees it, so test a `NOT NULL` with native SQL. Before trusting a test, ask what it structurally cannot see.
 3. **Concurrency claims need a concurrent test.** Reasoning that something is race-safe is a hypothesis. Back it with a test that actually races (two threads on the last unit, a webhook against the sweep) and say what was and was not exercised. Never state a load or overselling result that was not measured.
-4. **Sweep siblings for the same gap.** When a rule is introduced or a bug fixed, grep every sibling table, entity and service for the same gap in the same piece. Inventory's V6/V7 were backfills for rules Identity already had; they should have been found when Identity was written. Services of the same shape must stay identical (poms, config, base tests) unless a difference is documented.
-5. **Pre-flight a migration before it ships.** Adding a constraint to a table that may hold rows: check what is there first and say what you found. Never edit an applied or pushed migration; add a new version.
-6. **Run the whole suite before committing, and report real numbers.** Say how many tests ran and passed. Do not write "green" in a commit message or summary unless it was run in this session.
-7. **A rationale is a claim, and nothing tests a comment.** The mutation pass shows a test can fail; no pass shows a *reason* is true, and a wrong reason in a migration outlives the code it explains. Check the behaviour you are about to assert — the `payment_ref` partial index was justified by a NULL collision Postgres does not have (NULLs in a unique index are distinct), and that wrong reason shipped in the migration comment, a test javadoc and a commit message.
-8. **A lesson that is general goes in the rules.** If a bug teaches something that applies beyond its own file, add one line here or to the conventions below, not only to the commit message. Keep this file lean: one line, not a story.
+4. **Check siblings and migrations once.** When a rule is introduced or a bug fixed, grep the sibling services for the same gap. Services of the same shape stay identical unless a difference is documented. Before adding a constraint to a table that may hold rows, check what is there. Never edit an applied or pushed migration; add a new version.
+5. **Run the whole suite before committing, and report real numbers.** Say how many tests ran and passed. Do not write "green" unless it was run in this session.
+6. **A stated reason is a claim.** If a comment, doc or summary gives a reason that matters ("this would jam the system"), measure it or word it as unverified. A lesson that applies beyond its own file goes here as one line.
 
 ## Load-bearing design rules
 
@@ -86,13 +84,13 @@ Reasoning is in `decisions.md` ("Entity and migration conventions", "Database CH
 - One branch per piece (a derived batch counts as one piece), **one focused commit per logical unit** that explains *why*, merge `--no-ff`, delete the branch. Never amend a published commit unless asked. No unrelated changes in a feature commit.
 - No secrets committed. Keep `.env.example` current.
 - Only meaningful decisions go in `docs/decisions.md` (Decision / Context / Options Considered / Chosen Approach / Why / Trade-offs / Consequences). No entry for mechanical changes.
-- Before calling a feature done: implemented, tests added, failure cases considered, reviewed, committed, decision documented if warranted, **and Akshansh can explain it unaided**.
+- **Done means Akshansh has understood the piece.** Before calling a feature done: implemented, tests added, failure cases considered, reviewed, committed, decision documented if warranted. Then explain the piece in easy language if he asks. It is done when he says he understands it; do not move to the next piece before that.
 
 ## Build order
 
 Follow the phase plan: setup → architecture/requirements → schema → JPA entities → APIs/DTOs → reservation/payment → state machine → security → Redis caching → rate limiting → idempotency → transactions/locking → outbox → Kafka → webhooks → microservices/gateway → load testing. Don't jump ahead unless he asks.
 
-**Current position:** see `architecture.md` §8 and `git log`. As a pointer only: entities and migrations are done for all four services; no repositories, services or controllers exist anywhere, so nothing yet issues a CAS. If this paragraph and §8 disagree, §8 and the code win.
+**Current position:** see `architecture.md` §8 and `git log`. As a pointer only: entities are done for Inventory, Identity, Notification and Order; no repositories, services or controllers exist anywhere. If this paragraph and §8 disagree, §8 and the code win.
 
 **Ports:** gateway `8080` (reserved), identity `8081`, inventory `8082`, order `8083`, notification `8084`. One shared `DB_USERNAME`/`DB_PASSWORD` pair, one separate database per service.
 
