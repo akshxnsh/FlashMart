@@ -1,10 +1,11 @@
 # FlashMart — Architecture
 
-> Current design per `docs/decisions.md` through Revision 3. Supersedes the
-> PRD wherever they conflict (see `CLAUDE.md`). Design document — Section 8
-> is what actually has code behind it: every service's entities on Flyway
-> migrations, covered by persistence tests, plus Inventory's API contract layer
-> (DTOs and the reserve HTTP endpoint, with no reserve logic behind it).
+> Current design per every entry in `docs/decisions.md` (Revision 3 and the
+> implementation-phase entries after it). Supersedes the PRD wherever they
+> conflict (see `CLAUDE.md`). Design document — Section 8 is what actually has
+> code behind it: every service's entities on Flyway migrations, covered by
+> persistence tests, plus Inventory's API contract layer (DTOs and the reserve
+> HTTP endpoint, with no reserve logic behind it).
 
 ## 1. System Overview
 
@@ -42,7 +43,7 @@ proceeding.
 **Synchronous (OpenFeign):**
 - **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). The idempotency key is `(orderId, flashSaleId, productId)`; `quantity` is deliberately not part of it. `quantity` is 1..5 per item (`MAX_QUANTITY_PER_ITEM`, enforced at the API only, no `CHECK`; decisions.md, "Per-item quantity cap of 5"). Every `200` carries `outcome` ∈ `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED | ITEM_NOT_IN_SALE`. `ITEM_NOT_IN_SALE` (no sale item for `(flashSaleId, productId)`) is an outcome, not an error: Order has no way to check it in advance (it cannot read Inventory's database and no endpoint exists), so a buyer or bot can trigger it at will, and Order answers it with `RESERVATION_FAILED`. `reservationId`, `salePrice`, `brandId` and `productName` are present **only** when `outcome = RESERVED` and are omitted (not `null`) otherwise. `salePrice` is a string with exactly two decimals in plain notation (`"3999.00"`). There is no `success` and no "replayed" flag: a replay looks exactly like a first call. Business outcomes are always `200`, because a non-2xx could trip the circuit breaker in front of Inventory during a drop. Non-`200` means something upstream is wrong and should alert, with body `{ code, message }` (`message` is for logs only): `400 INVALID_QUANTITY` (any problem with `quantity`, including a fractional one or one above 5; Jackson's float-to-int truncation is turned off), `INVALID_REQUEST` (any other malformed field or body, with `400`; or a body that is not JSON, with `415`), `409 QUANTITY_MISMATCH`. The `415` is mapped because the controller-scoped handler can see it: the mapping declares no `consumes`, so the controller is chosen first and the `415` is raised while reading the body. One exception answers with **Spring's default body, not `{ code, message }`**: `405` (wrong method), which is raised before any controller is chosen, so the scoped handler cannot see it. Accepted: a global handler would leak reserve's codes onto future controllers, and a `405` means a broken caller, not a buyer outcome. **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
 
-  *Implementation rules — recorded, not built (`reserve` has an HTTP layer and an interface, no implementation):*
+  *Implementation rules — recorded, not built (`reserve` has an HTTP layer and an interface; its only bean is a placeholder that throws):*
   - **Replay path, in this order:** find the existing reservation for `(orderId, item)` in **any** status → compare `quantity` (different → `409 QUANTITY_MISMATCH`) → if `RELEASED`, return `200 RESERVATION_RELEASED` and never fall through to a new reservation → otherwise return the stored reservation as `RESERVED`. A replay skips the liveness and stock gates.
   - **`ITEM_NOT_IN_SALE` is logged:** Inventory logs a WARN each time it returns this outcome, so a spike (a bot, or an Order bug sending the wrong sale id) is visible. A plain log line until the observability phase brings metrics.
   - **Concurrent first calls:** when two first calls for the same `(orderId, item)` race, the loser must end on the replay path, never a `500`, and its stock change must not survive. The mechanism depends on the open reserve write-path decision (§9).
@@ -66,7 +67,7 @@ transaction as the business change):
 - **Order** publishes `PaymentConfirmed { order_id, buyer_id, brand_id, items: [{product_id, product_name, quantity, unit_price, subtotal}], amount }` — consumed by **Inventory** (needs only `order_id`, to confirm reservations) and **Notification** (needs the rest, for the receipt).
 - **Order** publishes `OrderCancelled { order_id, reason, buyer_id }`, `reason ∈ {RESERVATION_FAILED, PAYMENT_FAILED, PAYMENT_UNAVAILABLE, ORDER_EXPIRED}` — consumed by **Inventory** (releases every reservation for the order, any reason) and **Notification** (buyer only, and only for `PAYMENT_FAILED`/`ORDER_EXPIRED` — the two reasons determined after the buyer's request has closed; the other two are answered synchronously, and emailing them would give a deliberately cold service a bursty hot-path load).
 - **Identity** publishes `BrandUpserted { brand_id, email, updated_at }` / `UserUpserted { user_id, email, updated_at }` on creation and email change. `updated_at` is the **source-side** timestamp — required for Notification's out-of-order-safe upsert (§4).
-- **Inventory** and **Notification** publish nothing; Inventory is a pure consumer plus Feign responder.
+- **Inventory** and **Notification** publish nothing. Inventory consumes events and answers Feign calls; its only outbound call is the status check above.
 
 Every event is a **flat, bare payload** — no envelope, no `event_version`, no
 `event_id`. Adding a field is safe by default; the discipline is to only add
@@ -196,7 +197,9 @@ stock_reservations(id, order_id, flash_sale_item_id, quantity, status, reserved_
   -- UNIQUE(order_id, flash_sale_item_id) — idempotent reserve on retry
   -- quantity: required by design — release (OrderCancelled carries no items)
   --   must know how many units to add back, and the replay check compares it
-  --   to detect QUANTITY_MISMATCH
+  --   to detect QUANTITY_MISMATCH. The API caps it at 5 per item (§3); the
+  --   cap is deliberately NOT a CHECK, since it is policy that may change —
+  --   only CHECK (quantity > 0) is in the schema
   -- insert-only per buyer, no version column (no write contention here)
   -- status: RESERVED -> CONFIRMED (on PaymentConfirmed) | RELEASED (on
   --   OrderCancelled). CONFIRMED is never released — a PAID order can't
@@ -207,7 +210,12 @@ stock_reservations(id, order_id, flash_sale_item_id, quantity, status, reserved_
   --   confirm/release-all: UNIQUE(order_id, flash_sale_item_id) already leads
   --   with order_id, and an extra index only slows every reserve insert
 
-products(...)
+products(id, brand_id, name, created_at, updated_at)
+  -- UNIQUE(brand_id, name); CHECK (length(btrim(name)) > 0) — the name is
+  --   snapshotted onto receipts, so a blank one would survive into a
+  --   permanent record
+  -- created_at/updated_at: TIMESTAMPTZ, Java clock (@CreationTimestamp /
+  --   @UpdateTimestamp) — audit-only, nothing compares them
   -- a product's name is frozen while a live sale references it: reserve
   --   returns productName on every replay, so a rename between a first call
   --   and its retry would give one reservation two names. Same reason a live
@@ -419,7 +427,7 @@ synchronous status check in §3.
 `PAYMENT_FAILED`, `ORDER_EXPIRED`, `PAYMENT_UNAVAILABLE`, `RESERVATION_FAILED`.
 
 - `CREATED → PENDING_PAYMENT` — every item reserved, `amount` set, gateway returned 202. Saves `payment_ref`, resets `expires_at` to the payment window.
-- `CREATED → RESERVATION_FAILED` — an item was out of stock.
+- `CREATED → RESERVATION_FAILED` — an item came back `OUT_OF_STOCK`, or `ITEM_NOT_IN_SALE` (designed; confirm in Order's API piece). Which state `SALE_NOT_LIVE` and `RESERVATION_RELEASED` lead to is not yet specified (§9).
 - `CREATED → PAYMENT_UNAVAILABLE` — circuit breaker open on initiate.
 - `CREATED → ORDER_EXPIRED` — didn't finish the loop + initiate before its deadline.
 - `PENDING_PAYMENT → PAID` — webhook success *for the payment this order holds*.
@@ -473,6 +481,9 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **Webhook-never-arrives is closed by a reconciliation sweep** querying the gateway by idempotency key, not `payment_ref` — a second, independent producer of `refunds` rows.
 - **All-or-nothing reservation, sequential per-item Feign loop** — not a batch endpoint; Inventory stays unaware of multi-item orders.
 - **`reserve`'s evaluation order is contractual** — an existing reservation is returned before the liveness/stock gates, so a post-deadline retry can't wrongly cancel an order whose stock is already held.
+- **`reserve` answers every business outcome with `200` and an `outcome` enum** — `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED | ITEM_NOT_IN_SALE`; non-`200` (`{ code, message }`) only for a broken caller. A non-2xx for a business outcome could trip the circuit breaker in front of Inventory during a drop (reasoned, unverified until the Feign/Resilience4j config exists).
+- **An item not in the sale is an outcome, not a `404`** — Order has no way to check it in advance, so a client can trigger it at will; a WARN log per occurrence keeps a spike visible.
+- **Per-item quantity cap of 5, at the API only** — a business rule that may change, so no `CHECK`; Order must check the same cap before calling `reserve`.
 - **Optimistic-lock `version` on `flash_sale_items`, not `stock_reservations`** — the contended row is the shared counter, not a per-buyer insert-only row. The column and `@Version` exist; **how `reserve` writes the decrement is still open** — `WHERE version = ?` versus a value-based `WHERE available_stock >= ? AND <liveness>` behave very differently under READ COMMITTED, and two decision entries specify them differently (§9).
 - **Sale terms are immutable once live** — price, stock quantities (`total_stock`), `start_time`/`end_time`, and cancellation all share one boundary: mutable pre-open, frozen after. `available_stock` moves only through reserve/release/confirm, never through an edit. A live sale always runs to its end; there is no emergency stop.
 - **Liveness is computed, never stored** — `status` shrinks to `ACTIVE|CANCELLED`; the drift problem is removed, not solved, by asking the two timestamps fresh every time, against the database's clock.
@@ -488,7 +499,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **Who stamps a time column depends on who compares it** — Java clock for audit-only columns (`products`); database default with `insertable = false` where the database's `now()` is compared against it (`stock_reservations.reserved_at`); a strictly-increasing trigger where another service orders events by it (`brands`/`users.updated_at`).
 - **`CHECK` constraints are the last line of defence, each documented against the guard that comes first** — the ceiling `available_stock <= total_stock` matters more than the floor because only application logic stands before it. A `CHECK` is never removed for "duplicating" application logic.
 - **Entity and migration conventions** — `IDENTITY` ids; migrations never edited once applied or pushed; same-service FKs real in the database but plain `Long` in Java; enums as `EnumType.STRING` plus a `CHECK`; chosen constraint names; a database-filled column must be `insertable = false` or Hibernate-generated, because Hibernate sends an explicit `NULL` that overrides a `DEFAULT`; `validate` cannot see triggers, defaults or `CHECK`s.
-- **Entity tests use real Postgres, roll back, and must be shown to fail** — each guard was verified by breaking what it protects. No `reserve`, so nothing is load-tested or verified under concurrency.
+- **Entity tests use real Postgres, roll back, and must be shown to fail** — each guard was verified by breaking what it protects. The reserve HTTP contract is tested in a web slice with the service mocked, through the application's real Jackson and validator configuration. No `reserve` logic exists, so nothing is load-tested or verified under concurrency.
 - **Service scaffolding** — fixed ports 8081–8084 (8080 reserved for the Gateway); one shared credential pair against one Postgres instance but a separate database per service; Kafka, Feign, Resilience4j and Security deferred to their phases; Validation added to Inventory in its API phase, and each sibling adds it in its own.
 - **Every event-publishing service owns an outbox** — now Order and Identity only.
 - **Cross-service relationships are always an ID or an event, never a foreign key** — §5.
@@ -499,7 +510,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 
 **Designed:** everything in §2–7, in full — all five schemas, the state
 machine, every communication pattern, every decision in `docs/decisions.md`
-through Revision 3.
+(Revision 3 and the implementation-phase entries after it).
 
 **Implemented:**
 - **Inventory Service** — all four entities (`Product`, `FlashSale`,
@@ -511,7 +522,7 @@ through Revision 3.
   **API contract layer:** request/response DTOs as records for reserve,
   products, flash sales and sale items, with Bean Validation
   (`spring-boot-starter-validation`, Inventory only, so far); the reserve
-  controller; a `ReservationService` **interface with no implementation**; and
+  controller; a `ReservationService` **interface with no real implementation**; and
   an exception handler scoped to the reserve controller. `application.yml`
   turns off Jackson's float-to-int truncation. No public controllers (they
   wait for security), no browse endpoint. So that the application can start,
@@ -520,10 +531,10 @@ through Revision 3.
   does not map, so it can never become an `ErrorResponse` or a business
   outcome; Spring's default error handling answers it. Delete it when
   `reserve` is built. `quantity` is capped at 5 per item at the API.
-- **Identity Service** — complete: `Brand`, `User`, `ApiKey` and
+- **Identity Service** — entity layer complete: `Brand`, `User`, `ApiKey` and
   `OutboxEvent` on migrations V1–V7, including the `bump_updated_at` trigger
   attached to both identity tables.
-- **Notification Service** — complete: `NotificationLog`, `BrandContact` and
+- **Notification Service** — entity layer complete: `NotificationLog`, `BrandContact` and
   `BuyerContact` on migrations V1–V2.
 - **Order Service** — all four tables (`orders`, `order_items`, `refunds`,
   `outbox`) on migrations V1–V5, with `Order`, `OrderItem`, `Refund`,
@@ -538,46 +549,36 @@ through Revision 3.
   so nothing yet writes a CAS.
 - **Not built anywhere:** repositories, service implementations, any
   controller other than Inventory's reserve endpoint, the API Gateway, Kafka,
-  Redis, security. **`reserve` logic is not implemented.** All four services share one local Postgres
-  credential pair but each owns a separate database.
+  Redis, security. **`reserve` logic is not implemented.** All four services
+  share one local Postgres credential pair but each owns a separate database.
 
-**Tested: 193 tests, all passing** — 58 in Inventory (24 persistence and
-guard tests plus 34 API contract tests, run when the item-not-in-sale
-piece landed), and 59 in Order, 47 in Identity and 29 in Notification (each last run
-when its own piece landed, unchanged since). Each count includes a context
-test and the zone-less-timestamp guard every service carries. The persistence
-tests save into real Postgres inside a rolled-back transaction; every CHECK,
-unique key and FK is verified to reject bad rows, not merely to exist.
+**Tested: 193 tests, all passing, all four suites run on 2026-10-22** — 58 in
+Inventory (24 persistence and guard tests plus 34 API contract tests), 59 in
+Order, 47 in Identity, 29 in Notification. Each count includes a context test
+and the zone-less-timestamp guard every service carries. The persistence tests
+save into real Postgres inside a rolled-back transaction; every CHECK, unique
+key and FK is verified to reject bad rows, not merely to exist.
 
 **Inventory's reserve contract is tested at the HTTP layer only**
-(`@WebMvcTest`, with the service mocked): the response shape, validation and
-error mapping, through the application's real Jackson and validator
-configuration. Four guards were shown to fail when broken. Removing
-`@JsonFormat` made `salePrice` a JSON number. Removing
-`@JsonInclude(NON_NULL)` made the non-`RESERVED` outcomes carry null fields.
-Removing `@Positive` made `quantity: 0` return `200`. Removing
-`accept-float-as-int: false` made `quantity: 2.5` return `200`, silently
-truncated. One assertion trap: Spring's `jsonPath(...).doesNotExist()` passes
-for a key that is present with a `null` value, so omission is asserted as
-"the body is exactly `{outcome}`". **Reserve logic is not implemented**, so
-evaluation order, replay, liveness against the database clock and concurrency
-are untested.
-
-Added by the reserve-gaps piece: `quantity` 5 reaches the service and 6 is
-`400 INVALID_QUANTITY` without reaching it; a `salePrice` of `"3999.000"` is
-rejected; `405` keeps Spring's default body; the placeholder's
-`UnsupportedOperationException` stays unmapped. Two of these were shown to
-fail on purpose: mapping `RuntimeException` in the reserve handler failed the
-unmapped-exception test, and mapping the `405`/`415` exceptions there changed
-the `415` but not the `405`. That second probe is why the docs say the handler
-*can* see a `415`.
-
-Changed by the item-not-in-sale piece: `404 ITEM_NOT_FOUND` is gone and
-"item not in this sale" is the `200` outcome `ITEM_NOT_IN_SALE`, covered by the
-"only the outcome" test, which now runs four outcomes. The `415` is now mapped
-to `{ code: INVALID_REQUEST }` with its status unchanged; removing that handler
-fails its test. The WARN log on `ITEM_NOT_IN_SALE` is a recorded rule, not
-code: reserve logic does not exist yet.
+(`@WebMvcTest`, with the service mocked), through the application's real
+Jackson and validator configuration: the response shape (`salePrice` a
+two-decimal string; non-`RESERVED` outcomes carry only `outcome`, all four of
+them), validation (`quantity` 1..5, a fractional `quantity` rejected, a numeric
+string accepted; a `salePrice` with a third decimal rejected; the sale window),
+error mapping (`400`/`415 INVALID_REQUEST`, `400 INVALID_QUANTITY`,
+`409 QUANTITY_MISMATCH`, `405` left on Spring's default body), and the
+placeholder's `UnsupportedOperationException` staying unmapped. Shown to fail
+when broken: removing `@JsonFormat` (`salePrice` became a number),
+`@JsonInclude(NON_NULL)` (null fields appeared), `@Positive` (`quantity: 0`
+returned `200`), `accept-float-as-int: false` (`quantity: 2.5` returned `200`,
+truncated) and the `415` handler (no `code` in the body); adding a
+`RuntimeException` handler failed the unmapped-exception test. A probe also
+showed the controller-scoped handler can see a `415` but not a `405`. One
+assertion trap: Spring's `jsonPath(...).doesNotExist()` passes for a key
+present with a `null` value, so omission is asserted as "the body is exactly
+`{outcome}`". **Reserve logic is not implemented**, so evaluation order,
+replay, liveness against the database clock, the `ITEM_NOT_IN_SALE` WARN log
+and concurrency are untested.
 
 The tests are shown able to fail, not assumed to be. Order's 30 mutations —
 25 applied to the database, 5 stripping an `@Generated` — killed exactly the
@@ -594,32 +595,32 @@ without the column constraint. `orders.expires_at` therefore has a native-SQL
 test as well; no other `NOT NULL` in any service is guarded this way.
 
 **Not load-tested, not verified under concurrency or failure** — no `reserve`
-exists yet. NFR-P1–P4 remain unverified targets by explicit decision, not by
+logic exists yet. NFR-P1–P4 remain unverified targets by explicit decision, not by
 omission.
 
 **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
 `8084`; `8080` is reserved for the API Gateway.
 
-**Diagrams and ERDs: current.** All sequence diagrams (including the two that
-were pre-Revision-3 and the two that never existed — reconciliation sweep,
-partial-item-failure) and all four ERDs now live in the Notion FlashMart page
-as Mermaid blocks, matching the current design. `docs/Flashmart.prd`
-(Revision 4) also matches, with one known gap: §6.5 undercounts Razorpay
-Clone's requirements (see §9).
+**Diagrams and ERDs: drawn for the Revision 3 design, not re-checked since.**
+All sequence diagrams (including reconciliation sweep and partial-item failure)
+and all four ERDs live in the Notion FlashMart page as Mermaid blocks. They
+were drawn before the implementation-phase changes — the revised reserve
+contract (`outcome` enum, `ITEM_NOT_IN_SALE`, the quantity cap), the partial
+`UNIQUE` on `payment_ref`, and the webhook loading its order by our order id —
+and have not been re-checked against them. Notion is updated only on request.
+`docs/Flashmart.prd` was re-synced to this document on 2026-10-22.
 
-**Notion log cross-check:** its "JPA Entities & Repositories" section (§7)
-now records every entity written so far, and §9 records the project setup.
-Its "API & Event Contracts", "Feature Implementation", "Testing Per Feature"
-and "Load Testing & Verification" sections remain present but empty,
-consistent with the repo — none of that exists yet. Its design sections
-(§1–5) are current as of this update; they are a personal engineering log,
-not themselves a second source of truth — `docs/decisions.md` remains
-authoritative on conflict.
+**Notion log:** a personal engineering log, not a source of truth —
+`docs/decisions.md` remains authoritative on conflict. It was last
+cross-checked when the entity layer landed; its "API & Event Contracts"
+section was empty then and does not yet record the reserve contract built
+since. Not re-checked in this pass; Notion is updated only on request.
 
 ## 9. Known Open Items / Next Steps
 
-Mirrors `docs/decisions.md`. Nothing below needs more design thinking —
-each is blocked on something that doesn't exist yet, or is mechanical work.
+Mirrors the Open Items in `docs/decisions.md`. Most items are blocked on
+something that doesn't exist yet; those marked "not specified", "not decided"
+or "recorded, not decided" still need a design decision.
 
 - **Accepted, permanently.** A second captured payment can escape correction
   entirely if the initiate idempotency key ever fails to dedupe *and* a
@@ -689,6 +690,10 @@ each is blocked on something that doesn't exist yet, or is mechanical work.
   not specified. Recorded, not decided.
 - **Order answers `ITEM_NOT_IN_SALE` with `RESERVATION_FAILED`** (no new
   state). Designed; confirm in Order's API piece.
+- **Which state Order moves to on `SALE_NOT_LIVE` is not specified.** The
+  `RESERVATION_FAILED` decision covers only out of stock. Not decided.
+- **Bean Validation exists in Inventory only.** Identity, Order and
+  Notification add `spring-boot-starter-validation` in their own API phase.
 - **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` from Order instead of
   firing an Inventory alert. Not built.
@@ -702,10 +707,11 @@ each is blocked on something that doesn't exist yet, or is mechanical work.
   already taken", not a 500; the JWT must say whether its subject is a brand
   or a user (brand 7 and user 7 share an id); published `outbox` rows need a
   cleanup job.
-- Build Razorpay Clone with the three behaviours this design leans on:
-  idempotency on `initiate` and `refund`, and a payment-status lookup
-  queryable by our idempotency key or order reference. Not built yet;
-  designed-not-verified until it is.
+- Build Razorpay Clone with the behaviours this design leans on
+  (`docs/requirements.md` §9, `RZP-1`–`RZP-9`), above all: idempotency on
+  `initiate` and `refund`, a payment-status lookup queryable by our idempotency
+  key or order reference, and payments and webhooks that carry our order id.
+  Not built yet; designed-not-verified until it is.
 
 The PRD is `docs/Flashmart.prd` (Revision 4, markdown). The earlier
 `FlashMart_Project_Plan_v3.pdf` reference was stale — no such file exists or

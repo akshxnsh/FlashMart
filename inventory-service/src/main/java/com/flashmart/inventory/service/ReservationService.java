@@ -5,9 +5,10 @@ import com.flashmart.inventory.dto.reserve.ReserveResponse;
 import com.flashmart.inventory.exception.QuantityMismatchException;
 
 /**
- * Reserves stock for one order item. Contract only: no implementation exists,
- * because the write path, locking strategy and isolation level are open
- * decisions (architecture.md §9).
+ * Reserves stock for one order item. Contract only: the only bean is
+ * {@link NotImplementedReservationService}, which throws, because the write
+ * path, locking strategy and isolation level are open decisions
+ * (architecture.md §9).
  *
  * <p>Evaluation order is part of the contract:
  * <ol>
