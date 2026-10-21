@@ -6,6 +6,7 @@ import com.flashmart.inventory.dto.reserve.ReserveResponse;
 import com.flashmart.inventory.exception.ItemNotFoundException;
 import com.flashmart.inventory.exception.QuantityMismatchException;
 import com.flashmart.inventory.service.ReservationService;
+import jakarta.servlet.ServletException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -19,12 +20,18 @@ import org.springframework.test.web.servlet.ResultActions;
 import java.math.BigDecimal;
 
 import static org.hamcrest.Matchers.aMapWithSize;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.hasEntry;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -119,6 +126,24 @@ class ReservationControllerTest {
     }
 
     @Test
+    void quantityAtTheCapReachesTheService() throws Exception {
+        given(reservationService.reserve(any())).willReturn(ReserveResponse.notReserved(ReserveOutcome.OUT_OF_STOCK));
+
+        reserve(body("42", String.valueOf(ReserveRequest.MAX_QUANTITY_PER_ITEM))).andExpect(status().isOk());
+
+        verify(reservationService).reserve(new ReserveRequest(42L, 7L, 501L, ReserveRequest.MAX_QUANTITY_PER_ITEM));
+    }
+
+    @Test
+    void quantityAboveTheCapIsInvalidQuantityAndNeverReachesTheService() throws Exception {
+        reserve(body("42", String.valueOf(ReserveRequest.MAX_QUANTITY_PER_ITEM + 1)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_QUANTITY"));
+
+        verifyNoInteractions(reservationService);
+    }
+
+    @Test
     void quantityWinsWhenAnotherFieldIsAlsoInvalid() throws Exception {
         reserve("{\"flashSaleId\": 7, \"productId\": 501, \"quantity\": 0}")
                 .andExpect(status().isBadRequest())
@@ -159,6 +184,56 @@ class ReservationControllerTest {
         reserve("{\"orderId\": 42,")
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+    }
+
+    // --- what the reserve handler deliberately does NOT answer ---
+
+    /**
+     * The placeholder service throws UnsupportedOperationException. It must
+     * stay unmapped, so it can never come back as an ErrorResponse or a
+     * business outcome. MockMvc has no error page, so an unmapped exception
+     * surfaces here as a thrown ServletException. If anyone maps it, or a
+     * parent such as RuntimeException, a response comes back instead and
+     * this test fails.
+     */
+    @Test
+    void unsupportedOperationIsNotMappedByTheReserveHandler() {
+        given(reservationService.reserve(any())).willThrow(new UnsupportedOperationException("not built"));
+
+        ServletException thrown = assertThrows(ServletException.class, () -> reserve(body("42", "2")));
+
+        assertInstanceOf(UnsupportedOperationException.class, thrown.getCause());
+    }
+
+    /**
+     * 405 is raised while Spring is still choosing a handler, before any
+     * controller is selected, so the controller-scoped advice cannot see it.
+     * Its body is Spring's default, not { code, message }.
+     */
+    @Test
+    void getOnTheReserveUrlIs405WithSpringsDefaultBody() throws Exception {
+        mockMvc.perform(get(URL))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(content().string(not(containsString("\"code\""))));
+
+        verifyNoInteractions(reservationService);
+    }
+
+    /**
+     * Unlike 405, this 415 IS visible to the scoped advice: the mapping
+     * declares no consumes, so the controller is chosen first and the 415 is
+     * raised when no converter can read text/plain into ReserveRequest. It is
+     * deliberately not mapped, so its body stays Spring's default. Shown by
+     * probe: adding a handler for it to ReservationExceptionHandler changed
+     * this response. This test fails if anyone maps it.
+     */
+    @Test
+    void textPlainBodyIs415WithSpringsDefaultBody() throws Exception {
+        mockMvc.perform(post(URL).contentType(MediaType.TEXT_PLAIN).content(body("42", "2")))
+                .andExpect(status().isUnsupportedMediaType())
+                .andExpect(content().string(not(containsString("\"code\""))));
+
+        verifyNoInteractions(reservationService);
     }
 
     // --- 404 / 409 ---

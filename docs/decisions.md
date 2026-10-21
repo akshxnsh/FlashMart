@@ -4040,6 +4040,38 @@ Option 2.
 
 ---
 
+## Decision: Per-item quantity cap of 5, enforced at the API, not the database
+
+**Context / Problem:**
+`reserve` accepted any positive `quantity`, so one order item could take a
+whole sale's stock.
+
+**Options Considered:**
+1. Cap at the API only (`@Max` on `ReserveRequest.quantity`).
+2. Cap at the API plus a `CHECK (quantity <= 5)` on `stock_reservations`.
+
+**Chosen Approach:**
+Option 1. `ReserveRequest.MAX_QUANTITY_PER_ITEM = 5`; a violation answers
+`400 INVALID_QUANTITY`, like any other problem with `quantity`.
+
+**Why:**
+The cap is a business rule that may change. A `CHECK` is for something that
+must never be false, such as `quantity > 0`. A cap in a `CHECK` would make a
+policy change a migration, and would make old rows invalid if the cap were
+ever lowered.
+
+**Trade-offs:**
+- Nothing below the API stops a raw-SQL write of 6. Accepted: the database
+  guards what is always wrong, the API guards what is currently policy.
+- The cap is per item per order, not per buyer (Open Items).
+
+**Consequences:**
+- Order must check the same cap before calling `reserve`, or a buyer's
+  mistake shows up as an Inventory alert (Open Items).
+- Tested at the HTTP layer: 5 reaches the service, 6 does not.
+
+---
+
 ## Open Items (not yet designed)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -4167,6 +4199,11 @@ Option 2.
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
 - **Order's handling of `RESERVATION_RELEASED`** mid-loop is not specified.
+- **Order's create-order request must reject `quantity > 5`** before any
+  `reserve` call, so a buyer's mistake gets a `400` instead of firing an
+  Inventory alert. See "Per-item quantity cap of 5".
+- **A per-buyer limit across orders is not covered.** The cap is per item per
+  order.
 - **A retried create while the order is still `CREATED` is not specified.**
   Recovery is abort ("`saga_state` is dropped"). If a resume path is ever
   added, it runs only over `order_items` rows `WHERE unit_price IS NULL`, and
