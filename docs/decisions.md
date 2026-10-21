@@ -2573,6 +2573,14 @@ nothing after.** One invariant to remember instead of three.
 > Neither changes what this entry decided; the concrete shape was written
 > before that rule existed.
 
+> **Correction (from "Reserve contract revised: `outcome` replaces
+> `success`/`reason`"):** the response shapes in the table below are
+> superseded. Every `200` now carries an `outcome` enum instead of
+> `success`/`reason`, a released reservation answers `RESERVATION_RELEASED`,
+> malformed fields other than `quantity` answer `400 INVALID_REQUEST`, and
+> every non-`200` body is `{ code, message }`. The evaluation order and the
+> 200-vs-non-200 line decided here stand.
+
 **Context / Problem:**
 `reserve` is the hot path and the one call that carries the no-overselling
 invariant. Several decisions had accumulated against it — return `brand_id`,
@@ -3571,6 +3579,13 @@ pattern is a real decision, not a tidy-up.
 
 ## Decision: Service scaffolding — fixed ports, one shared credential pair, a separate database per service, and deferred dependencies
 
+> **Correction (Inventory API contract piece):** Validation is no longer
+> deferred in Inventory: `spring-boot-starter-validation` was added when its
+> DTOs were built. It needs no infrastructure, so the reason for deferring the
+> others does not apply to it. The sibling services add it in their own API
+> phase; until then their dependency sets differ from Inventory's by this one
+> entry, on purpose.
+
 **Context / Problem:**
 Identity, Order and Notification were added beside Inventory. The choices made
 while doing so were recorded only in `.env.example` and a commit message.
@@ -3925,6 +3940,106 @@ the expiry sweep (status, `payment_ref` and `expires_at` in one CAS).
 
 ---
 
+## Decision: Reserve contract revised — `outcome` replaces `success`/`reason`
+
+**Context / Problem:**
+"Inventory's `reserve` API contract" answered every case with
+`{ success, reason }`. Building the HTTP layer exposed four gaps in it:
+
+1. **A released reservation had no answer.** The order is cancelled, its
+   reservation is flipped to `RELEASED`, and then a delayed retry of `reserve`
+   for that order arrives. "Return the existing reservation" would hand a
+   released hold back as a success. Falling through to the normal path would
+   reserve fresh stock for an order that is already dead.
+2. **Only `quantity` had an error code.** A missing `orderId` or a broken body
+   had none.
+3. **Two field combinations were meaningless but possible:** `success: false`
+   alongside a `reservationId`, or `success: true` alongside a `reason`.
+4. **Jackson 3 silently truncated `quantity`.** It accepts a JSON float where
+   an int is expected and truncates it (`ACCEPT_FLOAT_AS_INT` is on by default
+   in 3.1.5), so `{"quantity": 2.5}` would reserve 2 units and return `200`.
+
+**Options Considered:**
+1. Keep `success` + `reason` and add the missing values.
+2. One `outcome` enum on every `200`, and a separate `{ code, message }` body on
+   every non-`200`.
+
+**Chosen Approach:**
+Option 2.
+
+| Situation | Response |
+|---|---|
+| Fresh reservation, or a replay of a held or confirmed one | `200 { outcome: RESERVED, reservationId, salePrice, brandId, productName }` |
+| Not enough stock | `200 { outcome: OUT_OF_STOCK }` |
+| Sale not live | `200 { outcome: SALE_NOT_LIVE }` |
+| Replay of a `RELEASED` reservation, same quantity | `200 { outcome: RESERVATION_RELEASED }` |
+| Replay with a different quantity, in any status | `409 { code: QUANTITY_MISMATCH, message }` |
+| Any problem with `quantity`, including a fraction | `400 { code: INVALID_QUANTITY, message }` |
+| Any other malformed field or body | `400 { code: INVALID_REQUEST, message }` |
+| No such `(flashSaleId, productId)` | `404 { code: ITEM_NOT_FOUND, message }` |
+
+- The four `RESERVED` fields are **omitted**, not `null`, on every other
+  outcome. `salePrice` is a string with exactly two decimals in plain notation.
+  A replay returns exactly the shape of a first call; nothing marks it as one.
+- `message` is for logs only; callers branch on `code`.
+- **Replay order:** find the row for `(orderId, item)` in any status → compare
+  quantity → if `RELEASED`, answer `RESERVATION_RELEASED` → otherwise return
+  the stored reservation. The liveness and stock gates are skipped.
+- **Concurrent first calls** are specified by outcome only: the loser ends on
+  the replay path, never a `500`, and its stock change does not survive. How
+  that happens depends on the open write-path decision.
+- `spring.jackson.deserialization.accept-float-as-int: false`, service-wide.
+- **A product's name is frozen while a live sale references it.**
+
+**Why:**
+- `outcome` keeps the property the old entry kept `success` for: there is one
+  field, always present, to branch on. Splitting the two response families
+  into two types removes the meaningless combinations.
+- **Business outcomes stay `200` for a second reason the old entry did not
+  give.** Order calls `reserve` through Feign behind Resilience4j. Feign turns
+  a non-2xx into an exception by default, and the circuit breaker counts
+  exceptions as failures. During a drop, `OUT_OF_STOCK` is the most common
+  answer. As a `4xx` it could open the breaker and fail healthy orders for an
+  outcome that is not a fault. (A reasoned claim, **unverified** until the
+  Feign/Resilience4j configuration exists.)
+- **Quantity is checked before `RELEASED`** because a different quantity is a
+  bug whatever state the row is in, and `409` is the code that alerts.
+- **`RELEASED` never falls through to a new reservation.** A fresh hold for an
+  order that is already dead would stay held until the late-reservation
+  republish of `OrderCancelled` cleaned it up.
+- **The name freeze has the same reason as the price freeze.** `productName`
+  is returned on every replay. A rename between a first call and its retry
+  would give one reservation two names, and Order snapshots whichever it
+  receives. Renames when no live sale references the product stay allowed, as
+  "Event payload shapes" accepts.
+- **A unit count must never change without an error.** Truncating `2.5` to `2`
+  is exactly what `INVALID_QUANTITY` exists to catch. The numeric string `"2"`
+  is still accepted: it is unambiguous.
+
+**Trade-offs:**
+- Order has a fourth outcome to handle. What it does with
+  `RESERVATION_RELEASED` mid-loop is not decided (Open Items).
+- A released row asked for with a different quantity answers `409`, not
+  `RESERVATION_RELEASED`: the alert takes precedence over the business
+  outcome.
+- A brand cannot correct a typo in a product's name while one of its sales is
+  live. This is the same accepted cost as the frozen price.
+- The float-to-int setting is service-wide, so it also applies to every
+  future Inventory endpoint. That is intended.
+
+**Consequences:**
+- `architecture.md` §3 carries the contract and the reserve implementation
+  rules, which are recorded, not built.
+- "Inventory's `reserve` API contract" carries a Correction pointing here. Its
+  evaluation order and its 200-vs-non-200 line stand.
+- The contract is tested at the HTTP layer only (`@WebMvcTest`, mocked
+  service). Reserve's logic, replay, liveness and concurrency are untested
+  because they do not exist yet.
+- Enforcing the name freeze is a service-layer rule, listed in Open Items next
+  to "frozen once the sale opens".
+
+---
+
 ## Open Items (not yet designed)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -4037,6 +4152,25 @@ the expiry sweep (status, `payment_ref` and `expires_at` in one CAS).
   service-layer rule: reject any edit once `now >= start_time`, evaluated
   against the database clock in the same transaction as the write — otherwise
   an edit landing at the boundary races the first reservation.
+- **Enforcing "a product's name is frozen while a live sale references it"
+  (designed, not built).** Same shape as the item above. See "Reserve
+  contract revised".
+- **TODO: reject a sale whose start is in the past, at the API.** Put it on the
+  create request only (on update it would hide the real "frozen" reason), with
+  a fixed clock in tests. The authoritative rule stays the service-layer check
+  against the DB clock.
+- **A zero-amount order is untested.** A free item is allowed (`sale_price >=
+  0`, and the API's `@PositiveOrZero` matches), so an order can total `0.00`,
+  and a payment gateway may refuse a zero-amount payment. Decide in the
+  payment phase.
+- **FR-B1 (buyer browse) has no endpoint.** It waits for security and
+  caching. Any future stock hint is a coarse `soldOut` flag, never an exact
+  count.
+- **Order's handling of `RESERVATION_RELEASED`** mid-loop is not specified.
+- **A retried create while the order is still `CREATED` is not specified.**
+  Recovery is abort ("`saga_state` is dropped"). If a resume path is ever
+  added, it runs only over `order_items` rows `WHERE unit_price IS NULL`, and
+  each item's pricing `UPDATE` is write-once (`WHERE unit_price IS NULL`).
 - **Identity, API phase (designed, not built):** a lost signup race must read
   "email already taken", not a 500; the JWT must say whether its subject is a
   brand or a user; published `outbox` rows need a cleanup job. See "Identity's

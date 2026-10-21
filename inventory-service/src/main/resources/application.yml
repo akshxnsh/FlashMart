@@ -20,3 +20,10 @@ spring:
       # never generates or mutates DDL. See docs/decisions.md.
       ddl-auto: validate
     show-sql: true
+
+  jackson:
+    deserialization:
+      # Jackson 3 accepts a JSON float where an int is expected and TRUNCATES
+      # it by default, so {"quantity": 2.5} would reserve 2 units and return
+      # 200. Turned off so a fractional count is a 400, not a silent change.
+      accept-float-as-int: false
