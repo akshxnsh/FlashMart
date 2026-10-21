@@ -25,8 +25,8 @@ typical marketplace "should" have it.
 - **Brand** *(formerly "Vendor")* — lists products, configures flash sales,
   and manages their own product/pricing/inventory data. Does not receive
   payouts through FlashMart — settlement is out of scope.
-- **Platform/Admin** — owns cross-cutting concerns: reservation expiry and
-  the payment-webhook trust boundary. No longer owns commission or
+- **Platform/Admin** — owns cross-cutting concerns: order expiry (which
+  releases the order's held stock) and the payment-webhook trust boundary. No longer owns commission or
   settlement (removed).
 
 ## 3. Functional Requirements
@@ -103,7 +103,7 @@ typical marketplace "should" have it.
 ## 5. Non-Functional Requirements — Performance (TARGETS, unverified until load-tested)
 
 These are targets to be measured via load testing (JMeter/Gatling), not
-requirements assumed to be met by design alone. See PRD Section 7 for the
+requirements assumed to be met by design alone. See PRD Section 8 for the
 full metrics table.
 
 - NFR-P1: Zero overselling incidents under 5,000 concurrent buy requests
@@ -139,6 +139,12 @@ full metrics table.
   that an open sale's terms cannot shift while they are transacting against
   it — is the reason for the constraint; the cost, accepted deliberately, is
   that a brand has no remedy for a mistake discovered after opening.
+- A product's name cannot change while a live sale includes it, for the same
+  reason: a buyer's reservation and receipt must name what they actually
+  reserved.
+- A buyer may order at most 5 units of one product in one order. This is a
+  per-item, per-order limit; a limit per buyer across orders is not a
+  requirement today.
 
 ## 8. Out of Scope
 
@@ -158,9 +164,9 @@ full metrics table.
   entirely on Razorpay Clone's side, and FlashMart's only involvement is
   initiating the payment and receiving its result (§7). No vault, tokenization
   layer, or card-data handling of any kind belongs in this codebase.
-- Anything beyond the PRD's Section 6 build-plan phases 1–19 — including
-  multi-region deployment and fraud detection — is out of scope unless
-  explicitly added later.
+- Anything beyond the PRD's Section 7 build plan — including multi-region
+  deployment and fraud detection — is out of scope unless explicitly added
+  later.
 
 ## 9. Razorpay Clone — Required Behaviors
 
@@ -205,11 +211,16 @@ must not assume any of it is proven.
   decimal values, never floating-point-lossy — serialized as strings over
   JSON (`"3999.00"`, not `3999.00`), consistent with the rule FlashMart
   applies to every monetary field crossing its own service boundaries.
+- RZP-9: Every payment and every payment-result webhook shall carry
+  FlashMart's own order id. The webhook handler loads the order by that id,
+  never by the gateway's payment reference, which FlashMart may not have saved
+  yet in exactly the crash window a webhook is most likely to arrive in.
 
 **Correctness does not depend on RZP-1–3 being honoured** — if idempotency
 ever fails to dedupe, FlashMart's one-payment invariant and already-refunded
 check catch the failure independently (see "An order keeps exactly one
-payment" and gap 15's accepted residual risk in `docs/decisions.md`).
-Prevention (RZP-1–3) and correction are deliberately independent; RZP-4–8 are
-not optional in the same way, since FlashMart has no fallback for a payment
-result it cannot trust, sign-verify, or read the amount of.
+payment" and the accepted residual risk at the top of the Open Items in
+`docs/decisions.md`). Prevention (RZP-1–3) and correction are deliberately
+independent; RZP-4–9 are not optional in the same way, since FlashMart has no
+fallback for a payment result it cannot trust, sign-verify, read the amount
+of, or attach to its order.

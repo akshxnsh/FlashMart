@@ -7,12 +7,15 @@
 > superseded it.
 >
 > **Status note:** everything here is *designed*, not implemented or tested,
-> unless an entry says otherwise. As of 2026-10-02 the exceptions are the
-> schema decisions for Inventory's four tables and Identity's `brands` and `users`, which
-> are implemented as entities on Flyway migrations and persistence-tested
-> against real Postgres; their entries are marked where that changed the
-> record. Nothing is load-tested, and no `reserve`, API, Kafka or Redis code
-> exists — every decision about those remains *designed*.
+> unless an entry says otherwise. As of 2026-10-22 the exceptions are: every
+> schema decision for all four services (Inventory, Identity, Order,
+> Notification), implemented as entities on Flyway migrations and
+> persistence-tested against real Postgres; and Inventory's reserve HTTP
+> contract (DTOs, validation, error mapping), implemented and tested at the
+> HTTP layer with the service mocked. `architecture.md` §8 is the status source
+> of truth. No `reserve` logic, repositories, other controllers, Kafka, Redis or
+> security code exists, and nothing is load-tested — every decision about
+> those remains *designed*.
 
 ---
 
@@ -3035,6 +3038,16 @@ None identified. Nothing currently depends on this existing.
 
 ---
 
+# Implementation phase — decisions made while building
+
+The entries below were made while turning the design into code, not in the
+Revision 3 review pass above: schema mechanics, conventions, test discipline,
+and the gaps that writing real entities and the first API contract exposed.
+Where one changes an earlier entry, the earlier entry carries a Correction
+pointing here.
+
+---
+
 ## Decision: Flyway (SQL-first migrations), not Hibernate `ddl-auto`, owns schema creation
 
 **Context / Problem:**
@@ -4136,7 +4149,7 @@ not built).
 
 ---
 
-## Open Items (not yet designed)
+## Open Items (not yet decided or not yet built)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
   can escape correction entirely, in two distinct shapes, if the initiate
@@ -4154,7 +4167,8 @@ not built).
     ever looks at this order again.
 
   Both require the same three independent failures to stack: idempotency
-  failing on `initiate`, a webhook being lost (gap 1's whole subject), and, in
+  failing on `initiate`, a webhook being lost (the subject of "Webhook-never-arrives
+is closed by a reconciliation sweep"), and, in
   the second shape, webhook arrival landing in the specific order that
   produces `PAID` rather than expiry. Each is already managed on its own;
   stacking all of them is markedly rarer than any single one. The cost of
@@ -4162,14 +4176,15 @@ not built).
   also check `PAID` orders is judged not worth it against that likelihood.
   Accepted as a permanent, documented residual risk — this is the one place
   in the design that leans on prevention rather than independent correction.
-- **Done — all sequence diagrams and ERDs, in the Notion FlashMart page.**
-  Both invalidated diagrams (TTL expiry, payment-failure compensation) were
-  redrawn to match the current CAS-based flow; the reconciliation-sweep and
-  partial-item-reservation-failure diagrams (never drawn before) now exist;
-  all four ERDs were regenerated against the current schema. Drawn as Mermaid
-  blocks (`sequenceDiagram`/`erDiagram`/`stateDiagram-v2`), which Notion
-  renders natively, since no image-generation tool exists to reproduce the
-  page's original pasted-image style.
+- **Sequence diagrams and ERDs, in the Notion FlashMart page — drawn for the
+  Revision 3 design, not re-checked since.** Both invalidated diagrams (TTL
+  expiry, payment-failure compensation) were redrawn to the CAS-based flow;
+  the reconciliation-sweep and partial-item-reservation-failure diagrams were
+  added; all four ERDs were regenerated. Drawn as Mermaid blocks, which Notion
+  renders natively. They predate the implementation-phase changes (the revised
+  reserve contract, the partial `UNIQUE` on `payment_ref`, the webhook loading
+  its order by our order id) and have not been re-checked against them. Notion
+  is updated only on request.
 - **The two derived deadlines** — the short `CREATED` deadline and the refund
   stale-claim lease — plus the Order sweep interval and the payment window.
   Blocked on the Feign/Resilience4j timeout configuration by design, not by
@@ -4265,6 +4280,11 @@ not built).
 - **Order's handling of `RESERVATION_RELEASED`** mid-loop is not specified.
 - **Order answers `ITEM_NOT_IN_SALE` with `RESERVATION_FAILED`** (no new
   state). Designed; confirm in Order's API piece.
+- **Which state Order moves to on `SALE_NOT_LIVE` is not specified.** "`RESERVATION_FAILED`
+  added as a fifth terminal state" covers only out of stock. Not decided.
+- **Bean Validation exists in Inventory only.** Identity, Order and
+  Notification add `spring-boot-starter-validation` in their own API phase
+  (see the Correction on "Service scaffolding").
 - **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` instead of firing an
   Inventory alert. See "Per-item quantity cap of 5".
