@@ -2,10 +2,10 @@ package com.flashmart.inventory.controller;
 
 import com.flashmart.inventory.dto.reserve.ErrorCode;
 import com.flashmart.inventory.dto.reserve.ErrorResponse;
-import com.flashmart.inventory.exception.ItemNotFoundException;
 import com.flashmart.inventory.exception.QuantityMismatchException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -52,10 +52,13 @@ public class ReservationExceptionHandler {
                 : new ErrorResponse(ErrorCode.INVALID_REQUEST, "request body could not be read");
     }
 
-    @ExceptionHandler(ItemNotFoundException.class)
-    @ResponseStatus(HttpStatus.NOT_FOUND)
-    public ErrorResponse itemNotFound(ItemNotFoundException ex) {
-        return new ErrorResponse(ErrorCode.ITEM_NOT_FOUND, ex.getMessage());
+    // Reachable here, unlike 405: the mapping declares no consumes, so the
+    // controller is chosen first and this is raised while reading the body.
+    // Status stays 415; the body joins the { code, message } contract.
+    @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
+    @ResponseStatus(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
+    public ErrorResponse unsupportedMediaType(HttpMediaTypeNotSupportedException ex) {
+        return new ErrorResponse(ErrorCode.INVALID_REQUEST, "unsupported content type: " + ex.getContentType());
     }
 
     @ExceptionHandler(QuantityMismatchException.class)

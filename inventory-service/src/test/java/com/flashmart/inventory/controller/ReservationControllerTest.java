@@ -3,7 +3,6 @@ package com.flashmart.inventory.controller;
 import com.flashmart.inventory.dto.reserve.ReserveOutcome;
 import com.flashmart.inventory.dto.reserve.ReserveRequest;
 import com.flashmart.inventory.dto.reserve.ReserveResponse;
-import com.flashmart.inventory.exception.ItemNotFoundException;
 import com.flashmart.inventory.exception.QuantityMismatchException;
 import com.flashmart.inventory.service.ReservationService;
 import jakarta.servlet.ServletException;
@@ -223,29 +222,19 @@ class ReservationControllerTest {
      * Unlike 405, this 415 IS visible to the scoped advice: the mapping
      * declares no consumes, so the controller is chosen first and the 415 is
      * raised when no converter can read text/plain into ReserveRequest. It is
-     * deliberately not mapped, so its body stays Spring's default. Shown by
-     * probe: adding a handler for it to ReservationExceptionHandler changed
-     * this response. This test fails if anyone maps it.
+     * mapped: status stays 415, body is { code: INVALID_REQUEST, message }.
+     * Fails if the handler is removed (the body would be Spring's default).
      */
     @Test
-    void textPlainBodyIs415WithSpringsDefaultBody() throws Exception {
+    void textPlainBodyIs415WithInvalidRequestCode() throws Exception {
         mockMvc.perform(post(URL).contentType(MediaType.TEXT_PLAIN).content(body("42", "2")))
                 .andExpect(status().isUnsupportedMediaType())
-                .andExpect(content().string(not(containsString("\"code\""))));
+                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
 
         verifyNoInteractions(reservationService);
     }
 
-    // --- 404 / 409 ---
-
-    @Test
-    void itemNotFoundIs404() throws Exception {
-        given(reservationService.reserve(any())).willThrow(new ItemNotFoundException(7L, 501L));
-
-        reserve(body("42", "2"))
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.code").value("ITEM_NOT_FOUND"));
-    }
+    // --- 409 ---
 
     @Test
     void quantityMismatchIs409() throws Exception {

@@ -7,6 +7,5 @@ package com.flashmart.inventory.dto.reserve;
 public enum ErrorCode {
     INVALID_QUANTITY,
     INVALID_REQUEST,
-    ITEM_NOT_FOUND,
     QUANTITY_MISMATCH
 }

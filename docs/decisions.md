@@ -765,6 +765,10 @@ payments). Accepted.
 **Consequences:**
 - Order Service must validate at creation that every requested item belongs to
   the order's `flash_sale_id`.
+  > **Correction (from "`ITEM_NOT_IN_SALE` is a `200` outcome"):** no such
+  > check exists or can exist as designed. Order cannot read Inventory's
+  > database and no endpoint answers the question, so an item outside the sale
+  > is only discovered by `reserve`, which answers `200 ITEM_NOT_IN_SALE`.
 - Since a sale belongs to exactly one brand, every order belongs to exactly one
   brand — this is the fact that made the "Brand email delivery" redesign below
   possible.
@@ -2565,6 +2569,12 @@ nothing after.** One invariant to remember instead of three.
 
 ## Decision: Inventory's `reserve` API contract
 
+> **Correction (from "`ITEM_NOT_IN_SALE` is a `200` outcome"):** the claim
+> below that `ITEM_NOT_FOUND` "is also a bug" because "Order validates at
+> creation that every item belongs to the order's `flash_sale_id`" is wrong:
+> that check does not exist. `404 ITEM_NOT_FOUND` is replaced by the `200`
+> outcome `ITEM_NOT_IN_SALE`.
+
 > **Correction (from "Event payload shapes"):** two fields below are
 > incomplete against a rule decided later. The response must also return
 > `productName` — `order_items.product_name` is snapshotted from it, for
@@ -3942,6 +3952,14 @@ the expiry sweep (status, `payment_ref` and `expires_at` in one CAS).
 
 ## Decision: Reserve contract revised — `outcome` replaces `success`/`reason`
 
+> **Correction (from "`ITEM_NOT_IN_SALE` is a `200` outcome"):** the
+> `404 { code: ITEM_NOT_FOUND }` row below is replaced by
+> `200 { outcome: ITEM_NOT_IN_SALE }`, and `ErrorCode.ITEM_NOT_FOUND` no longer
+> exists. Separately, a body that is not JSON now answers
+> `415 { code: INVALID_REQUEST, message }`: the controller-scoped handler can
+> see a `415`, because the mapping declares no `consumes`. Only `405` keeps
+> Spring's default body.
+
 **Context / Problem:**
 "Inventory's `reserve` API contract" answered every case with
 `{ success, reason }`. Building the HTTP layer exposed four gaps in it:
@@ -4072,6 +4090,52 @@ ever lowered.
 
 ---
 
+## Decision: `ITEM_NOT_IN_SALE` is a `200` outcome, not `404 ITEM_NOT_FOUND`
+
+**Context / Problem:**
+`reserve` answered a `(flashSaleId, productId)` with no sale item as
+`404 ITEM_NOT_FOUND`, on the grounds that it "can only be a bug because Order
+checks every item at creation". That check does not exist. Order cannot read
+Inventory's database, and no endpoint answers "is this product in this sale?".
+So a buyer or bot sending a product that is not in the sale would fire an alert
+on every request. A `4xx` may also count against the circuit breaker in front
+of Inventory: a reasoned claim, **unverified** until the Feign/Resilience4j
+configuration exists.
+
+**Options Considered:**
+1. A `200` business outcome, `ITEM_NOT_IN_SALE`.
+2. An Order-side pre-check through a new Inventory endpoint.
+3. Keep the `404` and fix the wording.
+
+**Chosen Approach:**
+Option 1. `ReserveOutcome.ITEM_NOT_IN_SALE`, returned as `200` with only
+`{ "outcome": ... }`, like `OUT_OF_STOCK`. Order cancels with
+`RESERVATION_FAILED`; there is no new Order state. `ItemNotFoundException`,
+its `404` mapping and `ErrorCode.ITEM_NOT_FOUND` are removed. Inventory logs a
+WARN each time it returns this outcome (recorded as a rule; reserve logic is
+not built).
+
+**Why:**
+- It is input a client controls, which is the line between the two families:
+  outcomes a caller can legitimately produce are `200`.
+- A pre-check (option 2) adds a call, a timeout budget and a failure mode, and
+  is still racy for nothing: `reserve` must handle the case anyway.
+- Option 3 leaves a bot able to page someone at will.
+
+**Trade-offs:**
+- A real Order bug that sends the wrong sale id no longer pages. It shows up as
+  a rise in `RESERVATION_FAILED`, and the WARN log makes a spike visible. Real
+  metrics wait for the observability phase.
+
+**Consequences:**
+- `QuantityMismatchException` is now the only exception `reserve` throws on
+  purpose.
+- The "only the outcome" contract test covers `ITEM_NOT_IN_SALE`
+  automatically (it runs every non-`RESERVED` outcome).
+- Order's handling is an open item, to confirm in Order's API piece.
+
+---
+
 ## Open Items (not yet designed)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -4199,6 +4263,8 @@ ever lowered.
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
 - **Order's handling of `RESERVATION_RELEASED`** mid-loop is not specified.
+- **Order answers `ITEM_NOT_IN_SALE` with `RESERVATION_FAILED`** (no new
+  state). Designed; confirm in Order's API piece.
 - **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` instead of firing an
   Inventory alert. See "Per-item quantity cap of 5".

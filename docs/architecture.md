@@ -40,10 +40,11 @@ Chosen per-interaction by whether the caller needs the result before
 proceeding.
 
 **Synchronous (OpenFeign):**
-- **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). The idempotency key is `(orderId, flashSaleId, productId)`; `quantity` is deliberately not part of it. `quantity` is 1..5 per item (`MAX_QUANTITY_PER_ITEM`, enforced at the API only, no `CHECK`; decisions.md, "Per-item quantity cap of 5"). Every `200` carries `outcome` ∈ `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED`. `reservationId`, `salePrice`, `brandId` and `productName` are present **only** when `outcome = RESERVED` and are omitted (not `null`) otherwise. `salePrice` is a string with exactly two decimals in plain notation (`"3999.00"`). There is no `success` and no "replayed" flag: a replay looks exactly like a first call. Business outcomes are always `200`, because a non-2xx could trip the circuit breaker in front of Inventory during a drop. Non-`200` means something upstream is wrong and should alert, with body `{ code, message }` (`message` is for logs only): `400 INVALID_QUANTITY` (any problem with `quantity`, including a fractional one or one above 5; Jackson's float-to-int truncation is turned off), `400 INVALID_REQUEST` (any other malformed field or body), `404 ITEM_NOT_FOUND`, `409 QUANTITY_MISMATCH`. Two exceptions answer with **Spring's default body, not `{ code, message }`**: `405` (wrong method) and `415` (a body that is not JSON). A `405` is raised before any controller is chosen, so the controller-scoped exception handler cannot see it. A `415` *is* visible to that handler (the mapping declares no `consumes`, so the controller is chosen first and the `415` is raised while reading the body), but it is deliberately not mapped. Accepted: a global handler would leak reserve's codes onto future controllers, and both mean a broken caller, not a buyer outcome. **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
+- **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). The idempotency key is `(orderId, flashSaleId, productId)`; `quantity` is deliberately not part of it. `quantity` is 1..5 per item (`MAX_QUANTITY_PER_ITEM`, enforced at the API only, no `CHECK`; decisions.md, "Per-item quantity cap of 5"). Every `200` carries `outcome` ∈ `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED | ITEM_NOT_IN_SALE`. `ITEM_NOT_IN_SALE` (no sale item for `(flashSaleId, productId)`) is an outcome, not an error: Order has no way to check it in advance (it cannot read Inventory's database and no endpoint exists), so a buyer or bot can trigger it at will, and Order answers it with `RESERVATION_FAILED`. `reservationId`, `salePrice`, `brandId` and `productName` are present **only** when `outcome = RESERVED` and are omitted (not `null`) otherwise. `salePrice` is a string with exactly two decimals in plain notation (`"3999.00"`). There is no `success` and no "replayed" flag: a replay looks exactly like a first call. Business outcomes are always `200`, because a non-2xx could trip the circuit breaker in front of Inventory during a drop. Non-`200` means something upstream is wrong and should alert, with body `{ code, message }` (`message` is for logs only): `400 INVALID_QUANTITY` (any problem with `quantity`, including a fractional one or one above 5; Jackson's float-to-int truncation is turned off), `INVALID_REQUEST` (any other malformed field or body, with `400`; or a body that is not JSON, with `415`), `409 QUANTITY_MISMATCH`. The `415` is mapped because the controller-scoped handler can see it: the mapping declares no `consumes`, so the controller is chosen first and the `415` is raised while reading the body. One exception answers with **Spring's default body, not `{ code, message }`**: `405` (wrong method), which is raised before any controller is chosen, so the scoped handler cannot see it. Accepted: a global handler would leak reserve's codes onto future controllers, and a `405` means a broken caller, not a buyer outcome. **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
 
   *Implementation rules — recorded, not built (`reserve` has an HTTP layer and an interface, no implementation):*
   - **Replay path, in this order:** find the existing reservation for `(orderId, item)` in **any** status → compare `quantity` (different → `409 QUANTITY_MISMATCH`) → if `RELEASED`, return `200 RESERVATION_RELEASED` and never fall through to a new reservation → otherwise return the stored reservation as `RESERVED`. A replay skips the liveness and stock gates.
+  - **`ITEM_NOT_IN_SALE` is logged:** Inventory logs a WARN each time it returns this outcome, so a spike (a bot, or an Order bug sending the wrong sale id) is visible. A plain log line until the observability phase brings metrics.
   - **Concurrent first calls:** when two first calls for the same `(orderId, item)` race, the loser must end on the replay path, never a `500`, and its stock change must not survive. The mechanism depends on the open reserve write-path decision (§9).
 - **Order → Razorpay Clone** — initiate payment, with an idempotency key derived from the order ID. 202-only response; Order sets `PENDING_PAYMENT`, never `PAID`, off it.
 - **Order → Razorpay Clone** — refund a captured payment, and a payment-status lookup (used both to check "already refunded?" and by the reconciliation sweep, §6). Must accept *our* idempotency key or order reference, not only the gateway's own payment ID.
@@ -541,8 +542,8 @@ through Revision 3.
   credential pair but each owns a separate database.
 
 **Tested: 193 tests, all passing** — 58 in Inventory (24 persistence and
-guard tests plus 34 API contract tests, run when the reserve-gaps piece
-landed), and 59 in Order, 47 in Identity and 29 in Notification (each last run
+guard tests plus 34 API contract tests, run when the item-not-in-sale
+piece landed), and 59 in Order, 47 in Identity and 29 in Notification (each last run
 when its own piece landed, unchanged since). Each count includes a context
 test and the zone-less-timestamp guard every service carries. The persistence
 tests save into real Postgres inside a rolled-back transaction; every CHECK,
@@ -564,12 +565,19 @@ are untested.
 
 Added by the reserve-gaps piece: `quantity` 5 reaches the service and 6 is
 `400 INVALID_QUANTITY` without reaching it; a `salePrice` of `"3999.000"` is
-rejected; `405` and `415` keep Spring's default body; the placeholder's
+rejected; `405` keeps Spring's default body; the placeholder's
 `UnsupportedOperationException` stays unmapped. Two of these were shown to
 fail on purpose: mapping `RuntimeException` in the reserve handler failed the
 unmapped-exception test, and mapping the `405`/`415` exceptions there changed
 the `415` but not the `405`. That second probe is why the docs say the handler
 *can* see a `415`.
+
+Changed by the item-not-in-sale piece: `404 ITEM_NOT_FOUND` is gone and
+"item not in this sale" is the `200` outcome `ITEM_NOT_IN_SALE`, covered by the
+"only the outcome" test, which now runs four outcomes. The `415` is now mapped
+to `{ code: INVALID_REQUEST }` with its status unchanged; removing that handler
+fails its test. The WARN log on `ITEM_NOT_IN_SALE` is a recorded rule, not
+code: reserve logic does not exist yet.
 
 The tests are shown able to fail, not assumed to be. Order's 30 mutations —
 25 applied to the database, 5 stripping an `@Generated` — killed exactly the
@@ -679,6 +687,8 @@ each is blocked on something that doesn't exist yet, or is mechanical work.
   count.
 - **What Order does when `reserve` returns `RESERVATION_RELEASED`** mid-loop is
   not specified. Recorded, not decided.
+- **Order answers `ITEM_NOT_IN_SALE` with `RESERVATION_FAILED`** (no new
+  state). Designed; confirm in Order's API piece.
 - **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` from Order instead of
   firing an Inventory alert. Not built.
