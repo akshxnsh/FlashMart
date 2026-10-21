@@ -9,5 +9,11 @@ public enum ReserveOutcome {
     RESERVED,
     OUT_OF_STOCK,
     SALE_NOT_LIVE,
-    RESERVATION_RELEASED
+    RESERVATION_RELEASED,
+    /**
+     * No sale item for {@code (flashSaleId, productId)}. A buyer or bot can
+     * send this, and Order has no way to check it in advance, so it is an
+     * outcome, not an error. Inventory logs a WARN each time it returns it.
+     */
+    ITEM_NOT_IN_SALE
 }
