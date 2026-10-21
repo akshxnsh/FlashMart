@@ -2,8 +2,9 @@
 
 > Current design per `docs/decisions.md` through Revision 3. Supersedes the
 > PRD wherever they conflict (see `CLAUDE.md`). Design document — Section 8
-> is what actually has code behind it: Inventory's four entities and Identity's
-> `brands`, all on Flyway migrations and covered by persistence tests.
+> is what actually has code behind it: every service's entities on Flyway
+> migrations, covered by persistence tests, plus Inventory's API contract layer
+> (DTOs and the reserve HTTP endpoint, with no reserve logic behind it).
 
 ## 1. System Overview
 
@@ -39,7 +40,11 @@ Chosen per-interaction by whether the caller needs the result before
 proceeding.
 
 **Synchronous (OpenFeign):**
-- **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). Returns `{ success, reservationId, salePrice, brandId, productName }` (money as a string). `200` for buyer-legitimate outcomes (`OUT_OF_STOCK`, `SALE_NOT_LIVE`); non-`200` means something upstream is wrong and should alert (`404 ITEM_NOT_FOUND`, `409 QUANTITY_MISMATCH`, `400 INVALID_QUANTITY`). **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
+- **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). The idempotency key is `(orderId, flashSaleId, productId)`; `quantity` is deliberately not part of it. Every `200` carries `outcome` ∈ `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED`. `reservationId`, `salePrice`, `brandId` and `productName` are present **only** when `outcome = RESERVED` and are omitted (not `null`) otherwise. `salePrice` is a string with exactly two decimals in plain notation (`"3999.00"`). There is no `success` and no "replayed" flag: a replay looks exactly like a first call. Business outcomes are always `200`, because a non-2xx could trip the circuit breaker in front of Inventory during a drop. Non-`200` means something upstream is wrong and should alert, with body `{ code, message }` (`message` is for logs only): `400 INVALID_QUANTITY` (any problem with `quantity`, including a fractional one; Jackson's float-to-int truncation is turned off), `400 INVALID_REQUEST` (any other malformed field or body), `404 ITEM_NOT_FOUND`, `409 QUANTITY_MISMATCH`. **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
+
+  *Implementation rules — recorded, not built (`reserve` has an HTTP layer and an interface, no implementation):*
+  - **Replay path, in this order:** find the existing reservation for `(orderId, item)` in **any** status → compare `quantity` (different → `409 QUANTITY_MISMATCH`) → if `RELEASED`, return `200 RESERVATION_RELEASED` and never fall through to a new reservation → otherwise return the stored reservation as `RESERVED`. A replay skips the liveness and stock gates.
+  - **Concurrent first calls:** when two first calls for the same `(orderId, item)` race, the loser must end on the replay path, never a `500`, and its stock change must not survive. The mechanism depends on the open reserve write-path decision (§9).
 - **Order → Razorpay Clone** — initiate payment, with an idempotency key derived from the order ID. 202-only response; Order sets `PENDING_PAYMENT`, never `PAID`, off it.
 - **Order → Razorpay Clone** — refund a captured payment, and a payment-status lookup (used both to check "already refunded?" and by the reconciliation sweep, §6). Must accept *our* idempotency key or order reference, not only the gateway's own payment ID.
 - **Inventory → Order** — `GET /internal/orders/{orderId}/status` → `{ orderId, status }`, used by Inventory's stale-reservation reconciler. `PAID` → confirm; terminal failure → release; `CREATED`/`PENDING_PAYMENT` → do nothing **and alert** (an hours-old reservation on a live order means Order's sweep has died); `404`/unreachable → do nothing and alert, never guess. Safe without locking: every answer acted on is terminal and can't change after being read. Internal only. The reconciler scans a bounded number of rows per pass, so a systemic backlog (e.g. Kafka down for hours) can't flood Order.
@@ -86,7 +91,9 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
   -- flash_sale_id: order-level — one order = exactly one brand's sale
   -- amount: SUM(order_items.subtotal), DECIMAL, stored (the price the buyer
   --   agreed to, frozen). NULL until the last item is priced; set once by a CAS
-  --   guarded on status = CREATED; a test checks it equals SUM(subtotal)
+  --   guarded on status = CREATED; a test checks it equals SUM(subtotal).
+  --   Computed once from SUM(order_items.subtotal) after the last item is
+  --   priced, never accumulated item by item (recorded, not built)
   -- status: CREATED | PENDING_PAYMENT | PAID | PAYMENT_FAILED
   --         | ORDER_EXPIRED | PAYMENT_UNAVAILABLE | RESERVATION_FAILED
   --         (CHECK on the seven values)
@@ -118,6 +125,12 @@ order_items(id, order_id, product_id, product_name, quantity, unit_price, subtot
   -- CHECK (quantity > 0); CHECK unit_price >= 0 AND subtotal >= 0
   -- CHECK product_name, unit_price, subtotal all NULL or all non-NULL
   -- CHECK subtotal = unit_price * quantity when filled
+  -- RECORDED, NOT BUILT: product_name/unit_price/subtotal are written once —
+  --   the pricing UPDATE carries WHERE unit_price IS NULL, on top of the
+  --   orders.status = 'CREATED' guard
+  -- RECORDED, NOT BUILT: recovery is abort (decisions.md, "saga_state is
+  --   dropped"). IF a resume path is ever added (e.g. a retried create while
+  --   the order is still CREATED), it runs only over rows WHERE unit_price IS NULL
 
 refunds(id, order_id, payment_ref, amount, status, attempts,
         next_retry_at, claimed_at, last_error, created_at, updated_at)
@@ -192,6 +205,10 @@ stock_reservations(id, order_id, flash_sale_item_id, quantity, status, reserved_
   --   with order_id, and an extra index only slows every reserve insert
 
 products(...)
+  -- a product's name is frozen while a live sale references it: reserve
+  --   returns productName on every replay, so a rename between a first call
+  --   and its retry would give one reservation two names. Same reason a live
+  --   sale's price is frozen. Service-layer rule, not built (§9)
 ```
 No `outbox` — Inventory publishes nothing.
 
@@ -350,8 +367,8 @@ buyer_contacts(user_id, email, updated_at)      -- fed by UserUpserted
   --   synchronous Identity lookup would undo the reason the cache exists
 ```
 
-Code behind these schemas so far: all four Inventory tables and Identity's
-`brands` — see §8 for exactly what is and is not built.
+Code behind these schemas so far: every table above, as entities on Flyway
+migrations, in all four services — see §8 for exactly what is and is not built.
 
 ## 5. Cross-Service Relationships: IDs vs. Events
 
@@ -469,7 +486,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **`CHECK` constraints are the last line of defence, each documented against the guard that comes first** — the ceiling `available_stock <= total_stock` matters more than the floor because only application logic stands before it. A `CHECK` is never removed for "duplicating" application logic.
 - **Entity and migration conventions** — `IDENTITY` ids; migrations never edited once applied or pushed; same-service FKs real in the database but plain `Long` in Java; enums as `EnumType.STRING` plus a `CHECK`; chosen constraint names; a database-filled column must be `insertable = false` or Hibernate-generated, because Hibernate sends an explicit `NULL` that overrides a `DEFAULT`; `validate` cannot see triggers, defaults or `CHECK`s.
 - **Entity tests use real Postgres, roll back, and must be shown to fail** — each guard was verified by breaking what it protects. No `reserve`, so nothing is load-tested or verified under concurrency.
-- **Service scaffolding** — fixed ports 8081–8084 (8080 reserved for the Gateway); one shared credential pair against one Postgres instance but a separate database per service; Kafka, Feign, Resilience4j, Security and Validation deferred to their phases.
+- **Service scaffolding** — fixed ports 8081–8084 (8080 reserved for the Gateway); one shared credential pair against one Postgres instance but a separate database per service; Kafka, Feign, Resilience4j and Security deferred to their phases; Validation added to Inventory in its API phase, and each sibling adds it in its own.
 - **Every event-publishing service owns an outbox** — now Order and Identity only.
 - **Cross-service relationships are always an ID or an event, never a foreign key** — §5.
 - **Deadlines and leases are derived from the timeouts they race, never picked** — the `CREATED` deadline and refund claim lease stay open until real Feign/Resilience4j config exists.
@@ -488,6 +505,16 @@ through Revision 3.
   zone-less `TIMESTAMP`; see §9). V7 backfilled the window-ordering and
   non-blank-name `CHECK`s, and `StockReservation.reservedAt` carries
   `@Generated` so the saved instance reads the database's value back.
+  **API contract layer:** request/response DTOs as records for reserve,
+  products, flash sales and sale items, with Bean Validation
+  (`spring-boot-starter-validation`, Inventory only, so far); the reserve
+  controller; a `ReservationService` **interface with no implementation**; and
+  an exception handler scoped to the reserve controller. `application.yml`
+  turns off Jackson's float-to-int truncation. No public controllers (they
+  wait for security), no browse endpoint. So that the application can start,
+  `NotImplementedReservationService` stands in for the service: every call
+  throws and returns a `500`, never a business outcome. Delete it when
+  `reserve` is built.
 - **Identity Service** — complete: `Brand`, `User`, `ApiKey` and
   `OutboxEvent` on migrations V1–V7, including the `bump_updated_at` trigger
   attached to both identity tables.
@@ -504,15 +531,32 @@ through Revision 3.
   `bump_updated_at` is recreated in Order's own database and attached to
   `orders` and `refunds`. **Still no repositories, services or controllers**,
   so nothing yet writes a CAS.
-- **Not built anywhere:** repositories, services, controllers, the API
-  Gateway, Kafka, Redis, security. All four services share one local Postgres
+- **Not built anywhere:** repositories, service implementations, any
+  controller other than Inventory's reserve endpoint, the API Gateway, Kafka,
+  Redis, security. **`reserve` logic is not implemented.** All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested: 159 tests, all passing, run in this session** — 59 in Order, 47 in
-Identity, 29 in Notification, 24 in Inventory (each count includes a context
-test and the zone-less-timestamp guard every service carries). Each saves into
-real Postgres inside a rolled-back transaction; every CHECK, unique key and FK
-is verified to reject bad rows, not merely to exist.
+**Tested: 187 tests, all passing** — 52 in Inventory (24 persistence and
+guard tests plus 28 API contract tests, run when the API contract piece
+landed), and 59 in Order, 47 in Identity and 29 in Notification (each last run
+when its own piece landed, unchanged since). Each count includes a context
+test and the zone-less-timestamp guard every service carries. The persistence
+tests save into real Postgres inside a rolled-back transaction; every CHECK,
+unique key and FK is verified to reject bad rows, not merely to exist.
+
+**Inventory's reserve contract is tested at the HTTP layer only**
+(`@WebMvcTest`, with the service mocked): the response shape, validation and
+error mapping, through the application's real Jackson and validator
+configuration. Four guards were shown to fail when broken. Removing
+`@JsonFormat` made `salePrice` a JSON number. Removing
+`@JsonInclude(NON_NULL)` made the non-`RESERVED` outcomes carry null fields.
+Removing `@Positive` made `quantity: 0` return `200`. Removing
+`accept-float-as-int: false` made `quantity: 2.5` return `200`, silently
+truncated. One assertion trap: Spring's `jsonPath(...).doesNotExist()` passes
+for a key that is present with a `null` value, so omission is asserted as
+"the body is exactly `{outcome}`". **Reserve logic is not implemented**, so
+evaluation order, replay, liveness against the database clock and concurrency
+are untested.
 
 The tests are shown able to fail, not assumed to be. Order's 30 mutations —
 25 applied to the database, 5 stripping an `@Generated` — killed exactly the
@@ -607,6 +651,25 @@ each is blocked on something that doesn't exist yet, or is mechanical work.
 - Enforce "frozen once the sale opens" (price, `total_stock`, times,
   cancellation) in the service layer, against the database clock, in the same
   transaction as the write. A CHECK cannot express it. Not built.
+- Enforce "a product's name is frozen while a live sale references it" in the
+  service layer, by the same means as the item above (§4). Not built.
+- TODO: add an API check so a brand cannot create a sale that starts in the
+  past. Put it on the create request only (on update it would hide the real
+  "frozen" reason), with a fixed clock in tests. The authoritative rule stays
+  the service-layer check against the DB clock.
+- **A zero-amount order is untested.** `sale_price` may be `0.00` (the
+  `>= 0` CHECK and the API's `@PositiveOrZero` agree), so an order can total
+  `0.00`, and a payment gateway may refuse a zero-amount payment. Decide in
+  the payment phase.
+- **FR-B1 (buyer browse) has no endpoint.** It waits for security and
+  caching. Any future stock hint is a coarse `soldOut` flag, never an exact
+  count.
+- **What Order does when `reserve` returns `RESERVATION_RELEASED`** mid-loop is
+  not specified. Recorded, not decided.
+- **A retried create while the order is still `CREATED` is not specified**
+  (`UNIQUE(buyer_id, idempotency_key)` finds the row; what the request then
+  does is undecided). Recovery today is abort; see the conditional rule on
+  `order_items` (§4).
 - Identity, for the API phase: a lost signup race must surface as "email
   already taken", not a 500; the JWT must say whether its subject is a brand
   or a user (brand 7 and user 7 share an id); published `outbox` rows need a
