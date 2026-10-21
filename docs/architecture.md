@@ -601,20 +601,22 @@ omission.
 **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
 `8084`; `8080` is reserved for the API Gateway.
 
-**Diagrams and ERDs: drawn for the Revision 3 design, not re-checked since.**
-All sequence diagrams (including reconciliation sweep and partial-item failure)
+**Diagrams and ERDs: current, checked 2026-10-22.** All sequence diagrams
+(including reconciliation sweep and partial-item failure), both state diagrams
 and all four ERDs live in the Notion FlashMart page as Mermaid blocks. They
-were drawn before the implementation-phase changes — the revised reserve
-contract (`outcome` enum, `ITEM_NOT_IN_SALE`, the quantity cap), the partial
-`UNIQUE` on `payment_ref`, and the webhook loading its order by our order id —
-and have not been re-checked against them. Notion is updated only on request.
-`docs/Flashmart.prd` was re-synced to this document on 2026-10-22.
+were checked against the code and this document on 2026-10-22 and updated
+where they lagged: the reserve step now shows the item-in-sale check and the
+replay quantity check, Order rejects a quantity above 5, and
+`ITEM_NOT_IN_SALE` leads to `RESERVATION_FAILED`. `docs/Flashmart.prd` was
+re-synced to this document the same day.
 
 **Notion log:** a personal engineering log, not a source of truth —
-`docs/decisions.md` remains authoritative on conflict. It was last
-cross-checked when the entity layer landed; its "API & Event Contracts"
-section was empty then and does not yet record the reserve contract built
-since. Not re-checked in this pass; Notion is updated only on request.
+`docs/decisions.md` remains authoritative on conflict. Checked and brought up
+to date on 2026-10-22: "API & Event Contracts" records every reserve-contract
+piece (including `ITEM_NOT_IN_SALE` and the `415`), and the test totals match
+the 193 measured that day. "Feature Implementation" and "Load Testing &
+Verification" are empty, consistent with the repo — no feature logic and no
+load test exist yet.
 
 ## 9. Known Open Items / Next Steps
 

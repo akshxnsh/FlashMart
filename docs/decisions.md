@@ -4176,15 +4176,14 @@ is closed by a reconciliation sweep"), and, in
   also check `PAID` orders is judged not worth it against that likelihood.
   Accepted as a permanent, documented residual risk — this is the one place
   in the design that leans on prevention rather than independent correction.
-- **Sequence diagrams and ERDs, in the Notion FlashMart page — drawn for the
-  Revision 3 design, not re-checked since.** Both invalidated diagrams (TTL
-  expiry, payment-failure compensation) were redrawn to the CAS-based flow;
-  the reconciliation-sweep and partial-item-reservation-failure diagrams were
-  added; all four ERDs were regenerated. Drawn as Mermaid blocks, which Notion
-  renders natively. They predate the implementation-phase changes (the revised
-  reserve contract, the partial `UNIQUE` on `payment_ref`, the webhook loading
-  its order by our order id) and have not been re-checked against them. Notion
-  is updated only on request.
+- **Done — sequence diagrams, state diagrams and ERDs, in the Notion
+  FlashMart page; checked against the code on 2026-10-22.** Both invalidated
+  diagrams (TTL expiry, payment-failure compensation) were redrawn to the
+  CAS-based flow; the reconciliation-sweep and partial-item-reservation-failure
+  diagrams were added; all four ERDs were regenerated. Drawn as Mermaid blocks,
+  which Notion renders natively. On 2026-10-22 they were updated for the
+  implementation-phase reserve changes (item-in-sale check, replay quantity
+  check, the quantity cap, `ITEM_NOT_IN_SALE` → `RESERVATION_FAILED`).
 - **The two derived deadlines** — the short `CREATED` deadline and the refund
   stale-claim lease — plus the Order sweep interval and the payment window.
   Blocked on the Feign/Resilience4j timeout configuration by design, not by
