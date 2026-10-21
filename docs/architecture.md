@@ -40,7 +40,7 @@ Chosen per-interaction by whether the caller needs the result before
 proceeding.
 
 **Synchronous (OpenFeign):**
-- **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). The idempotency key is `(orderId, flashSaleId, productId)`; `quantity` is deliberately not part of it. Every `200` carries `outcome` ∈ `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED`. `reservationId`, `salePrice`, `brandId` and `productName` are present **only** when `outcome = RESERVED` and are omitted (not `null`) otherwise. `salePrice` is a string with exactly two decimals in plain notation (`"3999.00"`). There is no `success` and no "replayed" flag: a replay looks exactly like a first call. Business outcomes are always `200`, because a non-2xx could trip the circuit breaker in front of Inventory during a drop. Non-`200` means something upstream is wrong and should alert, with body `{ code, message }` (`message` is for logs only): `400 INVALID_QUANTITY` (any problem with `quantity`, including a fractional one; Jackson's float-to-int truncation is turned off), `400 INVALID_REQUEST` (any other malformed field or body), `404 ITEM_NOT_FOUND`, `409 QUANTITY_MISMATCH`. **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
+- **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). The idempotency key is `(orderId, flashSaleId, productId)`; `quantity` is deliberately not part of it. `quantity` is 1..5 per item (`MAX_QUANTITY_PER_ITEM`, enforced at the API only, no `CHECK`; decisions.md, "Per-item quantity cap of 5"). Every `200` carries `outcome` ∈ `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED`. `reservationId`, `salePrice`, `brandId` and `productName` are present **only** when `outcome = RESERVED` and are omitted (not `null`) otherwise. `salePrice` is a string with exactly two decimals in plain notation (`"3999.00"`). There is no `success` and no "replayed" flag: a replay looks exactly like a first call. Business outcomes are always `200`, because a non-2xx could trip the circuit breaker in front of Inventory during a drop. Non-`200` means something upstream is wrong and should alert, with body `{ code, message }` (`message` is for logs only): `400 INVALID_QUANTITY` (any problem with `quantity`, including a fractional one or one above 5; Jackson's float-to-int truncation is turned off), `400 INVALID_REQUEST` (any other malformed field or body), `404 ITEM_NOT_FOUND`, `409 QUANTITY_MISMATCH`. Two exceptions answer with **Spring's default body, not `{ code, message }`**: `405` (wrong method) and `415` (a body that is not JSON). A `405` is raised before any controller is chosen, so the controller-scoped exception handler cannot see it. A `415` *is* visible to that handler (the mapping declares no `consumes`, so the controller is chosen first and the `415` is raised while reading the body), but it is deliberately not mapped. Accepted: a global handler would leak reserve's codes onto future controllers, and both mean a broken caller, not a buyer outcome. **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
 
   *Implementation rules — recorded, not built (`reserve` has an HTTP layer and an interface, no implementation):*
   - **Replay path, in this order:** find the existing reservation for `(orderId, item)` in **any** status → compare `quantity` (different → `409 QUANTITY_MISMATCH`) → if `RELEASED`, return `200 RESERVATION_RELEASED` and never fall through to a new reservation → otherwise return the stored reservation as `RESERVED`. A replay skips the liveness and stock gates.
@@ -184,7 +184,9 @@ flash_sales(id, brand_id, name, start_time, end_time, status)
 flash_sale_items(id, flash_sale_id, product_id, sale_price,
                  total_stock, available_stock, version)
   -- UNIQUE(flash_sale_id, product_id)
-  -- sale_price: DECIMAL, immutable once the sale is live
+  -- sale_price: DECIMAL, immutable once the sale is live. The API refuses any
+  --   third decimal, even a zero ("3999.000"): Postgres would silently round
+  --   it on insert (3999.005::numeric(12,2) = 3999.01, measured)
   -- total_stock fixed (reporting); available_stock is the decremented counter
   -- version: optimistic lock — the contended row under concurrent decrement
   -- OPEN: optimistic alone vs. pessimistic vs. Redis lock — decide + load-test
@@ -513,8 +515,10 @@ through Revision 3.
   turns off Jackson's float-to-int truncation. No public controllers (they
   wait for security), no browse endpoint. So that the application can start,
   `NotImplementedReservationService` stands in for the service: every call
-  throws and returns a `500`, never a business outcome. Delete it when
-  `reserve` is built.
+  throws `UnsupportedOperationException`, which the reserve exception handler
+  does not map, so it can never become an `ErrorResponse` or a business
+  outcome; Spring's default error handling answers it. Delete it when
+  `reserve` is built. `quantity` is capped at 5 per item at the API.
 - **Identity Service** — complete: `Brand`, `User`, `ApiKey` and
   `OutboxEvent` on migrations V1–V7, including the `bump_updated_at` trigger
   attached to both identity tables.
@@ -536,8 +540,8 @@ through Revision 3.
   Redis, security. **`reserve` logic is not implemented.** All four services share one local Postgres
   credential pair but each owns a separate database.
 
-**Tested: 187 tests, all passing** — 52 in Inventory (24 persistence and
-guard tests plus 28 API contract tests, run when the API contract piece
+**Tested: 193 tests, all passing** — 58 in Inventory (24 persistence and
+guard tests plus 34 API contract tests, run when the reserve-gaps piece
 landed), and 59 in Order, 47 in Identity and 29 in Notification (each last run
 when its own piece landed, unchanged since). Each count includes a context
 test and the zone-less-timestamp guard every service carries. The persistence
@@ -557,6 +561,15 @@ for a key that is present with a `null` value, so omission is asserted as
 "the body is exactly `{outcome}`". **Reserve logic is not implemented**, so
 evaluation order, replay, liveness against the database clock and concurrency
 are untested.
+
+Added by the reserve-gaps piece: `quantity` 5 reaches the service and 6 is
+`400 INVALID_QUANTITY` without reaching it; a `salePrice` of `"3999.000"` is
+rejected; `405` and `415` keep Spring's default body; the placeholder's
+`UnsupportedOperationException` stays unmapped. Two of these were shown to
+fail on purpose: mapping `RuntimeException` in the reserve handler failed the
+unmapped-exception test, and mapping the `405`/`415` exceptions there changed
+the `415` but not the `405`. That second probe is why the docs say the handler
+*can* see a `415`.
 
 The tests are shown able to fail, not assumed to be. Order's 30 mutations —
 25 applied to the database, 5 stripping an `@Generated` — killed exactly the
@@ -666,6 +679,11 @@ each is blocked on something that doesn't exist yet, or is mechanical work.
   count.
 - **What Order does when `reserve` returns `RESERVATION_RELEASED`** mid-loop is
   not specified. Recorded, not decided.
+- **Order's create-order request must reject `quantity > 5`** before any
+  `reserve` call, so a buyer's mistake gets a `400` from Order instead of
+  firing an Inventory alert. Not built.
+- **A per-buyer limit across orders is not covered.** The cap of 5 is per item
+  per order; a buyer can place several orders.
 - **A retried create while the order is still `CREATED` is not specified**
   (`UNIQUE(buyer_id, idempotency_key)` finds the row; what the request then
   does is undecided). Recovery today is abort; see the conditional rule on

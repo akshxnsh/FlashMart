@@ -91,6 +91,20 @@ class PublicDtoContractTest {
                 invalidFields(validator.validate(new AddSaleItemRequest(1L, new BigDecimal("1.001"), 5))));
     }
 
+    /**
+     * Postgres would silently round a third decimal into DECIMAL(12, 2) on
+     * insert, so the API refuses any third decimal, even a zero. Parsed from
+     * the JSON string, the path a real request takes, so the scale survives.
+     */
+    @Test
+    void salePriceWithATrailingZeroThirdDecimalIsRejected() {
+        AddSaleItemRequest request = objectMapper.readValue(
+                "{\"productId\": 1, \"salePrice\": \"3999.000\", \"totalStock\": 5}", AddSaleItemRequest.class);
+
+        assertEquals(new BigDecimal("3999.000"), request.salePrice());
+        assertEquals(Set.of("salePrice"), invalidFields(validator.validate(request)));
+    }
+
     @Test
     void addSaleItemAcceptsSalePriceAsStringOrNumber() {
         AddSaleItemRequest fromString = objectMapper.readValue(
