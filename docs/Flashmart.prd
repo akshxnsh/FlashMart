@@ -782,9 +782,9 @@ Mapped session-for-session to the Coding Shuttle Razorpay Clone cohort schedule.
 | Session(s) | Cohort topic | FlashMart equivalent | State |
 |---|---|---|---|
 | 1 | Orientation | Repo setup, base Spring Boot app per service, docker-compose skeleton | **Partly done** — all four services scaffolded (own database, fixed port, Flyway); docker-compose skeleton not started |
-| 2 | Gateway internals & diagrams | Architecture + purchase-flow sequence diagrams | Done for the Revision 3 design; not re-checked against the implementation-phase changes (§9) |
+| 2 | Gateway internals & diagrams | Architecture + purchase-flow sequence diagrams | Done; checked against the code and updated 2026-10-22 (§9) |
 | 3 | Requirement gathering | `docs/requirements.md` | Done; re-checked 2026-10-22 — behavioural only, no stale mechanism in it |
-| 4 | Schema design | All five schemas + ERDs | **Done** — all four services' schemas implemented; ERDs in Notion drawn for the Revision 3 design (§9) |
+| 4 | Schema design | All five schemas + ERDs | **Done** — all four services' schemas implemented; ERDs in Notion checked against them 2026-10-22 (§9) |
 | 5–6 | JPA entities Part 1 & 2 | Entities + repositories: `Product → FlashSale → FlashSaleItem → StockReservation`, `Order → OrderItem → Refund`, Identity and Notification entities | **Entities done in all four services**; no repositories yet |
 | 7–8 | Merchant API — signup, API key | Identity Service: brand + buyer signup/login, brand API key generation, `BrandUpserted` / `UserUpserted` outbox rows | |
 | 9 | Order APIs with MapStruct | Order creation/status/list APIs, multi-item request/response, DTO↔entity mapping (Inventory's DTOs map with a static `from(entity)`, no MapStruct) | |
@@ -847,14 +847,13 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 reserved for the API Gateway. All four services share one local Postgres credential pair but
 each owns a separate database.
 
-**Diagrams and ERDs: drawn for the Revision 3 design, not re-checked since.** They live in
-the Notion FlashMart page as Mermaid blocks and predate the implementation-phase changes in
-§0 (reserve contract, webhook lookup by order id). Notion is updated only on request. This
-document's status, flows and open items were re-synced to `architecture.md` on 2026-10-22.
+**Diagrams and ERDs: current, checked 2026-10-22.** They live in the Notion FlashMart page as
+Mermaid blocks and were updated that day for the implementation-phase changes in §0. This
+document's status, flows and open items were re-synced to `architecture.md` the same day.
 
-**Notion log:** a personal engineering log, not a source of truth. Last cross-checked when
-the entity layer landed; its "API & Event Contracts" section does not yet record the reserve
-contract built since. Not re-checked in this pass.
+**Notion log:** a personal engineering log, not a source of truth. Checked and brought up to
+date on 2026-10-22: its "API & Event Contracts" section records every reserve-contract piece,
+and its test totals match the 193 measured that day.
 
 ---
 
