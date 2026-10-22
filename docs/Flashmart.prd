@@ -351,7 +351,7 @@ Kafka -> Notification : read brand_contacts / buyer_contacts; send receipt (buye
 
 ```
 Order -> Inventory : reserve(item 3) -> 200 { outcome: OUT_OF_STOCK }
-                     (ITEM_NOT_IN_SALE lands here too -- designed, confirm in Order's API piece)
+                     (SALE_NOT_LIVE and ITEM_NOT_IN_SALE land here too -- decided, not built)
 Order              : ONE tx -- CAS CREATED -> RESERVATION_FAILED
                      + outbox row OrderCancelled{reason: RESERVATION_FAILED}
 Order --> Buyer    : synchronous failure response (buyer is told now)
@@ -678,7 +678,7 @@ Two transient states (`CREATED`, `PENDING_PAYMENT`) → five terminal states.
 | Transition | Trigger |
 |---|---|
 | `CREATED → PENDING_PAYMENT` | Every item reserved, `amount` set, gateway returned 202. Saves `payment_ref`, resets `expires_at` to the payment window |
-| `CREATED → RESERVATION_FAILED` | An item came back `OUT_OF_STOCK`, or `ITEM_NOT_IN_SALE` (designed; confirm in Order's API piece). The state for `SALE_NOT_LIVE` and `RESERVATION_RELEASED` is not yet specified (§10) |
+| `CREATED → RESERVATION_FAILED` | An item came back `OUT_OF_STOCK`, `SALE_NOT_LIVE` or `ITEM_NOT_IN_SALE` (decided, not built; no new state). The detail goes in `failure_detail` (debug only) and the buyer's reply. What Order does on `RESERVATION_RELEASED` is not yet specified (§10) |
 | `CREATED → PAYMENT_UNAVAILABLE` | Circuit breaker open on initiate |
 | `CREATED → ORDER_EXPIRED` | Didn't finish the loop + initiate before its deadline |
 | `PENDING_PAYMENT → PAID` | Webhook success *for the payment this order holds* |
@@ -889,8 +889,12 @@ on prevention rather than independent correction.**
 - Enforce "frozen once the sale opens" (price, `total_stock`, times, cancellation) in the
   service layer against the database clock — a CHECK cannot express it. Same for "a product's
   name is frozen while a live sale includes it".
-- Order's handling of `reserve` outcomes: `ITEM_NOT_IN_SALE` → `RESERVATION_FAILED` (designed,
-  confirm in Order's API piece); `SALE_NOT_LIVE` and `RESERVATION_RELEASED` — not specified.
+- Order's handling of `reserve` outcomes: `OUT_OF_STOCK`, `SALE_NOT_LIVE` and `ITEM_NOT_IN_SALE`
+  all end the order as `RESERVATION_FAILED` (decided, not built). What Order does on
+  `RESERVATION_RELEASED` — not specified.
+- For Order's API piece: what a retried create with the same idempotency key returns when the
+  order is already `RESERVATION_FAILED` (`failure_detail` is debug only, so it cannot say which
+  outcome it was) — not decided.
 - Order's create-order request must reject `quantity > 5` before any reserve call. A per-buyer
   limit across orders is not covered.
 - A retried create while the order is still `CREATED` is not specified; recovery is abort.
