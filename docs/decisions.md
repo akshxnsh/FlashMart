@@ -4068,6 +4068,13 @@ Option 2.
   because they do not exist yet.
 - Enforcing the name freeze is a service-layer rule, listed in Open Items next
   to "frozen once the sale opens".
+- **Decided: all three reserve "no" outcomes (`OUT_OF_STOCK`, `SALE_NOT_LIVE`,
+  `ITEM_NOT_IN_SALE`) end the order as `RESERVATION_FAILED`.** A state exists
+  only if something downstream reacts differently to it, and every reserve
+  failure gets the same reaction: release everything, send no email, tell the
+  buyer in the reply. Which outcome it was goes in `failure_detail` (debug
+  only) and in the buyer's reply. No new state, no migration. Not built: Order
+  has no API yet.
 
 ---
 
@@ -4277,10 +4284,12 @@ is closed by a reconciliation sweep"), and, in
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
 - **Order's handling of `RESERVATION_RELEASED`** mid-loop is not specified.
-- **Order answers `ITEM_NOT_IN_SALE` with `RESERVATION_FAILED`** (no new
-  state). Designed; confirm in Order's API piece.
-- **Which state Order moves to on `SALE_NOT_LIVE` is not specified.** "`RESERVATION_FAILED`
-  added as a fifth terminal state" covers only out of stock. Not decided.
+- **Decided, not built:** all three reserve "no" outcomes end the order as
+  `RESERVATION_FAILED`. See "Reserve contract revised".
+- **For Order's API piece: what a retried create with the same idempotency key
+  returns when the order is already `RESERVATION_FAILED`.** `failure_detail` is
+  debug only, so the retry cannot read the original outcome from it. Not
+  decided.
 - **Bean Validation exists in Inventory only.** Identity, Order and
   Notification add `spring-boot-starter-validation` in their own API phase
   (see the Correction on "Service scaffolding").

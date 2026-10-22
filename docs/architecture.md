@@ -427,7 +427,7 @@ synchronous status check in §3.
 `PAYMENT_FAILED`, `ORDER_EXPIRED`, `PAYMENT_UNAVAILABLE`, `RESERVATION_FAILED`.
 
 - `CREATED → PENDING_PAYMENT` — every item reserved, `amount` set, gateway returned 202. Saves `payment_ref`, resets `expires_at` to the payment window.
-- `CREATED → RESERVATION_FAILED` — an item came back `OUT_OF_STOCK`, or `ITEM_NOT_IN_SALE` (designed; confirm in Order's API piece). Which state `SALE_NOT_LIVE` and `RESERVATION_RELEASED` lead to is not yet specified (§9).
+- `CREATED → RESERVATION_FAILED` — an item came back `OUT_OF_STOCK`, `SALE_NOT_LIVE` or `ITEM_NOT_IN_SALE` (decided; no new state, no migration). A state exists only if something downstream reacts differently to it, and every reserve "no" gets the same reaction: release everything, send no email, tell the buyer in the reply. Which outcome it was goes in `failure_detail` (debug only) and in the buyer's reply. What Order does on `RESERVATION_RELEASED` is not yet specified (§9).
 - `CREATED → PAYMENT_UNAVAILABLE` — circuit breaker open on initiate.
 - `CREATED → ORDER_EXPIRED` — didn't finish the loop + initiate before its deadline.
 - `PENDING_PAYMENT → PAID` — webhook success *for the payment this order holds*.
@@ -690,10 +690,13 @@ or "recorded, not decided" still need a design decision.
   count.
 - **What Order does when `reserve` returns `RESERVATION_RELEASED`** mid-loop is
   not specified. Recorded, not decided.
-- **Order answers `ITEM_NOT_IN_SALE` with `RESERVATION_FAILED`** (no new
-  state). Designed; confirm in Order's API piece.
-- **Which state Order moves to on `SALE_NOT_LIVE` is not specified.** The
-  `RESERVATION_FAILED` decision covers only out of stock. Not decided.
+- **Decided, not built:** all three reserve "no" outcomes (`OUT_OF_STOCK`,
+  `SALE_NOT_LIVE`, `ITEM_NOT_IN_SALE`) end the order as `RESERVATION_FAILED`.
+  No new state, no migration (§6).
+- **For Order's API piece: what a retried create with the same idempotency key
+  returns when the order is already `RESERVATION_FAILED`.** `failure_detail`
+  is debug only and never drives behaviour, so the retry cannot read the
+  original outcome from it. Not decided.
 - **Bean Validation exists in Inventory only.** Identity, Order and
   Notification add `spring-boot-starter-validation` in their own API phase.
 - **Order's create-order request must reject `quantity > 5`** before any
