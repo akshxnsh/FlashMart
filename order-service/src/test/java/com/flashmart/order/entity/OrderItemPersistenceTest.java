@@ -26,9 +26,9 @@ class OrderItemPersistenceTest {
 
     private Long persistedOrderId;
 
-    private Long persistOrder(String idempotencyKey) {
+    private Long persistOrder(long buyerId, String idempotencyKey) {
         Order order = new Order();
-        order.setBuyerId(1L);
+        order.setBuyerId(buyerId);
         order.setFlashSaleId(7L);
         order.setStatus(OrderStatus.CREATED);
         order.setIdempotencyKey(idempotencyKey);
@@ -41,7 +41,7 @@ class OrderItemPersistenceTest {
     /** An item as it is first written: inserted up front, not yet priced. */
     private OrderItem newUnpricedItem(long productId, int quantity) {
         if (persistedOrderId == null) {
-            persistedOrderId = persistOrder("key-1");
+            persistedOrderId = persistOrder(1L, "key-1");
         }
         OrderItem item = new OrderItem();
         item.setOrderId(persistedOrderId);
@@ -220,7 +220,8 @@ class OrderItemPersistenceTest {
         entityManager.persist(first);
 
         OrderItem second = new OrderItem();
-        second.setOrderId(persistOrder("key-2"));
+        // a different buyer: one buyer cannot hold two live orders for a sale
+        second.setOrderId(persistOrder(2L, "key-2"));
         second.setProductId(100L);
         second.setQuantity(2);
         entityManager.persist(second);

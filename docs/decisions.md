@@ -4156,6 +4156,54 @@ not built).
 
 ---
 
+## Decision: One live-or-paid order per buyer per sale
+
+**Context / Problem:**
+Nothing stopped one buyer from creating many orders for the same sale. Each
+live order holds reserved stock until it pays or expires, so one buyer could
+hold stock for the whole payment window, and could pay twice.
+
+**Options Considered:**
+1. A partial unique index on `(buyer_id, flash_sale_id)` for the live-or-paid
+   statuses (`CREATED`, `PENDING_PAYMENT`, `PAID`).
+2. A partial unique index on `PAID` only.
+3. A check in code (read the buyer's orders, then insert).
+
+**Chosen Approach:**
+Option 1: `uk_orders_buyer_sale_live_or_paid`, migration V6. The four failure
+statuses (`PAYMENT_FAILED`, `ORDER_EXPIRED`, `PAYMENT_UNAVAILABLE`,
+`RESERVATION_FAILED`) are outside the rule, so a failed buyer can try again.
+`UNIQUE(buyer_id, idempotency_key)` stays as it is.
+
+**Why:**
+- Two tabs submitted together both pass a code check, so only the database can
+  decide which insert wins. This rules out option 3.
+- With `PAID` only, a buyer could open many orders and hold stock for the whole
+  payment window, and a second payment would be taken before the unique rule
+  fired. This rules out option 2.
+- A plain (non-partial) unique would block the retry after a failure.
+
+**Trade-offs:**
+- A buyer cannot start a new order while an unpaid one is open, until it pays
+  or expires. The wait is bounded by the payment window (value still open).
+- Order's API must turn the unique violation on insert into a `409` that
+  returns the existing order, so the buyer can finish paying it.
+- It is per `buyer_id`. One person with two accounts is not covered.
+
+**Consequences:**
+- V6 only; V1 to V5 are untouched. The orders table was empty when V6 was
+  applied locally.
+- Tested against real Postgres with native-SQL status changes, since
+  production moves status with a raw compare-and-set. Shown to fail when the
+  index is dropped (the 4 rejection tests) and when it is made non-partial
+  (the 4 "slot freed" tests).
+- Not tested: two threads racing the insert. That is the database's job and is
+  not separately exercised.
+- Other services need no similar rule: Inventory's per-order uniqueness is on
+  `(order_id, item)`, and Identity and Notification hold no per-buyer orders.
+
+---
+
 ## Open Items (not yet decided or not yet built)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -4296,8 +4344,14 @@ is closed by a reconciliation sweep"), and, in
 - **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` instead of firing an
   Inventory alert. See "Per-item quantity cap of 5".
-- **A per-buyer limit across orders is not covered.** The cap is per item per
-  order.
+- **For Order's API piece: a unique violation on order insert must map to
+  `409`** and return the existing live-or-paid order, so the buyer can finish
+  paying it. Never a `500`. See "One live-or-paid order per buyer per sale".
+- **A buyer cannot start a new order while an unpaid one is open**, until it
+  pays or expires. The wait is bounded by the payment window (value still
+  open).
+- **One person with two accounts is not covered** by the one-live-order rule.
+  The cap of 5 is also still per item per order.
 - **A retried create while the order is still `CREATED` is not specified.**
   Recovery is abort ("`saga_state` is dropped"). If a resume path is ever
   added, it runs only over `order_items` rows `WHERE unit_price IS NULL`, and

@@ -456,6 +456,8 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
   --                        CREATED, reset to the payment window on entering PENDING_PAYMENT
   -- failure_detail       : nullable, debug only -- never drives state
   -- payment_reconciled_at: nullable; set once the reconciliation sweep has settled this order
+  -- partial UNIQUE (buyer_id, flash_sale_id) WHERE status IN ('CREATED','PENDING_PAYMENT','PAID'):
+  --                        one live-or-paid order per buyer per sale; failure statuses are outside it
   -- CHECK (status NOT IN ('PENDING_PAYMENT','PAID') OR amount IS NOT NULL)
 
 order_items(id, order_id, product_id, product_name, quantity, unit_price, subtotal)
@@ -635,6 +637,7 @@ Each index is derived from a **named** query, not added defensively.
 |---|---|---|
 | Order | `orders(status, expires_at)` | Expiry sweep |
 | Order | `orders(status, payment_reconciled_at)` | Reconciliation sweep |
+| Order | `UNIQUE(buyer_id, flash_sale_id) WHERE status IN ('CREATED','PENDING_PAYMENT','PAID')` | One live-or-paid order per buyer per sale |
 | Order | `UNIQUE(buyer_id, idempotency_key)` | Idempotent retries; also "list my orders" |
 | Order | `refunds(status, next_retry_at)` | Refund worker's claim scan |
 | Order, Identity | `outbox(created_at) WHERE published_at IS NULL` (partial) | Outbox relay: unpublished events in order; stays small because published rows are never indexed |
@@ -838,8 +841,8 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 | | |
 |---|---|
 | **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` (Revision 3 and the implementation-phase entries after it) |
-| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V7, every time column `TIMESTAMPTZ`; plus the API contract layer — request/response DTOs for reserve, products, flash sales and sale items with Bean Validation, the reserve controller, a scoped exception handler, and a `ReservationService` interface whose only bean is a placeholder that throws. **Identity:** entity layer complete — `Brand`, `User`, `ApiKey`, `OutboxEvent`, Flyway V1–V7, `bump_updated_at` on both identity tables. **Notification:** entity layer complete — `NotificationLog`, `BrandContact`, `BuyerContact`, Flyway V1–V2. **Order:** entity layer complete — `Order`, `OrderItem`, `Refund`, `OutboxEvent`, Flyway V1–V5, every guard shipped in the first migration. **Nowhere:** repositories, service implementations (including `reserve` logic), any controller besides Inventory's reserve endpoint, gateway, Kafka, Redis, security |
-| **Tested** | 193 tests, all passing, all four suites run on 2026-10-22: 58 in Inventory (24 persistence/guard + 34 reserve-contract tests at the HTTP layer), 59 in Order, 47 in Identity, 29 in Notification, each including a context test and the zone-less-timestamp guard. Persistence tests save into real Postgres in a rolled-back transaction, and every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken. Reserve logic does not exist, so its evaluation order, replay and concurrency are untested |
+| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V7, every time column `TIMESTAMPTZ`; plus the API contract layer — request/response DTOs for reserve, products, flash sales and sale items with Bean Validation, the reserve controller, a scoped exception handler, and a `ReservationService` interface whose only bean is a placeholder that throws. **Identity:** entity layer complete — `Brand`, `User`, `ApiKey`, `OutboxEvent`, Flyway V1–V7, `bump_updated_at` on both identity tables. **Notification:** entity layer complete — `NotificationLog`, `BrandContact`, `BuyerContact`, Flyway V1–V2. **Order:** entity layer complete — `Order`, `OrderItem`, `Refund`, `OutboxEvent`, Flyway V1–V6, every guard shipped in the first migration, plus V6's partial unique index (one `CREATED`/`PENDING_PAYMENT`/`PAID` order per buyer per sale). **Nowhere:** repositories, service implementations (including `reserve` logic), any controller besides Inventory's reserve endpoint, gateway, Kafka, Redis, security |
+| **Tested** | 203 tests, all passing (Order suite run on 2026-10-22 after V6; the other three suites last run before it): 58 in Inventory (24 persistence/guard + 34 reserve-contract tests at the HTTP layer), 69 in Order, 47 in Identity, 29 in Notification, each including a context test and the zone-less-timestamp guard. Persistence tests save into real Postgres in a rolled-back transaction, and every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken. Reserve logic does not exist, so its evaluation order, replay and concurrency are untested |
 | **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
 | **Verified under failure** | None |
 
@@ -895,8 +898,8 @@ on prevention rather than independent correction.**
 - For Order's API piece: what a retried create with the same idempotency key returns when the
   order is already `RESERVATION_FAILED` (`failure_detail` is debug only, so it cannot say which
   outcome it was) — not decided.
-- Order's create-order request must reject `quantity > 5` before any reserve call. A per-buyer
-  limit across orders is not covered.
+- Order's create-order request must reject `quantity > 5` before any reserve call. One person with
+  two accounts is not covered by the one-live-order rule.
 - A retried create while the order is still `CREATED` is not specified; recovery is abort.
 - A zero-amount order is untested (a free item is allowed); a gateway may refuse it. Decide in
   the payment phase.

@@ -117,6 +117,14 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
   -- created_at: DB default. updated_at: DB trigger (CAS writes are raw SQL and
   --   skip Hibernate's @UpdateTimestamp)
   -- index: (status, expires_at) expiry sweep; (status, payment_reconciled_at) reconciliation sweep
+  -- partial UNIQUE (buyer_id, flash_sale_id) WHERE status IN ('CREATED',
+  --   'PENDING_PAYMENT','PAID') (uk_orders_buyer_sale_live_or_paid, V6): a buyer
+  --   has at most one live-or-paid order per sale. The four failure statuses are
+  --   outside it, so a failed buyer can try again. In the database, not in code,
+  --   because two tabs submitted together both pass a code check. Not "PAID only":
+  --   a buyer could open many orders and hold stock for the whole payment window,
+  --   and a second payment would be taken before the unique rule fired
+  --   (decisions.md, "One live-or-paid order per buyer per sale")
 
 order_items(id, order_id, product_id, product_name, quantity, unit_price, subtotal)
   -- UNIQUE(order_id, product_id)
@@ -537,7 +545,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
 - **Notification Service** — entity layer complete: `NotificationLog`, `BrandContact` and
   `BuyerContact` on migrations V1–V2.
 - **Order Service** — all four tables (`orders`, `order_items`, `refunds`,
-  `outbox`) on migrations V1–V5, with `Order`, `OrderItem`, `Refund`,
+  `outbox`) on migrations V1–V6, with `Order`, `OrderItem`, `Refund`,
   `OutboxEvent` and the two status enums. Every guard in §4 shipped in this
   first migration rather than as a backfill, including the partial
   `UNIQUE (payment_ref) WHERE payment_ref IS NOT NULL`, the seven-state
@@ -545,16 +553,21 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   `order_items` all-or-none pricing and `subtotal = unit_price * quantity`
   guards, and an `outbox.event_type` `CHECK` pinned to Order's two events.
   `bump_updated_at` is recreated in Order's own database and attached to
-  `orders` and `refunds`. **Still no repositories, services or controllers**,
+  `orders` and `refunds`. V6 adds the partial unique index
+  `uk_orders_buyer_sale_live_or_paid` (one `CREATED`/`PENDING_PAYMENT`/`PAID`
+  order per buyer per sale); the database rule exists and is tested, but nothing
+  yet maps its violation to a `409` (§9). **Still no repositories, services or controllers**,
   so nothing yet writes a CAS.
 - **Not built anywhere:** repositories, service implementations, any
   controller other than Inventory's reserve endpoint, the API Gateway, Kafka,
   Redis, security. **`reserve` logic is not implemented.** All four services
   share one local Postgres credential pair but each owns a separate database.
 
-**Tested: 193 tests, all passing, all four suites run on 2026-10-22** — 58 in
-Inventory (24 persistence and guard tests plus 34 API contract tests), 59 in
-Order, 47 in Identity, 29 in Notification. Each count includes a context test
+**Tested: 203 tests, all passing** — the Order suite (69) was run on
+2026-10-22 after V6; the other three suites (58, 47, 29) were last run on
+2026-10-22 before V6 and are unaffected by it. 58 in
+Inventory (24 persistence and guard tests plus 34 API contract tests), 69 in
+Order (10 new for V6), 47 in Identity, 29 in Notification. Each count includes a context test
 and the zone-less-timestamp guard every service carries. The persistence tests
 save into real Postgres inside a rolled-back transaction; every CHECK, unique
 key and FK is verified to reject bad rows, not merely to exist.
@@ -702,8 +715,15 @@ or "recorded, not decided" still need a design decision.
 - **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` from Order instead of
   firing an Inventory alert. Not built.
-- **A per-buyer limit across orders is not covered.** The cap of 5 is per item
-  per order; a buyer can place several orders.
+- **For Order's API piece: a unique violation on order insert must map to `409`**
+  and return the existing live-or-paid order, so the buyer can finish paying it.
+  Never a `500`. Needed by `uk_orders_buyer_sale_live_or_paid`. Not built.
+- **A buyer cannot start a new order while an unpaid one is open**, until it
+  pays or expires. The wait is bounded by the payment window (value still
+  open, see the derived deadlines). Accepted cost of the one-live-order rule.
+- **One person with two accounts is not covered** by the one-live-order rule:
+  the rule is per `buyer_id`, and Identity does not link accounts. The cap of
+  5 is also still per item per order.
 - **A retried create while the order is still `CREATED` is not specified**
   (`UNIQUE(buyer_id, idempotency_key)` finds the row; what the request then
   does is undecided). Recovery today is abort; see the conditional rule on
