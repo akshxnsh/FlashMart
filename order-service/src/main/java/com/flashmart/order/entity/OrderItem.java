@@ -65,6 +65,6 @@ public class OrderItem {
      * is the only thing stopping it disagreeing with its own inputs. The sum
      * of these is what the buyer is charged.
      */
-    @Column(name = "subtotal", precision = 12, scale = 2)
+    @Column(name = "subtotal", precision = 14, scale = 2)
     private BigDecimal subtotal;
 }

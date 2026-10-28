@@ -60,19 +60,27 @@ class OrderAmountPersistenceTest {
         entityManager.flush();
 
         // What the reserve loop does once the last item is priced: set the
-        // amount and make the order payable, in one write.
-        order.setAmount(new BigDecimal("199.98"));
-        order.setStatus(OrderStatus.PENDING_PAYMENT);
-        entityManager.flush();
+        // amount and make the order payable, in one raw write (production moves
+        // status with raw SQL, not through the entity).
+        entityManager.createNativeQuery(
+                        "update orders set amount = 199.98, status = 'PENDING_PAYMENT', payment_ref = 'pay_1' "
+                                + "where id = :id")
+                .setParameter("id", order.getId())
+                .executeUpdate();
 
-        Object summed = entityManager.createNativeQuery(
+        // Both sides read back from SQL, never from the entity's own field.
+        BigDecimal summed = (BigDecimal) entityManager.createNativeQuery(
                         "select sum(subtotal) from order_items where order_id = :id")
                 .setParameter("id", order.getId())
                 .getSingleResult();
+        BigDecimal stored = (BigDecimal) entityManager.createNativeQuery(
+                        "select amount from orders where id = :id")
+                .setParameter("id", order.getId())
+                .getSingleResult();
 
-        assertEquals(0, new BigDecimal("199.98").compareTo((BigDecimal) summed),
-                "the items do not sum to the stored amount");
-        assertEquals(0, order.getAmount().compareTo((BigDecimal) summed),
+        assertEquals(0, new BigDecimal("199.98").compareTo(summed),
+                "the items do not sum to the expected amount");
+        assertEquals(0, stored.compareTo(summed),
                 "orders.amount disagrees with SUM(order_items.subtotal)");
     }
 
@@ -104,10 +112,15 @@ class OrderAmountPersistenceTest {
                         "select count(*) from order_items where order_id = :id and subtotal is null")
                 .setParameter("id", order.getId())
                 .getSingleResult();
-
         assertEquals(1L, ((Number) unpricedCount).longValue(),
                 "one item is still waiting for its reserve() to return");
-        assertEquals(OrderStatus.CREATED, order.getStatus(),
-                "the order must still be CREATED while an item is unpriced");
+
+        // The amount is still unknown, so the move to payable must be refused.
+        // payment_ref is set so that the amount guard is the only one that can fire.
+        Violations.assertConstraint("ck_orders_amount_present_when_payable", () -> entityManager
+                .createNativeQuery("update orders set status = 'PENDING_PAYMENT', payment_ref = 'pay_1' "
+                        + "where id = :id")
+                .setParameter("id", order.getId())
+                .executeUpdate());
     }
 }

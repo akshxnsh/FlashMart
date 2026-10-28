@@ -60,7 +60,7 @@ public class Order {
      * agreed to. Null until the last item is priced, which is why V2 guards it
      * conditionally on status rather than with a {@code NOT NULL}.
      */
-    @Column(name = "amount", precision = 12, scale = 2)
+    @Column(name = "amount", precision = 14, scale = 2)
     private BigDecimal amount;
 
     @Enumerated(EnumType.STRING)

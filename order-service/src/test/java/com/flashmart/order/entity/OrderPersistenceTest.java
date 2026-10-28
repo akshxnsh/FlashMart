@@ -105,8 +105,9 @@ class OrderPersistenceTest {
         Order order = newOrder(1L, "key-1");
         order.setStatus(OrderStatus.PENDING_PAYMENT);
         order.setAmount(null);
+        order.setPaymentRef("pay_1"); // so only the amount guard can fire
 
-        assertThrows(PersistenceException.class, () -> {
+        Violations.assertConstraint("ck_orders_amount_present_when_payable", () -> {
             entityManager.persist(order);
             entityManager.flush();
         });
@@ -117,8 +118,9 @@ class OrderPersistenceTest {
         Order order = newOrder(1L, "key-1");
         order.setStatus(OrderStatus.PAID);
         order.setAmount(null);
+        order.setPaymentRef("pay_1"); // so only the amount guard can fire
 
-        assertThrows(PersistenceException.class, () -> {
+        Violations.assertConstraint("ck_orders_amount_present_when_payable", () -> {
             entityManager.persist(order);
             entityManager.flush();
         });
@@ -158,7 +160,7 @@ class OrderPersistenceTest {
 
         Order retry = newOrder(1L, "key-1");
 
-        assertThrows(PersistenceException.class, () -> {
+        Violations.assertConstraint("uk_orders_buyer_id_idempotency_key", () -> {
             entityManager.persist(retry);
             entityManager.flush();
         });
@@ -186,7 +188,7 @@ class OrderPersistenceTest {
         Order second = newOrder(2L, "key-2");
         second.setPaymentRef("pay_abc123");
 
-        assertThrows(PersistenceException.class, () -> {
+        Violations.assertConstraint("uk_orders_payment_ref", () -> {
             entityManager.persist(second);
             entityManager.flush();
         });

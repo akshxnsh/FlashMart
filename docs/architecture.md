@@ -117,6 +117,16 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
   -- created_at: DB default. updated_at: DB trigger (CAS writes are raw SQL and
   --   skip Hibernate's @UpdateTimestamp)
   -- index: (status, expires_at) expiry sweep; (status, payment_reconciled_at) reconciliation sweep
+  -- V7 (hardening, from an independent static review of V1-V6, Oct 29):
+  --   CHECK (status NOT IN ('PENDING_PAYMENT','PAID') OR payment_ref IS NOT NULL)
+  --   (ck_orders_payment_ref_present_when_payable: a status written without the
+  --   ref makes an order no webhook can ever pay); non-blank CHECKs on
+  --   idempotency_key and on payment_ref (NULL stays allowed there);
+  --   amount widened to NUMERIC(14,2). V7's header also corrects two V2
+  --   comments: the partial payment_ref index IS distinguishable from a total
+  --   one by structure (pg_indexes shows the predicate; only behaviour is
+  --   identical), and the "7x the size at 90% NULL" figure has no script in
+  --   the repo, so it is an expectation, not a measurement
   -- partial UNIQUE (buyer_id, flash_sale_id) WHERE status IN ('CREATED',
   --   'PENDING_PAYMENT','PAID') (uk_orders_buyer_sale_live_or_paid, V6): a buyer
   --   has at most one live-or-paid order per sale. The four failure statuses are
@@ -135,6 +145,8 @@ order_items(id, order_id, product_id, product_name, quantity, unit_price, subtot
   -- CHECK (quantity > 0); CHECK unit_price >= 0 AND subtotal >= 0
   -- CHECK product_name, unit_price, subtotal all NULL or all non-NULL
   -- CHECK subtotal = unit_price * quantity when filled
+  -- subtotal is NUMERIC(14,2) (V7), unit_price stays (12,2): a subtotal can
+  --   exceed the price's range
   -- RECORDED, NOT BUILT: product_name/unit_price/subtotal are written once —
   --   the pricing UPDATE carries WHERE unit_price IS NULL, on top of the
   --   orders.status = 'CREATED' guard
@@ -147,7 +159,8 @@ refunds(id, order_id, payment_ref, amount, status, attempts,
   -- a command outbox (only consumer is Order itself) — not an event outbox
   -- UNIQUE(payment_ref) — refunds are per payment, not per order
   -- status: PENDING | PROCESSING | SUCCEEDED | NEEDS_MANUAL_REVIEW
-  -- amount: DECIMAL, from the webhook's reported amount; CHECK amount > 0
+  -- amount: NUMERIC(14,2) (V7), from the webhook's reported amount; CHECK amount > 0
+  -- CHECK payment_ref non-blank (V7, ck_refunds_payment_ref_present)
   -- CHECK on status (the four values); CHECK attempts >= 0
   -- claimed_at: claim lease + fence token for the worker's finishing write
   --   (DB clock, set inside the claim SQL; so is next_retry_at)
@@ -545,7 +558,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
 - **Notification Service** — entity layer complete: `NotificationLog`, `BrandContact` and
   `BuyerContact` on migrations V1–V2.
 - **Order Service** — all four tables (`orders`, `order_items`, `refunds`,
-  `outbox`) on migrations V1–V6, with `Order`, `OrderItem`, `Refund`,
+  `outbox`) on migrations V1–V7, with `Order`, `OrderItem`, `Refund`,
   `OutboxEvent` and the two status enums. Every guard in §4 shipped in this
   first migration rather than as a backfill, including the partial
   `UNIQUE (payment_ref) WHERE payment_ref IS NOT NULL`, the seven-state
@@ -556,18 +569,23 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   `orders` and `refunds`. V6 adds the partial unique index
   `uk_orders_buyer_sale_live_or_paid` (one `CREATED`/`PENDING_PAYMENT`/`PAID`
   order per buyer per sale); the database rule exists and is tested, but nothing
-  yet maps its violation to a `409` (§9). **Still no repositories, services or controllers**,
+  yet maps its violation to a `409` (§9). V7 (hardening from an independent
+  static review) adds `ck_orders_payment_ref_present_when_payable`, three
+  non-blank guards (`orders.idempotency_key`, `orders.payment_ref`,
+  `refunds.payment_ref`) and widens `orders.amount`, `order_items.subtotal` and
+  `refunds.amount` to `NUMERIC(14,2)`; implemented and tested. **Still no repositories, services or controllers**,
   so nothing yet writes a CAS.
 - **Not built anywhere:** repositories, service implementations, any
   controller other than Inventory's reserve endpoint, the API Gateway, Kafka,
   Redis, security. **`reserve` logic is not implemented.** All four services
   share one local Postgres credential pair but each owns a separate database.
 
-**Tested: 203 tests, all passing** — the Order suite (69) was run on
-2026-10-22 after V6; the other three suites (58, 47, 29) were last run on
-2026-10-22 before V6 and are unaffected by it. 58 in
-Inventory (24 persistence and guard tests plus 34 API contract tests), 69 in
-Order (10 new for V6), 47 in Identity, 29 in Notification. Each count includes a context test
+**Tested: 233 tests, all passing** — Order (99) and Inventory (58) were run on
+2026-10-29 after V7. Identity (47) and Notification (29) were last run on
+2026-10-22 and were not re-run for V7, which does not touch them. Order's 99
+are the earlier 69 plus 30 new for V7 and the review's gaps (the constraint
+that fires is now asserted by name; native-SQL `NOT NULL` tests; index
+predicates read from `pg_indexes`). Each count includes a context test
 and the zone-less-timestamp guard every service carries. The persistence tests
 save into real Postgres inside a rolled-back transaction; every CHECK, unique
 key and FK is verified to reject bad rows, not merely to exist.
@@ -737,6 +755,23 @@ or "recorded, not decided" still need a design decision.
   `initiate` and `refund`, a payment-status lookup queryable by our idempotency
   key or order reference, and payments and webhooks that carry our order id.
   Not built yet; designed-not-verified until it is.
+- **Found by independent review, Oct 29, not decided.** An independent static
+  review of Order V1-V6 happened on 2026-10-29; the reviewer could not run the
+  tests. What it found and V7 fixed is in §4 (V7). The items below were left
+  alone on purpose, each waits for a decision. None is built or tested:
+  - **A1:** entity updatability and `@DynamicUpdate`. Not decided.
+  - **A2:** `refunds.next_retry_at` NULL handling and the refund claim query.
+    Not decided.
+  - **A3:** redesign of the sweep and refund indexes. Not decided.
+  - **B1:** `ON CONFLICT` for the refund insert. Not decided.
+  - **B2, B3:** the retried create (and the `409` it returns) and a request
+    fingerprint. Not decided. See also the two retried-create items above.
+  - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`. Not
+    decided.
+  - **B5:** which clock function stamps `expires_at`. Not decided. See also
+    the `now()` vs `clock_timestamp()` item.
+  - A `CHECK` on `payment_reconciled_at`, and a `CHECK` that `PROCESSING`
+    implies `claimed_at`. Not decided.
 
 The PRD is `docs/Flashmart.prd` (Revision 4, markdown). The earlier
 `FlashMart_Project_Plan_v3.pdf` reference was stale — no such file exists or
