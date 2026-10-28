@@ -123,7 +123,7 @@ class RefundPersistenceTest {
 
         Refund redelivery = newRefund("pay_abc123", "199.98");
 
-        assertThrows(PersistenceException.class, () -> {
+        Violations.assertConstraint("uk_refunds_payment_ref", () -> {
             entityManager.persist(redelivery);
             entityManager.flush();
         });

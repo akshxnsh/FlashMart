@@ -4373,3 +4373,20 @@ is closed by a reconciliation sweep"), and, in
   proven. Correctness does not depend on them (the one-payment invariant and
   the already-refunded check cover the failure), but the duplicate-prevention
   and retry-safety *optimisations* do.
+- **Found by independent review, Oct 29, not decided.** An independent static
+  review of Order V1-V6 happened on 2026-10-29; the reviewer could not run the
+  tests. What it found and V7 fixed is in §4 (V7). The items below were left
+  alone on purpose, each waits for a decision. None is built or tested:
+  - **A1:** entity updatability and `@DynamicUpdate`. Not decided.
+  - **A2:** `refunds.next_retry_at` NULL handling and the refund claim query.
+    Not decided.
+  - **A3:** redesign of the sweep and refund indexes. Not decided.
+  - **B1:** `ON CONFLICT` for the refund insert. Not decided.
+  - **B2, B3:** the retried create (and the `409` it returns) and a request
+    fingerprint. Not decided. See also the two retried-create items above.
+  - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`. Not
+    decided.
+  - **B5:** which clock function stamps `expires_at`. Not decided. See also
+    the `now()` vs `clock_timestamp()` item.
+  - A `CHECK` on `payment_reconciled_at`, and a `CHECK` that `PROCESSING`
+    implies `claimed_at`. Not decided.

@@ -50,7 +50,7 @@ public class Refund {
     private String paymentRef;
 
     /** The webhook's reported amount: what was captured, not what we think. */
-    @Column(name = "amount", nullable = false, precision = 12, scale = 2)
+    @Column(name = "amount", nullable = false, precision = 14, scale = 2)
     private BigDecimal amount;
 
     @Enumerated(EnumType.STRING)

@@ -1,7 +1,6 @@
 package com.flashmart.order.entity;
 
 import jakarta.persistence.EntityManager;
-import jakarta.persistence.PersistenceException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -13,7 +12,6 @@ import java.math.BigDecimal;
 import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * uk_orders_buyer_sale_live_or_paid: at most one CREATED / PENDING_PAYMENT /
@@ -39,6 +37,7 @@ class OrderOneLiveOrderPerBuyerSaleTest {
         order.setExpiresAt(DEADLINE);
         if (status == OrderStatus.PENDING_PAYMENT || status == OrderStatus.PAID) {
             order.setAmount(new BigDecimal("100.00"));
+            order.setPaymentRef("pay_" + idempotencyKey);
         }
         return order;
     }
@@ -52,7 +51,8 @@ class OrderOneLiveOrderPerBuyerSaleTest {
     /** What the CAS writes do: a raw UPDATE that Hibernate never sees. */
     private void moveTo(Order order, String status) {
         int rows = entityManager.createNativeQuery(
-                        "update orders set status = :s, amount = coalesce(amount, 100.00) where id = :id")
+                        "update orders set status = :s, amount = coalesce(amount, 100.00), "
+                                + "payment_ref = coalesce(payment_ref, 'pay_' || idempotency_key) where id = :id")
                 .setParameter("s", status)
                 .setParameter("id", order.getId())
                 .executeUpdate();
@@ -67,7 +67,7 @@ class OrderOneLiveOrderPerBuyerSaleTest {
         Order first = persist(newOrder(1L, 7L, "key-1", OrderStatus.CREATED));
         moveTo(first, status);
 
-        assertThrows(PersistenceException.class,
+        Violations.assertConstraint("uk_orders_buyer_sale_live_or_paid",
                 () -> persist(newOrder(1L, 7L, "key-2", OrderStatus.CREATED)));
     }
 
@@ -75,7 +75,7 @@ class OrderOneLiveOrderPerBuyerSaleTest {
     void twoPaidOrdersForTheSameBuyerAndSaleAreRejected() {
         persist(newOrder(1L, 7L, "key-1", OrderStatus.PAID));
 
-        assertThrows(PersistenceException.class,
+        Violations.assertConstraint("uk_orders_buyer_sale_live_or_paid",
                 () -> persist(newOrder(1L, 7L, "key-2", OrderStatus.PAID)));
     }
 
