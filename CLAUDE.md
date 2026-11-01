@@ -25,6 +25,15 @@ Authority order when documents disagree: `docs/decisions.md` → `docs/architect
 
 The Notion engineering log is Akshansh's personal record, not a source of truth. Update it only when he explicitly asks.
 
+## Karpathy guidelines (plugin skill)
+
+The `karpathy-guidelines` skill governs general coding behaviour: think first, simplicity, surgical changes, verifiable goals. This file does not repeat it. It adds FlashMart rules on top; where they differ, this file wins:
+
+- **"Trivial task, use judgment"** means *derived* work as defined in Working style 1–2. "Loop until verified" never runs past an open decision (Working style 5).
+- **"No error handling for impossible scenarios"** does not apply to DB `CHECK`s, unique keys or CAS guards. They are the last line of defence and are never removed.
+- **"Every changed line traces to the request"**: a `decisions.md` entry for a real decision, and the sibling-service check in Verification 4, count as part of the request.
+- **"If uncertain, ask"**: on decision-bearing work, ask by posing the failure scenario (Working style 3). On derived work, state assumptions and proceed.
+
 ## Working style (non-negotiable)
 
 1. **Depth follows decisions.** The more design a piece carries, the slower and more Socratic you go; the more it is simply derived from decisions already in the docs, the faster you move. The test: *could this reasonably be written two ways that behave differently under concurrency, failure or retry, or that trade one property for another?* If yes, it carries a decision. If the docs already settle it and only typing remains, it is derived. Most pieces are a mix: slow down for the decision-bearing part and move fast through the rest.
@@ -44,7 +53,7 @@ The Notion engineering log is Akshansh's personal record, not a source of truth.
 1. **Prove the guards that carry correctness.** For the load-bearing ones (CAS and conditional writes, unique keys that stop duplicates or double payments, triggers, `@Generated` columns), break the rule once, confirm the intended test fails, then restore it. Routine CHECKs (non-negative, non-blank) need a test that rejects a bad row, not a break-and-restore. Mention a break in the summary only if it surprised you.
 2. **A test must exercise the path production uses.** `clear()` then `find()` reads a fresh row and misses a field left null on the instance that was just saved (the `StockReservation.reservedAt` bug). A null set through the entity can be rejected by Hibernate before the database sees it, so test a `NOT NULL` with native SQL. Before trusting a test, ask what it structurally cannot see.
 3. **Concurrency claims need a concurrent test.** Reasoning that something is race-safe is a hypothesis. Back it with a test that actually races (two threads on the last unit, a webhook against the sweep) and say what was and was not exercised. Never state a load or overselling result that was not measured.
-4. **Check siblings and migrations once.** When a rule is introduced or a bug fixed, grep the sibling services for the same gap. Services of the same shape stay identical unless a difference is documented. Before adding a constraint to a table that may hold rows, check what is there. Never edit an applied or pushed migration; add a new version.
+4. **Check siblings and migrations once.** When a rule is introduced or a bug fixed, grep the sibling services for the same gap. Fix it in the same piece if the fix is mechanical; if it carries a decision, flag it and wait. Services of the same shape stay identical unless a difference is documented. Before adding a constraint to a table that may hold rows, check what is there. Never edit an applied or pushed migration; add a new version.
 5. **Run the whole suite before committing, and report real numbers.** Say how many tests ran and passed. Do not write "green" unless it was run in this session.
 6. **A stated reason is a claim.** If a comment, doc or summary gives a reason that matters ("this would jam the system"), measure it or word it as unverified. A lesson that applies beyond its own file goes here as one line.
 
@@ -90,7 +99,7 @@ Reasoning is in `decisions.md` ("Entity and migration conventions", "Database CH
 
 Follow the phase plan: setup → architecture/requirements → schema → JPA entities → APIs/DTOs → reservation/payment → state machine → security → Redis caching → rate limiting → idempotency → transactions/locking → outbox → Kafka → webhooks → microservices/gateway → load testing. Don't jump ahead unless he asks.
 
-**Current position:** see `architecture.md` §8 and `git log`. As a pointer only: entities are done in all four services; Inventory has its DTOs and the reserve HTTP contract (tested at the HTTP layer only) with no reserve logic behind it; no repositories, service implementations or other controllers exist anywhere. If this paragraph and §8 disagree, §8 and the code win.
+**Current position:** see `architecture.md` §8 and `git log`. As a pointer only: entities and Flyway migrations are done in all four services (Order is at V7 after a schema-hardening pass); Inventory has its DTOs, the reserve controller and a `ReservationService` interface whose only implementation is the `NotImplementedReservationService` stand-in (HTTP contract tested at the HTTP layer only), so no reserve logic exists; no repositories, real service implementations or other controllers exist anywhere. If this paragraph and §8 disagree, §8 and the code win.
 
 **Ports:** gateway `8080` (reserved), identity `8081`, inventory `8082`, order `8083`, notification `8084`. One shared `DB_USERNAME`/`DB_PASSWORD` pair, one separate database per service.
 
