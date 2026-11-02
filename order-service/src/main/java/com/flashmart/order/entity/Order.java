@@ -12,6 +12,7 @@ import jakarta.persistence.UniqueConstraint;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.DynamicUpdate;
 import org.hibernate.annotations.Generated;
 import org.hibernate.generator.EventType;
 
@@ -34,10 +35,20 @@ import java.time.Instant;
  * {@code WHERE} clause, so declaring it would describe a total constraint the
  * database does not have. It lives in V2 only.
  */
+/*
+ * CAS-owned columns (status, amount, payment_ref, expires_at,
+ * payment_reconciled_at) are updatable = false: they are written by INSERT and
+ * afterwards only by raw conditional SQL. Otherwise a stale managed entity
+ * flushed for an unrelated field would write every column and overwrite a
+ * winning CAS (e.g. the sweep's ORDER_EXPIRED). Setters on them are silently
+ * ignored after insert; OrderCasOwnedColumnsTest guards that.
+ * @DynamicUpdate makes the remaining UPDATEs name only changed columns.
+ */
 @Entity
 @Table(name = "orders", uniqueConstraints = {
         @UniqueConstraint(name = "uk_orders_buyer_id_idempotency_key", columnNames = {"buyer_id", "idempotency_key"})
 })
+@DynamicUpdate
 @Getter
 @Setter
 @NoArgsConstructor
@@ -60,11 +71,11 @@ public class Order {
      * agreed to. Null until the last item is priced, which is why V2 guards it
      * conditionally on status rather than with a {@code NOT NULL}.
      */
-    @Column(name = "amount", precision = 14, scale = 2)
+    @Column(name = "amount", precision = 14, scale = 2, updatable = false)
     private BigDecimal amount;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "status", nullable = false, length = 20)
+    @Column(name = "status", nullable = false, length = 20, updatable = false)
     private OrderStatus status;
 
     @Column(name = "idempotency_key", nullable = false)
@@ -75,7 +86,7 @@ public class Order {
      * finds its order — that is the order id, because this is null in exactly
      * the crash window a webhook is most likely to arrive in.
      */
-    @Column(name = "payment_ref")
+    @Column(name = "payment_ref", updatable = false)
     private String paymentRef;
 
     /**
@@ -87,7 +98,7 @@ public class Order {
      * writes it as {@code now() + interval} in SQL, with Java supplying only
      * the duration; this mapping exists so the row can be inserted at all.
      */
-    @Column(name = "expires_at", nullable = false)
+    @Column(name = "expires_at", nullable = false, updatable = false)
     private Instant expiresAt;
 
     /** Debug only. Never read to drive state. */
@@ -95,7 +106,7 @@ public class Order {
     private String failureDetail;
 
     /** Written by the reconciliation sweep's own SQL, using the DB clock. */
-    @Column(name = "payment_reconciled_at")
+    @Column(name = "payment_reconciled_at", updatable = false)
     private Instant paymentReconciledAt;
 
     /**
