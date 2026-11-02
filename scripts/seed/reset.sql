@@ -17,7 +17,7 @@ DELETE FROM stock_reservations;
 
 -- Restore the three windows exactly as inventory.sql sets them (re-anchored
 -- to now(), so LIVE is live again).
-UPDATE flash_sales SET start_time = now() - interval '1 minute', end_time = now() + interval '1 hour'  WHERE id = 1;
+UPDATE flash_sales SET start_time = now() - interval '1 minute', end_time = now() + interval '24 hours' WHERE id = 1;
 UPDATE flash_sales SET start_time = now() + interval '1 hour',   end_time = now() + interval '2 hours' WHERE id = 2;
 UPDATE flash_sales SET start_time = now() - interval '2 hours',  end_time = now() - interval '1 hour'  WHERE id = 3;
 

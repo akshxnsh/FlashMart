@@ -5,7 +5,7 @@
 --
 -- Three sales, windows given as now() +/- interval so they are right whenever
 -- this runs:
---   1 LIVE      started 1 minute ago, ends in 1 hour
+--   1 LIVE      started 1 minute ago, ends in 24 hours
 --   2 UPCOMING  starts in 1 hour, ends in 2 hours
 --   3 ENDED     started 2 hours ago, ended 1 hour ago
 -- "Live" is computed from the window, never stored: all three have status
@@ -26,7 +26,7 @@ ON CONFLICT (id) DO UPDATE
         name = EXCLUDED.name;
 
 INSERT INTO flash_sales (id, brand_id, name, start_time, end_time, status) VALUES
-    (1, 1, 'Zephyr Live Drop',     now() - interval '1 minute', now() + interval '1 hour',  'ACTIVE'),
+    (1, 1, 'Zephyr Live Drop',     now() - interval '1 minute', now() + interval '24 hours', 'ACTIVE'),
     (2, 1, 'Zephyr Upcoming Drop', now() + interval '1 hour',   now() + interval '2 hours', 'ACTIVE'),
     (3, 1, 'Zephyr Ended Drop',    now() - interval '2 hours',  now() - interval '1 hour',  'ACTIVE')
 ON CONFLICT (id) DO UPDATE

@@ -47,7 +47,7 @@ Running it twice is safe: it resets first, then every row is an upsert by id.
 | Brand | `1` | Zephyr Athletics, `sales@zephyr-athletics.test` |
 | Buyers | `1`, `2`, `3` | Asha Verma, Rohan Mehta, Neha Kapoor (`*@buyers.test`) |
 | Products | `1`, `2`, `3` | Runner Shoe, Court Tee, Trail Cap (all brand 1) |
-| Sale `1` | LIVE | started 1 minute ago, ends in 1 hour |
+| Sale `1` | LIVE | started 1 minute ago, ends in 24 hours |
 | Sale `2` | UPCOMING | starts in 1 hour |
 | Sale `3` | ENDED | ended 1 hour ago |
 | Item `1` | sale 1, product 1 | 500 units, 4999.00 |
@@ -61,8 +61,10 @@ security on Day 8.
 ## Things to know
 
 - **Windows drift.** The sale windows are `now() +/- interval` at the moment
-  the script runs. After an hour the LIVE sale is no longer live. Run
-  `seed.sh` (or `reset.sql`) again before each test that needs it live.
+  the script runs. The LIVE window is 24 hours from the last seed or reset;
+  after that the LIVE sale is no longer live. The UPCOMING sale starts after an
+  hour, so it stops being "upcoming" then too. Run `seed.sh` (or `reset.sql`)
+  again before each test that needs the windows as described above.
 - **No events.** Identity's seed writes no outbox rows, so no `BrandUpserted`
   or `UserUpserted` is published. `notification.sql` fills the contact caches
   by hand with a fixed old `updated_at`, so any real event beats it.
@@ -83,7 +85,8 @@ q identity-service     "select (select count(*) from brands), (select count(*) f
 q inventory-service    "select (select count(*) from products), (select count(*) from flash_sales), (select count(*) from flash_sale_items), (select count(*) from stock_reservations)"  # 3|3|4|0
 q notification-service "select (select count(*) from brand_contacts), (select count(*) from buyer_contacts)"  # 1|3
 
-# LIVE sale is live; UPCOMING and ENDED are not (expect: 1|t, 2|f, 3|f)
+# Right after a seed or reset, the LIVE sale is live (for the next 24 hours);
+# UPCOMING and ENDED are not (expect: 1|t, 2|f, 3|f)
 q inventory-service "select id, (status <> 'CANCELLED' and start_time <= now() and now() < end_time) from flash_sales order by id"
 
 # Stock is full (expect: 1|500|500, 2|50|50, 3|100|100, 4|20|20)
