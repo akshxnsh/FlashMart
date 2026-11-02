@@ -4204,6 +4204,57 @@ statuses (`PAYMENT_FAILED`, `ORDER_EXPIRED`, `PAYMENT_UNAVAILABLE`,
 
 ---
 
+## Decision: CAS-owned columns are insert-only in the entities (A1)
+
+**Context / Problem:**
+By default Hibernate's `UPDATE` writes every column, using the values the
+entity loaded. Say the sweep wins a CAS and sets an order to `ORDER_EXPIRED`
+while a request thread still holds that order as `CREATED`. If the thread then
+saves an unrelated field (`failureDetail`), its `UPDATE` also writes
+`status = 'CREATED'` and silently undoes the sweep. The same hole exists on
+`refunds` for the worker's claim.
+
+**Options Considered:**
+1. `updatable = false` on the CAS-owned columns, plus `@DynamicUpdate`.
+2. `@DynamicUpdate` alone (UPDATE names only changed columns).
+3. No entity write at all: a CAS-only repository.
+4. `@Version` (optimistic locking) on `orders` / `refunds`.
+
+**Chosen Approach:**
+Option 1 now, with option 3 as how the columns are written later (raw CAS
+queries in a repository, not built in this piece).
+- `Order`: `status`, `amount`, `payment_ref`, `expires_at`,
+  `payment_reconciled_at`.
+- `Refund`: `status`, `attempts`, `next_retry_at`, `claimed_at`, `last_error`
+  (all written by the claim and the `claimed_at`-fenced finishing SQL).
+  `order_id`, `payment_ref` and `amount` are untouched by this decision.
+- `INSERT` still writes them. No migration change.
+
+**Why:**
+- Option 2 alone only helps while the entity never changes the column. One
+  `setStatus()` on a stale entity writes the stale value again.
+- Option 4 adds a second guard that fails after any concurrent write, not just
+  a conflicting one; `Order`'s javadoc already rejects it for that reason.
+- Option 3 alone is not enough while the entity can still write the column.
+  Option 1 makes the database column writable only by the CAS.
+
+**Trade-offs:**
+- `updatable = false` ignores a setter silently after insert. Nothing warns
+  the next developer, so tests guard it.
+- `@DynamicUpdate` builds the UPDATE per flush, a small cost on a path that
+  will rarely use it.
+
+**Consequences:**
+- Any later normal write to these columns must be a raw conditional `UPDATE`.
+- `OrderCasOwnedColumnsTest` and `RefundCasOwnedColumnsTest` are **written, not
+  run** (no Postgres on the machine they were written on).
+- Break-and-restore is **not done yet**. With `@DynamicUpdate` present, the
+  stale-save test alone does not fail when only `updatable = false` is removed
+  (the stale status is not dirty, so it is not written). The silent-ignore test
+  is the one that guards `updatable = false`.
+
+---
+
 ## Open Items (not yet decided or not yet built)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment

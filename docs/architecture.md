@@ -574,7 +574,11 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   non-blank guards (`orders.idempotency_key`, `orders.payment_ref`,
   `refunds.payment_ref`) and widens `orders.amount`, `order_items.subtotal` and
   `refunds.amount` to `NUMERIC(14,2)`; implemented and tested. **Still no repositories, services or controllers**,
-  so nothing yet writes a CAS.
+  so nothing yet writes a CAS. **A1:** the CAS-owned columns of `Order`
+  (`status`, `amount`, `payment_ref`, `expires_at`, `payment_reconciled_at`) and
+  `Refund` (`status`, `attempts`, `next_retry_at`, `claimed_at`, `last_error`) are
+  `updatable = false` and both entities are `@DynamicUpdate`: implemented, tests
+  written, **NOT yet run**.
 - **Not built anywhere:** repositories, service implementations, any
   controller other than Inventory's reserve endpoint, the API Gateway, Kafka,
   Redis, security. **`reserve` logic is not implemented.** All four services
@@ -759,7 +763,10 @@ or "recorded, not decided" still need a design decision.
   review of Order V1-V6 happened on 2026-10-29; the reviewer could not run the
   tests. What it found and V7 fixed is in §4 (V7). The items below were left
   alone on purpose, each waits for a decision. None is built or tested:
-  - **A1:** entity updatability and `@DynamicUpdate`. Not decided.
+  - **A1:** entity updatability and `@DynamicUpdate`. **Decided** (see
+    `decisions.md`, "CAS-owned columns are insert-only in the entities"):
+    implemented, tests written, **NOT yet run** (no Postgres on the machine
+    it was written on); break-and-restore not done.
   - **A2:** `refunds.next_retry_at` NULL handling and the refund claim query.
     Not decided.
   - **A3:** redesign of the sweep and refund indexes. Not decided.
