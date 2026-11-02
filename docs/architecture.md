@@ -579,6 +579,16 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   `Refund` (`status`, `attempts`, `next_retry_at`, `claimed_at`, `last_error`) are
   `updatable = false` and both entities are `@DynamicUpdate`: implemented, tests
   written, **NOT yet run**.
+  **Day-1 repositories:** `OrderRepository` has one native compare-and-set per
+  transition (set amount, `CREATED` to `RESERVATION_FAILED` / `PAYMENT_UNAVAILABLE`,
+  `CREATED` or `PENDING_PAYMENT` to `ORDER_EXPIRED` with no time condition,
+  `PENDING_PAYMENT` to `PAID` only for the held `payment_ref`, `PENDING_PAYMENT`
+  to `PAYMENT_FAILED`), plus two finders; written with winner/loser tests,
+  **NOT yet run**. **Deliberately not built, blocked on B5 and the derived
+  deadlines:** `CREATED` to `PENDING_PAYMENT` (it stamps `expires_at` from a
+  database clock). Inventory has finder-only repositories (`FlashSale`,
+  `FlashSaleItem`, `StockReservation`), written with finder tests, **NOT yet
+  run**; no stock decrement, `@Lock` or retry exists (open decisions 1 to 3).
 - **Not built anywhere:** repositories, service implementations, any
   controller other than Inventory's reserve endpoint, the API Gateway, Kafka,
   Redis, security. **`reserve` logic is not implemented.** All four services
