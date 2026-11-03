@@ -83,4 +83,48 @@ class OrderCasOwnedColumnsTest {
 
         assertEquals("CREATED", statusInDatabase(id));
     }
+
+    private Object columnInDatabase(String column, Long id) {
+        return entityManager
+                .createNativeQuery("select " + column + " from orders where id = :id")
+                .setParameter("id", id)
+                .getSingleResult();
+    }
+
+    /** Set once at insert. A setter on a managed entity must not change them. */
+    @Test
+    void settingBuyerIdOnAManagedEntityIsIgnoredByTheDatabase() {
+        Long id = persistedCreatedOrder().getId();
+        entityManager.clear();
+        Order managed = entityManager.find(Order.class, id);
+
+        managed.setBuyerId(2L);
+        entityManager.flush();
+
+        assertEquals(1L, ((Number) columnInDatabase("buyer_id", id)).longValue());
+    }
+
+    @Test
+    void settingFlashSaleIdOnAManagedEntityIsIgnoredByTheDatabase() {
+        Long id = persistedCreatedOrder().getId();
+        entityManager.clear();
+        Order managed = entityManager.find(Order.class, id);
+
+        managed.setFlashSaleId(8L);
+        entityManager.flush();
+
+        assertEquals(7L, ((Number) columnInDatabase("flash_sale_id", id)).longValue());
+    }
+
+    @Test
+    void settingIdempotencyKeyOnAManagedEntityIsIgnoredByTheDatabase() {
+        Long id = persistedCreatedOrder().getId();
+        entityManager.clear();
+        Order managed = entityManager.find(Order.class, id);
+
+        managed.setIdempotencyKey("key-2");
+        entityManager.flush();
+
+        assertEquals("key-1", columnInDatabase("idempotency_key", id));
+    }
 }

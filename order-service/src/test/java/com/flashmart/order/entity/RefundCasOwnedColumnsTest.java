@@ -54,8 +54,9 @@ class RefundCasOwnedColumnsTest {
 
     /**
      * The worker claims the refund (PENDING to PROCESSING) while another thread
-     * holds it as PENDING and saves an allowed field. The claim must survive.
-     * {@code amount} is the only column here that is not CAS-owned.
+     * holds it as PENDING and saves a field. The claim must survive. Every
+     * column of {@code refunds} is now updatable = false, so the save writes
+     * nothing; there is no allowed field left to prove a write happened.
      */
     @Test
     void aStaleSaveOfAnotherFieldDoesNotOverwriteTheClaim() {
@@ -73,10 +74,6 @@ class RefundCasOwnedColumnsTest {
         entityManager.flush();
 
         assertEquals("PROCESSING", statusInDatabase(id));
-        assertEquals(0, new BigDecimal("1.00").compareTo((BigDecimal) entityManager
-                        .createNativeQuery("select amount from refunds where id = :id")
-                        .setParameter("id", id).getSingleResult()),
-                "the allowed field should still be written, or the test proves nothing");
     }
 
     @Test
@@ -88,5 +85,47 @@ class RefundCasOwnedColumnsTest {
         entityManager.flush();
 
         assertEquals("PENDING", statusInDatabase(id));
+    }
+
+    private Object columnInDatabase(String column, Long id) {
+        return entityManager
+                .createNativeQuery("select " + column + " from refunds where id = :id")
+                .setParameter("id", id)
+                .getSingleResult();
+    }
+
+    /** Set once at insert. A setter on a managed entity must not change them. */
+    @Test
+    void settingOrderIdOnAManagedRefundIsIgnoredByTheDatabase() {
+        Long id = persistedPendingRefundId();
+        Refund managed = entityManager.find(Refund.class, id);
+        long original = managed.getOrderId();
+
+        managed.setOrderId(original + 1000);
+        entityManager.flush();
+
+        assertEquals(original, ((Number) columnInDatabase("order_id", id)).longValue());
+    }
+
+    @Test
+    void settingPaymentRefOnAManagedRefundIsIgnoredByTheDatabase() {
+        Long id = persistedPendingRefundId();
+        Refund managed = entityManager.find(Refund.class, id);
+
+        managed.setPaymentRef("pay_other");
+        entityManager.flush();
+
+        assertEquals("pay_abc123", columnInDatabase("payment_ref", id));
+    }
+
+    @Test
+    void settingAmountOnAManagedRefundIsIgnoredByTheDatabase() {
+        Long id = persistedPendingRefundId();
+        Refund managed = entityManager.find(Refund.class, id);
+
+        managed.setAmount(new BigDecimal("1.00"));
+        entityManager.flush();
+
+        assertEquals(0, new BigDecimal("199.98").compareTo((BigDecimal) columnInDatabase("amount", id)));
     }
 }
