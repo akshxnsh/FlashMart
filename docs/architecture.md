@@ -589,7 +589,10 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   database clock). Inventory has finder-only repositories (`FlashSale`,
   `FlashSaleItem`, `StockReservation`), written with finder tests, **NOT yet
   run**; no stock decrement, `@Lock` or retry exists (open decisions 1 to 3).
-- **Not built anywhere:** repositories, service implementations, any
+  **Seed scripts** (`scripts/seed/`: Identity, Inventory, Notification seeds, a
+  reset for Inventory and Order, `seed.sh`, a README): **written, NOT yet run**.
+  Checked by reading against the migrations only.
+- **Not built anywhere:** repositories beyond the Day-1 ones above, service implementations, any
   controller other than Inventory's reserve endpoint, the API Gateway, Kafka,
   Redis, security. **`reserve` logic is not implemented.** All four services
   share one local Postgres credential pair but each owns a separate database.
