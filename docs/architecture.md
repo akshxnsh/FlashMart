@@ -610,10 +610,11 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   Redis, security. **`reserve` logic is not implemented.** All four services
   share one local Postgres credential pair but each owns a separate database.
 
-**Tested: 233 tests, all passing** — Order (99) and Inventory (58) were run on
-2026-10-29 after V7. Identity (47) and Notification (29) were last run on
-2026-10-22 and were not re-run for V7, which does not touch them. Order's 99
-are the earlier 69 plus 30 new for V7 and the review's gaps (the constraint
+**Tested: 266 tests, all passing, 0 failures, 0 errors, 0 skipped** — all four
+services run together on `main` on 2026-11-04: Order 127, Inventory 63,
+Identity 47, Notification 29. Order's 127 are the 99 from V7 (the earlier 69
+plus 30 new for V7 and the review's gaps) plus 28 added since for the
+repositories and the entity-updatability tests (the V7 constraint
 that fires is now asserted by name; native-SQL `NOT NULL` tests; index
 predicates read from `pg_indexes`). Each count includes a context test
 and the zone-less-timestamp guard every service carries. The persistence tests
