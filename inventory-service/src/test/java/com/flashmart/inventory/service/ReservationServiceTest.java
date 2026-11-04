@@ -84,6 +84,19 @@ class ReservationServiceTest {
         assertEquals(1, reservationCount(s));
     }
 
+    // Boundary of the stock guard: taking exactly what is left must succeed.
+    @Test
+    void reservingExactlyTheRemainingStockSucceedsAndLeavesZero() {
+        Seed s = seed("-1 hour", "+1 hour", 2);
+
+        ReserveResponse response = reservationService.reserve(request(1L, s, 2));
+
+        assertEquals(ReserveOutcome.RESERVED, response.outcome());
+        assertEquals(0, stock(s));
+        assertEquals(1L, version(s));
+        assertEquals(1, reservationCount(s));
+    }
+
     @Test
     void replayReturnsTheIdenticalResultAndLeavesStockAlone() {
         Seed s = seed("-1 hour", "+1 hour", 10);
