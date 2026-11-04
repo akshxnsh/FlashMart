@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Seeds the FlashMart databases. Written, not run.
+# Seeds the FlashMart databases. Run and verified on 2026-11-04 (see README.md).
 #
 # Needs DB_USERNAME and DB_PASSWORD in the environment (never committed; see
 # .env.example). Optional: DB_HOST (default localhost), DB_PORT (default 5432).
