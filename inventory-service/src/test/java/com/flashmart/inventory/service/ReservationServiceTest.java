@@ -194,6 +194,19 @@ class ReservationServiceTest {
         assertEquals(0, reservationCount(s));
     }
 
+    // The window covers now, so only the status can make this sale not live.
+    @Test
+    void cancelledSaleWithAWindowCoveringNowIsNotLive() {
+        Seed s = seed("-1 hour", "+1 hour", 10, "CANCELLED");
+
+        ReserveResponse response = reservationService.reserve(request(1L, s, 1));
+
+        assertEquals(ReserveOutcome.SALE_NOT_LIVE, response.outcome());
+        assertEquals(10, stock(s));
+        assertEquals(0L, version(s));
+        assertEquals(0, reservationCount(s));
+    }
+
     // ---- evaluation order -----------------------------------------------
 
     @Test
@@ -218,6 +231,10 @@ class ReservationServiceTest {
 
     /** Offsets are Postgres interval text, applied to the database's now(). */
     private Seed seed(String startOffset, String endOffset, int stock) {
+        return seed(startOffset, endOffset, stock, "ACTIVE");
+    }
+
+    private Seed seed(String startOffset, String endOffset, int stock, String status) {
         String productName = PRODUCT_NAME_PREFIX + UUID.randomUUID();
         Long productId = jdbc.queryForObject(
                 "INSERT INTO products (brand_id, name) VALUES (?, ?) RETURNING id",
@@ -226,8 +243,8 @@ class ReservationServiceTest {
 
         Long saleId = jdbc.queryForObject(
                 "INSERT INTO flash_sales (brand_id, name, start_time, end_time, status) "
-                        + "VALUES (?, ?, now() + ?::interval, now() + ?::interval, 'ACTIVE') RETURNING id",
-                Long.class, BRAND_ID, "Reserve Test Sale " + UUID.randomUUID(), startOffset, endOffset);
+                        + "VALUES (?, ?, now() + ?::interval, now() + ?::interval, ?) RETURNING id",
+                Long.class, BRAND_ID, "Reserve Test Sale " + UUID.randomUUID(), startOffset, endOffset, status);
         saleIds.add(saleId);
 
         Long itemId = jdbc.queryForObject(
