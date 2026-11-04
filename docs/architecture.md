@@ -601,8 +601,10 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   `FlashSaleItem`, `StockReservation`), written with finder tests, **run on
   2026-11-03** (part of the 260-test pass above); no stock decrement, `@Lock` or retry exists (open decisions 1 to 3).
   **Seed scripts** (`scripts/seed/`: Identity, Inventory, Notification seeds, a
-  reset for Inventory and Order, `seed.sh`, a README): **written, NOT yet run**.
-  Checked by reading against the migrations only.
+  reset for Inventory and Order, `seed.sh`, a README): **run and verified on 2026-11-04** against real Postgres: first run, second run with
+  identical counts, reset restores stock and version and clears reservations (checked
+  on Inventory only; the Order side of the reset was not exercised), and the sequence
+  moves past the seeded ids. `reset.sql` does not delete products.
 - **Not built anywhere:** repositories beyond the Day-1 ones above, service implementations, any
   controller other than Inventory's reserve endpoint, the API Gateway, Kafka,
   Redis, security. **`reserve` logic is not implemented.** All four services
