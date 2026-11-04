@@ -7,7 +7,7 @@
 > persistence tests, plus Inventory's API contract layer (DTOs and the reserve
 > HTTP endpoint) and Inventory's `reserve` logic, implemented, tested
 > single-threaded, and raced in a contention test (at most 50 threads, one
-> JVM; see §8). **Not load-tested.**
+> JVM; see §8). **First laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached.**
 
 ## 1. System Overview
 
@@ -45,7 +45,7 @@ proceeding.
 **Synchronous (OpenFeign):**
 - **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). The idempotency key is `(orderId, flashSaleId, productId)`; `quantity` is deliberately not part of it. `quantity` is 1..5 per item (`MAX_QUANTITY_PER_ITEM`, enforced at the API only, no `CHECK`; decisions.md, "Per-item quantity cap of 5"). Every `200` carries `outcome` ∈ `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED | ITEM_NOT_IN_SALE`. `ITEM_NOT_IN_SALE` (no sale item for `(flashSaleId, productId)`) is an outcome, not an error: Order has no way to check it in advance (it cannot read Inventory's database and no endpoint exists), so a buyer or bot can trigger it at will, and Order answers it with `RESERVATION_FAILED`. `reservationId`, `salePrice`, `brandId` and `productName` are present **only** when `outcome = RESERVED` and are omitted (not `null`) otherwise. `salePrice` is a string with exactly two decimals in plain notation (`"3999.00"`). There is no `success` and no "replayed" flag: a replay looks exactly like a first call. Business outcomes are always `200`, because a non-2xx could trip the circuit breaker in front of Inventory during a drop. Non-`200` means something upstream is wrong and should alert, with body `{ code, message }` (`message` is for logs only): `400 INVALID_QUANTITY` (any problem with `quantity`, including a fractional one or one above 5; Jackson's float-to-int truncation is turned off), `INVALID_REQUEST` (any other malformed field or body, with `400`; or a body that is not JSON, with `415`), `409 QUANTITY_MISMATCH`. The `415` is mapped because the controller-scoped handler can see it: the mapping declares no `consumes`, so the controller is chosen first and the `415` is raised while reading the body. One exception answers with **Spring's default body, not `{ code, message }`**: `405` (wrong method), which is raised before any controller is chosen, so the scoped handler cannot see it. Accepted: a global handler would leak reserve's codes onto future controllers, and a `405` means a broken caller, not a buyer outcome. **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
 
-  *Implementation rules — implemented in `ReservationServiceImpl` / `ReservationTransaction`, tested single-threaded and raced in a contention test (see §8); not load-tested:*
+  *Implementation rules — implemented in `ReservationServiceImpl` / `ReservationTransaction`, tested single-threaded and raced in a contention test (see §8); first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached:*
   - **Replay path, in this order:** find the existing reservation for `(orderId, item)` in **any** status → compare `quantity` (different → `409 QUANTITY_MISMATCH`) → if `RELEASED`, return `200 RESERVATION_RELEASED` and never fall through to a new reservation → otherwise return the stored reservation as `RESERVED`. A replay skips the liveness and stock gates.
   - **`ITEM_NOT_IN_SALE` is logged:** Inventory logs a WARN each time it returns this outcome, so a spike (a bot, or an Order bug sending the wrong sale id) is visible. A plain log line until the observability phase brings metrics.
   - **Concurrent first calls:** when two first calls for the same `(orderId, item)` race, the loser must end on the replay path, never a `500`, and its stock change must not survive. The unique violation rolls the loser back before it touches stock, and `ReservationServiceImpl` re-reads in a fresh transaction (decided in decisions.md, "Reserve write path").
@@ -214,7 +214,7 @@ flash_sale_items(id, flash_sale_id, product_id, sale_price,
   --   it on insert (3999.005::numeric(12,2) = 3999.01, measured)
   -- total_stock fixed (reporting); available_stock is the decremented counter
   -- version: optimistic lock — the contended row under concurrent decrement
-  -- DECIDED (implemented; tested single-threaded and in a contention test of at most 50 threads; not load-tested): see decisions.md, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction"
+  -- DECIDED (implemented; tested single-threaded and in a contention test of at most 50 threads; first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached): see decisions.md, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction"
 
 stock_reservations(id, order_id, flash_sale_item_id, quantity, status, reserved_at)
   -- UNIQUE(order_id, flash_sale_item_id) — idempotent reserve on retry
@@ -522,7 +522,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **Who stamps a time column depends on who compares it** — Java clock for audit-only columns (`products`); database default with `insertable = false` where the database's `now()` is compared against it (`stock_reservations.reserved_at`); a strictly-increasing trigger where another service orders events by it (`brands`/`users.updated_at`).
 - **`CHECK` constraints are the last line of defence, each documented against the guard that comes first** — the ceiling `available_stock <= total_stock` matters more than the floor because only application logic stands before it. A `CHECK` is never removed for "duplicating" application logic.
 - **Entity and migration conventions** — `IDENTITY` ids; migrations never edited once applied or pushed; same-service FKs real in the database but plain `Long` in Java; enums as `EnumType.STRING` plus a `CHECK`; chosen constraint names; a database-filled column must be `insertable = false` or Hibernate-generated, because Hibernate sends an explicit `NULL` that overrides a `DEFAULT`; `validate` cannot see triggers, defaults or `CHECK`s.
-- **Entity tests use real Postgres, roll back, and must be shown to fail** — each guard was verified by breaking what it protects. The reserve HTTP contract is tested in a web slice with the service mocked, through the application's real Jackson and validator configuration. `reserve` is implemented, tested single-threaded and raced in a contention test (see §8), but not load-tested.
+- **Entity tests use real Postgres, roll back, and must be shown to fail** — each guard was verified by breaking what it protects. The reserve HTTP contract is tested in a web slice with the service mocked, through the application's real Jackson and validator configuration. `reserve` is implemented, tested single-threaded and raced in a contention test (see §8); first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached.
 - **Service scaffolding** — fixed ports 8081–8084 (8080 reserved for the Gateway); one shared credential pair against one Postgres instance but a separate database per service; Kafka, Feign, Resilience4j and Security deferred to their phases; Validation added to Inventory in its API phase, and each sibling adds it in its own.
 - **Every event-publishing service owns an outbox** — now Order and Identity only.
 - **Cross-service relationships are always an ID or an event, never a foreign key** — §5.
@@ -883,7 +883,7 @@ or "recorded, not decided" still need a design decision.
   Order sweep interval, and the payment window — blocked on real
   Feign/Resilience4j config by design.
 - **Locking strategy and isolation level for `flash_sale_items`: decided**
-  (implemented, tested single-threaded only; not race-tested, not load-tested). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
+  (implemented, tested single-threaded and raced in a contention test; first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
   Pool size and timeout values, and insert-first vs update-first, come from
   the load test.
 - **Inventory's time columns are `TIMESTAMPTZ` — done (V6), recorded here
