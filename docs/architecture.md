@@ -623,6 +623,9 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   identical counts, reset restores stock and version and clears reservations (checked
   on Inventory only; the Order side of the reset was not exercised), and the sequence
   moves past the seeded ids. `reset.sql` does not delete products.
+  **`docker-compose.yml`** (Postgres 16, Redis 7, Kafka KRaft; see
+  `docs/development.md`): written, `docker compose config` validated, NOT
+  started, NOT tested.
 - **Not built anywhere:** repositories beyond the Day-1 ones above (apart from
   the ones `reserve` added), service implementations other than Inventory's
   `reserve`, any controller other than Inventory's reserve endpoint, the API
