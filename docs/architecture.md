@@ -768,9 +768,10 @@ was KO. The tool did not count responses by outcome; `RESERVED` below comes from
   3,324 of them never did. One run per size, one machine, one JVM; the numbers
   are not repeated and not compared across configurations.
 
-**Not load-tested, not verified under concurrency or failure** — `reserve` is
-implemented but has only single-threaded tests. NFR-P1–P4 remain unverified targets by explicit decision, not by
-omission.
+**Status of `reserve`:** implemented, tested single-threaded, and raced in the
+contention tests above. A first baseline load run exists (see "First load run"),
+but the 5,000-buyer / p99 target is still unmeasured. Not verified under
+failure. NFR-P1–P4 remain unmeasured targets.
 
 **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
 `8084`; `8080` is reserved for the API Gateway.
