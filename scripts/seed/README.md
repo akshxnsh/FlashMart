@@ -8,7 +8,7 @@ With stock set to 1, version set to 5 and one reservation inserted by hand, a
 re-run restored full stock, version 0 and an empty `stock_reservations`. A
 product inserted by hand got id 4 (the sequence is past the seeded ids);
 `reset.sql` does not delete products, so it stayed and was removed by hand.
-Not load-tested.
+The load runs in `architecture.md` §8 used these scripts to reset and reseed before each run.
 
 ## Why there are several files
 

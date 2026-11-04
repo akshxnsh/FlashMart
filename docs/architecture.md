@@ -551,8 +551,9 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   wait for security), no browse endpoint. `quantity` is capped at 5 per item
   at the API.
   **`reserve` logic: implemented, tested single-threaded, and raced in a
-  contention test (see "Inventory contention tests" below); not
-  load-tested.** `NotImplementedReservationService` is deleted.
+  contention test (see "Inventory contention tests" below); load-measured
+  on one laptop only (see "First load run" and "Second load run" below).**
+  `NotImplementedReservationService` is deleted.
   `ReservationServiceImpl` (not transactional) calls `ReservationTransaction`
   (one short `@Transactional`: resolve item, replay check, insert the
   reservation, then one native conditional `UPDATE` last: stock guard,
@@ -589,8 +590,9 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   static review) adds `ck_orders_payment_ref_present_when_payable`, three
   non-blank guards (`orders.idempotency_key`, `orders.payment_ref`,
   `refunds.payment_ref`) and widens `orders.amount`, `order_items.subtotal` and
-  `refunds.amount` to `NUMERIC(14,2)`; implemented and tested. **Still no repositories, services or controllers**,
-  so nothing yet writes a CAS. **A1:** the CAS-owned columns of `Order`
+  `refunds.amount` to `NUMERIC(14,2)`; implemented and tested. **No services or controllers** (the only repository is
+  the Day-1 `OrderRepository`, below), so nothing in the running application yet
+  writes a CAS. **A1:** the CAS-owned columns of `Order`
   (`status`, `amount`, `payment_ref`, `expires_at`, `payment_reconciled_at`) and
   `Refund` (`status`, `attempts`, `next_retry_at`, `claimed_at`, `last_error`) are
   `updatable = false`, as are the set-once columns `Order.buyer_id`,
@@ -861,11 +863,11 @@ re-synced to this document the same day.
 
 **Notion log:** a personal engineering log, not a source of truth —
 `docs/decisions.md` remains authoritative on conflict. Checked and brought up
-to date on 2026-10-22: "API & Event Contracts" records every reserve-contract
-piece (including `ITEM_NOT_IN_SALE` and the `415`), and the test totals match
-the 193 measured that day. "Feature Implementation" and "Load Testing &
-Verification" are empty, consistent with the repo — no feature logic and no
-load test exist yet.
+to date on 2026-10-22 (before `reserve` and the load runs existed): "API &
+Event Contracts" records every reserve-contract piece (including
+`ITEM_NOT_IN_SALE` and the `415`), and the test totals matched the 193
+measured that day. "Feature Implementation" and "Load Testing & Verification"
+were empty then. Not re-checked since.
 
 ## 9. Known Open Items / Next Steps
 
@@ -921,7 +923,7 @@ or "recorded, not decided" still need a design decision.
   UPDATE unblocks and needs no retry; a `version = ?` clause fails after any
   concurrent write. A native `UPDATE` also does not bump `version`, so mixing
   it with an entity save can silently clobber a decrement. Must be settled
-  before `reserve` is built. **Decided** (designed only): see `decisions.md`,
+  before `reserve` is built. **Decided and since implemented** (tested, raced, load-measured on one laptop; see §8): see `decisions.md`,
   "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
 - Enforce "frozen once the sale opens" (price, `total_stock`, times,
   cancellation) in the service layer, against the database clock, in the same
