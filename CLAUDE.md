@@ -105,10 +105,10 @@ Follow the phase plan: setup → architecture/requirements → schema → JPA en
 
 ## Open decisions (stop and decide together)
 
-1. **Locking strategy for `flash_sale_items`:** optimistic `version` alone, pessimistic, or a Redis lock in front. To be load-tested, not assumed. Write the entity with `@Version` as designed, but build no retry/backoff around it as though it were final.
-2. **Isolation level** on the same write path. It interacts directly with (1) and is decided with it.
-3. **The `reserve` write path is specified two incompatible ways:** `WHERE id = ? AND version = ?` versus `WHERE available_stock >= ? AND <liveness>`. Under READ COMMITTED the `version` form fails after *any* concurrent write (a retry storm at the 5,000-concurrent target), while the value-based form re-checks fresh stock and cleanly matches zero rows. Do not pick one by default when `reserve` is built.
-4. **Derived deadlines and leases** (see design rules), blocked on Feign/Resilience4j config.
+1. **Locking strategy for `flash_sale_items`: decided** (designed only, not built, not load-tested). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction". Build no retry/backoff around `@Version`.
+2. **Isolation level** on the same write path: **decided** (READ COMMITTED), same entry as (1).
+3. **The `reserve` write path: decided**, same entry as (1). Do not re-open it by default; the `WHERE version = ?` form is rejected as the reserve path.
+4. **Derived deadlines and leases** (see design rules), blocked on Feign/Resilience4j config. Pool size and the `lock_timeout` / `statement_timeout` / connection-wait values are open too and come from the load test.
 5. **Accepted permanent residual risk:** a second captured payment can escape correction only if initiate-idempotency fails, a webhook is lost, and the order reaches `PAID`. Not building "list every payment for this order." Do not treat it as an oversight.
 6. **Razorpay Clone is not built.** The design leans on four behaviours from it: idempotency on initiate, idempotency on refund, a payment-status lookup by *our* idempotency key, and payments and webhooks that carry **our order id**. Until it exists these are **designed, not verified**; write no code or docs that assume otherwise.
 
