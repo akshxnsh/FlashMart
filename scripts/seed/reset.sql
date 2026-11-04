@@ -1,4 +1,4 @@
--- Reset between load-test runs. Written, not run.
+-- Reset between load-test runs. Run and verified on 2026-11-04 (see README.md).
 --
 -- Run through seed.sh (or psql with -v inventory_db=... -v order_db=...).
 -- It touches two databases, which is why it uses \connect: the services never

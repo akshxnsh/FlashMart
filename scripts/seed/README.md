@@ -1,7 +1,14 @@
-# Seed data (written, not run)
+# Seed data (run and verified on 2026-11-04)
 
-Seed scripts for local development and load tests. **They have never been
-run**: they were checked by reading them against the Flyway migrations only.
+Seed scripts for local development and load tests. **They were run on
+2026-11-04** against local Postgres and verified: counts after seeding were
+identity 1|3, inventory 3|3|4|0, notification 1|3; liveness 1|t, 2|f, 3|f;
+stock 1|500|500, 2|50|50, 3|100|100, 4|20|20. A second run changed nothing.
+With stock set to 1, version set to 5 and one reservation inserted by hand, a
+re-run restored full stock, version 0 and an empty `stock_reservations`. A
+product inserted by hand got id 4 (the sequence is past the seeded ids);
+`reset.sql` does not delete products, so it stayed and was removed by hand.
+Not load-tested.
 
 ## Why there are several files
 
