@@ -682,8 +682,9 @@ every timeout left at its default; all threads wait on a latch and call
   `RESERVED`, two rows, version 2) and the 50-buyer test let **18** buyers win
   5 units.
 
-**Not exercised:** load (the 5,000-request, p99 targets are still targets,
-unmeasured), more than 50 threads, more than one JVM or Inventory instance, a
+**Not exercised** by these contention tests: load (measured separately, see
+"First load run" and "Second load run" below; the 5,000-concurrent target is
+not reached), more than 50 threads, more than one JVM or Inventory instance, a
 sale ending or being cancelled mid-race, the pool or timeouts under pressure,
 and a race on a non-`RESERVED` replay (`RELEASED`, quantity mismatch). The spy
 wraps `ReservationTransaction` for the whole test class, so it adds a small
@@ -837,9 +838,11 @@ response body, for OK responses only.
   repeat of (b) or (c), nothing changed in Inventory's pool, Tomcat or timeouts.
 
 **Status of `reserve`:** implemented, tested single-threaded, and raced in the
-contention tests above. A first baseline load run exists (see "First load run"),
-but the 5,000-buyer / p99 target is still unmeasured. Not verified under
-failure. NFR-P1–P4 remain unmeasured targets.
+contention tests above. Load-measured (see "First load run" and "Second load
+run") on one laptop with the load tool co-located: the p99 target was met at
+100 buyers/s (p99 13-89 ms), not met at 500 buyers/s (p99 ~9.4 s, 5.3%
+refused), cause not found; the 5,000-concurrent target is not reached. Not
+verified under failure.
 
 **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
 `8084`; `8080` is reserved for the API Gateway.

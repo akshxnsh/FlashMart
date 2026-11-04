@@ -99,7 +99,7 @@ Reasoning is in `decisions.md` ("Entity and migration conventions", "Database CH
 
 Follow the phase plan: setup → architecture/requirements → schema → JPA entities → APIs/DTOs → reservation/payment → state machine → security → Redis caching → rate limiting → idempotency → transactions/locking → outbox → Kafka → webhooks → microservices/gateway → load testing. Don't jump ahead unless he asks.
 
-**Current position:** entities and migrations are done in all four services; Inventory's `reserve` is implemented, tested, raced and baseline-load-run once, but the 5,000-buyer / p99 target is unmeasured; nothing else is built beyond the Day-1 repositories. Details in `architecture.md` §8 (which wins over this line).
+**Current position:** entities and migrations are done in all four services; Inventory's `reserve` is implemented, tested, raced and load-run on one laptop (p99 target met at 100 buyers/s, not met at 500 buyers/s; the 5,000-concurrent target is not reached); nothing else is built beyond the Day-1 repositories. Details in `architecture.md` §8 (which wins over this line).
 
 **Ports:** gateway `8080` (reserved), identity `8081`, inventory `8082`, order `8083`, notification `8084`. One shared `DB_USERNAME`/`DB_PASSWORD` pair, one separate database per service.
 
