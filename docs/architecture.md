@@ -725,6 +725,49 @@ Hibernate reject a null before Postgres sees it, so such a test passes with or
 without the column constraint. `orders.expires_at` therefore has a native-SQL
 test as well; no other `NOT NULL` in any service is guarded this way.
 
+**First load run** (2026-11-04, branch `test/load-first-run`, Gatling 3.16.0,
+`load-tests/ReserveOneItem`, `load-tests/verify.sh`). **One laptop running the
+load tool, Inventory and Postgres together; default connection pool and
+timeouts; first baseline. NOT the 5,000-buyer / p99 target result.** Every
+buyer sent one `reserve` for item 1 (stock 500) with its own order id, all at
+once. Before each run the databases were reset and reseeded (item 1: stock 500,
+version 0, no reservations). Inventory was started once with
+`./mvnw spring-boot:run` (its process showed `-XX:TieredStopAtLevel=1`, which
+that command adds) and **not restarted between runs**, so run 1 hit a freshly
+started JVM and runs 2 and 3 a JVM that had already served earlier runs. A
+response counted OK only for HTTP 200 with an `outcome` field; anything else
+was KO. The tool did not count responses by outcome; `RESERVED` below comes from
+`stock_reservations`.
+
+| Buyers | OK | KO | p50 / p95 / p99 / max (ms), all requests | p50 / p95 / p99 / max (ms), OK only | Requests/s (Gatling mean, all requests) |
+|---|---|---|---|---|---|
+| 100 | 100 | 0 | 1201 / 1235 / 1257 / 1263 | same (no KO) | 50 |
+| 1,000 | 309 | 691 | 1775 / 2150 / 2216 / 2341 | 2047 / 2199 / 2275 / 2341 | 333.33 (OK only: 103) |
+| 5,000 | 1,676 | 3,324 | 4398 / 5604 / 5832 / 5884 | 4721 / 5746 / 5863 / 5884 | 625 (OK only: 209.5) |
+
+- **Every KO, in both runs that had any, was the same error:**
+  `j.n.ConnectException: Connection refused: getsockopt` (691 of 691, then 3,324
+  of 3,324). The TCP connection was not made, so those requests did not reach
+  `reserve`. **The cause was not investigated.** Inventory still answered its
+  health endpoint after both runs and logged no `ERROR` line. The response times
+  of KO requests are the time to the refusal, so the "all requests" percentiles
+  for 1,000 and 5,000 mix refusals with real answers; the OK-only columns are the
+  answered requests.
+- **`verify.sh`, exit 0 after every run** (`available_stock >= 0`,
+  `sum(quantity) <= total_stock`, `available_stock = total_stock - sum(quantity)`):
+
+  | Buyers | available_stock | version | reservations | sum(quantity) | `RESERVED` rows |
+  |---|---|---|---|---|---|
+  | 100 | 400 | 100 | 100 | 100 | 100 |
+  | 1,000 | 191 | 309 | 309 | 309 | 309 |
+  | 5,000 | 0 | 500 | 500 | 500 | 500 |
+
+- **What this shows:** in the 5,000-buyer run, 500 units were reserved and the
+  stock reached 0, with no oversell visible in the database. It does **not**
+  show how Inventory behaves when all 5,000 buyers get a connection, because
+  3,324 of them never did. One run per size, one machine, one JVM; the numbers
+  are not repeated and not compared across configurations.
+
 **Not load-tested, not verified under concurrency or failure** — `reserve` is
 implemented but has only single-threaded tests. NFR-P1–P4 remain unverified targets by explicit decision, not by
 omission.
