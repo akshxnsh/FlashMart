@@ -5,8 +5,9 @@
 > conflict (see `CLAUDE.md`). Design document — Section 8 is what actually has
 > code behind it: every service's entities on Flyway migrations, covered by
 > persistence tests, plus Inventory's API contract layer (DTOs and the reserve
-> HTTP endpoint) and Inventory's `reserve` logic, implemented and tested
-> single-threaded only (not race-tested, not load-tested).
+> HTTP endpoint) and Inventory's `reserve` logic, implemented, tested
+> single-threaded, and raced in a contention test (at most 50 threads, one
+> JVM; see §8). **Not load-tested.**
 
 ## 1. System Overview
 
@@ -44,10 +45,10 @@ proceeding.
 **Synchronous (OpenFeign):**
 - **Order → Inventory** — `POST /internal/flash-sale-items/reserve { orderId, flashSaleId, productId, quantity }`, once per item (loop, not batch). The idempotency key is `(orderId, flashSaleId, productId)`; `quantity` is deliberately not part of it. `quantity` is 1..5 per item (`MAX_QUANTITY_PER_ITEM`, enforced at the API only, no `CHECK`; decisions.md, "Per-item quantity cap of 5"). Every `200` carries `outcome` ∈ `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED | ITEM_NOT_IN_SALE`. `ITEM_NOT_IN_SALE` (no sale item for `(flashSaleId, productId)`) is an outcome, not an error: Order has no way to check it in advance (it cannot read Inventory's database and no endpoint exists), so a buyer or bot can trigger it at will, and Order answers it with `RESERVATION_FAILED`. `reservationId`, `salePrice`, `brandId` and `productName` are present **only** when `outcome = RESERVED` and are omitted (not `null`) otherwise. `salePrice` is a string with exactly two decimals in plain notation (`"3999.00"`). There is no `success` and no "replayed" flag: a replay looks exactly like a first call. Business outcomes are always `200`, because a non-2xx could trip the circuit breaker in front of Inventory during a drop. Non-`200` means something upstream is wrong and should alert, with body `{ code, message }` (`message` is for logs only): `400 INVALID_QUANTITY` (any problem with `quantity`, including a fractional one or one above 5; Jackson's float-to-int truncation is turned off), `INVALID_REQUEST` (any other malformed field or body, with `400`; or a body that is not JSON, with `415`), `409 QUANTITY_MISMATCH`. The `415` is mapped because the controller-scoped handler can see it: the mapping declares no `consumes`, so the controller is chosen first and the `415` is raised while reading the body. One exception answers with **Spring's default body, not `{ code, message }`**: `405` (wrong method), which is raised before any controller is chosen, so the scoped handler cannot see it. Accepted: a global handler would leak reserve's codes onto future controllers, and a `405` means a broken caller, not a buyer outcome. **Evaluation order is contractual:** an existing reservation for `(orderId, item)` is checked and returned *before* the liveness/stock gates, so a retry arriving after the sale ends still succeeds instead of triggering a wrongful cancellation. Liveness is computed (§4), never read from a stored value. Internal only — never routable through the Gateway.
 
-  *Implementation rules — implemented in `ReservationServiceImpl` / `ReservationTransaction`, tested single-threaded only (see §8); not race-tested, not load-tested:*
+  *Implementation rules — implemented in `ReservationServiceImpl` / `ReservationTransaction`, tested single-threaded and raced in a contention test (see §8); not load-tested:*
   - **Replay path, in this order:** find the existing reservation for `(orderId, item)` in **any** status → compare `quantity` (different → `409 QUANTITY_MISMATCH`) → if `RELEASED`, return `200 RESERVATION_RELEASED` and never fall through to a new reservation → otherwise return the stored reservation as `RESERVED`. A replay skips the liveness and stock gates.
   - **`ITEM_NOT_IN_SALE` is logged:** Inventory logs a WARN each time it returns this outcome, so a spike (a bot, or an Order bug sending the wrong sale id) is visible. A plain log line until the observability phase brings metrics.
-  - **Concurrent first calls:** when two first calls for the same `(orderId, item)` race, the loser must end on the replay path, never a `500`, and its stock change must not survive. The mechanism depends on the open reserve write-path decision (§9).
+  - **Concurrent first calls:** when two first calls for the same `(orderId, item)` race, the loser must end on the replay path, never a `500`, and its stock change must not survive. The unique violation rolls the loser back before it touches stock, and `ReservationServiceImpl` re-reads in a fresh transaction (decided in decisions.md, "Reserve write path").
 - **Order → Razorpay Clone** — initiate payment, with an idempotency key derived from the order ID. 202-only response; Order sets `PENDING_PAYMENT`, never `PAID`, off it.
 - **Order → Razorpay Clone** — refund a captured payment, and a payment-status lookup (used both to check "already refunded?" and by the reconciliation sweep, §6). Must accept *our* idempotency key or order reference, not only the gateway's own payment ID.
 - **Inventory → Order** — `GET /internal/orders/{orderId}/status` → `{ orderId, status }`, used by Inventory's stale-reservation reconciler. `PAID` → confirm; terminal failure → release; `CREATED`/`PENDING_PAYMENT` → do nothing **and alert** (an hours-old reservation on a live order means Order's sweep has died); `404`/unreachable → do nothing and alert, never guess. Safe without locking: every answer acted on is terminal and can't change after being read. Internal only. The reconciler scans a bounded number of rows per pass, so a systemic backlog (e.g. Kafka down for hours) can't flood Order.
@@ -213,7 +214,7 @@ flash_sale_items(id, flash_sale_id, product_id, sale_price,
   --   it on insert (3999.005::numeric(12,2) = 3999.01, measured)
   -- total_stock fixed (reporting); available_stock is the decremented counter
   -- version: optimistic lock — the contended row under concurrent decrement
-  -- DECIDED (implemented, tested single-threaded only; not race-tested, not load-tested): see decisions.md, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction"
+  -- DECIDED (implemented; tested single-threaded and in a contention test of at most 50 threads; not load-tested): see decisions.md, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction"
 
 stock_reservations(id, order_id, flash_sale_item_id, quantity, status, reserved_at)
   -- UNIQUE(order_id, flash_sale_item_id) — idempotent reserve on retry
@@ -506,7 +507,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **`reserve` answers every business outcome with `200` and an `outcome` enum** — `RESERVED | OUT_OF_STOCK | SALE_NOT_LIVE | RESERVATION_RELEASED | ITEM_NOT_IN_SALE`; non-`200` (`{ code, message }`) only for a broken caller. A non-2xx for a business outcome could trip the circuit breaker in front of Inventory during a drop (reasoned, unverified until the Feign/Resilience4j config exists).
 - **An item not in the sale is an outcome, not a `404`** — Order has no way to check it in advance, so a client can trigger it at will; a WARN log per occurrence keeps a spike visible.
 - **Per-item quantity cap of 5, at the API only** — a business rule that may change, so no `CHECK`; Order must check the same cap before calling `reserve`.
-- **Optimistic-lock `version` on `flash_sale_items`, not `stock_reservations`** — the contended row is the shared counter, not a per-buyer insert-only row. The column and `@Version` exist; **how `reserve` writes the decrement is still open** — `WHERE version = ?` versus a value-based `WHERE available_stock >= ? AND <liveness>` behave very differently under READ COMMITTED, and two decision entries specify them differently (§9).
+- **Optimistic-lock `version` on `flash_sale_items`, not `stock_reservations`** — the contended row is the shared counter, not a per-buyer insert-only row. The column and `@Version` exist; **the decrement is decided: one atomic value-based conditional `UPDATE`** (`WHERE available_stock >= ? AND <liveness>`, with `version = version + 1`) under READ COMMITTED; the `WHERE version = ?` form is rejected as the reserve path (decisions.md, "Reserve write path").
 - **Sale terms are immutable once live** — price, stock quantities (`total_stock`), `start_time`/`end_time`, and cancellation all share one boundary: mutable pre-open, frozen after. `available_stock` moves only through reserve/release/confirm, never through an edit. A live sale always runs to its end; there is no emergency stop.
 - **Liveness is computed, never stored** — `status` shrinks to `ACTIVE|CANCELLED`; the drift problem is removed, not solved, by asking the two timestamps fresh every time, against the database's clock.
 - **An order keeps exactly one payment** — one CAS-enforced invariant, replacing an enumerated guard that had a hole.
@@ -521,7 +522,7 @@ Full context and trade-offs live in `docs/decisions.md`.
 - **Who stamps a time column depends on who compares it** — Java clock for audit-only columns (`products`); database default with `insertable = false` where the database's `now()` is compared against it (`stock_reservations.reserved_at`); a strictly-increasing trigger where another service orders events by it (`brands`/`users.updated_at`).
 - **`CHECK` constraints are the last line of defence, each documented against the guard that comes first** — the ceiling `available_stock <= total_stock` matters more than the floor because only application logic stands before it. A `CHECK` is never removed for "duplicating" application logic.
 - **Entity and migration conventions** — `IDENTITY` ids; migrations never edited once applied or pushed; same-service FKs real in the database but plain `Long` in Java; enums as `EnumType.STRING` plus a `CHECK`; chosen constraint names; a database-filled column must be `insertable = false` or Hibernate-generated, because Hibernate sends an explicit `NULL` that overrides a `DEFAULT`; `validate` cannot see triggers, defaults or `CHECK`s.
-- **Entity tests use real Postgres, roll back, and must be shown to fail** — each guard was verified by breaking what it protects. The reserve HTTP contract is tested in a web slice with the service mocked, through the application's real Jackson and validator configuration. No `reserve` logic exists, so nothing is load-tested or verified under concurrency.
+- **Entity tests use real Postgres, roll back, and must be shown to fail** — each guard was verified by breaking what it protects. The reserve HTTP contract is tested in a web slice with the service mocked, through the application's real Jackson and validator configuration. `reserve` is implemented, tested single-threaded and raced in a contention test (see §8), but not load-tested.
 - **Service scaffolding** — fixed ports 8081–8084 (8080 reserved for the Gateway); one shared credential pair against one Postgres instance but a separate database per service; Kafka, Feign, Resilience4j and Security deferred to their phases; Validation added to Inventory in its API phase, and each sibling adds it in its own.
 - **Every event-publishing service owns an outbox** — now Order and Identity only.
 - **Cross-service relationships are always an ID or an event, never a foreign key** — §5.
@@ -549,9 +550,9 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   turns off Jackson's float-to-int truncation. No public controllers (they
   wait for security), no browse endpoint. `quantity` is capped at 5 per item
   at the API.
-  **`reserve` logic: implemented and tested single-threaded only; not
-  race-tested, not load-tested** (branch `feat/reserve-service`, not yet
-  merged when this was written). `NotImplementedReservationService` is deleted.
+  **`reserve` logic: implemented, tested single-threaded, and raced in a
+  contention test (see "Inventory contention tests" below); not
+  load-tested.** `NotImplementedReservationService` is deleted.
   `ReservationServiceImpl` (not transactional) calls `ReservationTransaction`
   (one short `@Transactional`: resolve item, replay check, insert the
   reservation, then one native conditional `UPDATE` last: stock guard,
@@ -559,7 +560,9 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   throws the unchecked `StockNotTaken`, which rolls back the inserted
   reservation; the service then answers `SALE_NOT_LIVE` or `OUT_OF_STOCK`.
   The catch of a unique violation on the insert, with a fresh-transaction
-  re-read, is **implemented, not tested**. Service tests commit real data
+  re-read, is **exercised**: it ran in 100 of 100 rounds of the
+  same-order race (below), and its two branches are unit-tested with mocks.
+  Service tests commit real data
   (no rolled-back test transaction) and clean up by id. Break-and-restore done
   on the stock guard (`>=`; its boundary `>` is killed by the
   stock-equals-quantity test), the liveness predicate, and the `version` bump.
@@ -643,8 +646,49 @@ skipped** (inventory suite only, run on branch `feat/reserve-service` on
 the 63 above plus 10 in `ReservationServiceTest`. It covers, single-threaded:
 first call, replay, quantity mismatch, `RELEASED`, `ITEM_NOT_IN_SALE` with its
 WARN, `OUT_OF_STOCK` leaving no row, upcoming and ended sales, replay after the
-sale ended, and stock equal to quantity. **Not race-tested, not load-tested,
-and the unique-violation catch is not tested.**
+sale ended, and stock equal to quantity. (That count and its "not
+race-tested" wording are as of that run; the contention tests below came after.)
+
+**Inventory contention tests** (`ReservationConcurrencyTest`, plus
+`ReservationOrchestratorTest` with no database), run on branch
+`test/reserve-concurrency` on 2026-11-04, **inventory suite only: 81 tests, 0
+failures, 0 errors, 0 skipped** (the other three services were not re-run).
+What was raced, on real Postgres, in one JVM, with the connection pool and
+every timeout left at its default; all threads wait on a latch and call
+`reserve()` together:
+- **Last unit, two buyers:** stock 1, 2 threads (orders 1 and 2), 100 rounds,
+  each on a fresh item. Every round: exactly one `RESERVED` and one
+  `OUT_OF_STOCK`, no exception, stock 0, version 1, one reservation row, and it
+  belongs to the winner.
+- **Same order twice:** stock 10, same `orderId`, quantity 2, 2 threads, 100
+  rounds. Every round: both `RESERVED` with equal responses, stock 8, version 1,
+  one row. The unique-violation catch ran in **100 of 100 rounds** (counted with
+  a spy on `findReplay`, which only that catch calls). So in this harness the
+  loser always lost on the insert and never found the row at the replay check:
+  the other ordering (the replay check finds a committed row) was **not**
+  exercised by the race.
+- **50 buyers, 5 units:** 50 threads, distinct orders, quantity 1, **one**
+  race (with the default connection pool of 10, at most about 10 of the 50
+  threads work at once): exactly 5 `RESERVED`, 45 `OUT_OF_STOCK`, stock 0, 5 rows, sum of
+  quantity 5, no exception.
+- **Liveness edges** (not a race): `start_time = now()` is live, `end_time =
+  now()` is not, with `SELECT now()`, the window write and the `UPDATE` in one
+  transaction.
+- **Break-and-restore, all three killed by the intended test:** `start_time
+  <= now()` to `<` (start-inclusive test failed); `now() < end_time` to `<=`
+  (end-exclusive test failed); the atomic decrement replaced by an unlocked
+  read followed by a write of the value read minus the quantity (a lost update
+  that no `CHECK` catches): last-unit test broke in **98 of 100 rounds** (two
+  `RESERVED`, two rows, version 2) and the 50-buyer test let **18** buyers win
+  5 units.
+
+**Not exercised:** load (the 5,000-request, p99 targets are still targets,
+unmeasured), more than 50 threads, more than one JVM or Inventory instance, a
+sale ending or being cancelled mid-race, the pool or timeouts under pressure,
+and a race on a non-`RESERVED` replay (`RELEASED`, quantity mismatch). The spy
+wraps `ReservationTransaction` for the whole test class, so it adds a small
+overhead to every race there. Two buyers on the last unit passing 100 rounds
+shows the guard held in those rounds; it is evidence, not a proof.
 
 **Inventory's reserve contract is also tested at the HTTP layer**
 (`@WebMvcTest`, with the service mocked), through the application's real
@@ -664,7 +708,8 @@ showed the controller-scoped handler can see a `415` but not a `405`. One
 assertion trap: Spring's `jsonPath(...).doesNotExist()` passes for a key
 present with a `null` value, so omission is asserted as "the body is exactly
 `{outcome}`". (That layer mocks the service; the logic behind it is covered by
-`ReservationServiceTest` above.) Concurrency is untested.
+`ReservationServiceTest` above; contention is covered by
+`ReservationConcurrencyTest`, not at this layer.)
 
 The tests are shown able to fail, not assumed to be. Order's 30 mutations —
 25 applied to the database, 5 stripping an `@Generated` — killed exactly the
