@@ -21,7 +21,7 @@ Authority order when documents disagree: `docs/decisions.md` → `docs/architect
 | Open items | `architecture.md` §9 and the final "Open Items" section of `decisions.md` |
 | Why something is the way it is | `decisions.md`, **by heading** |
 
-**Reading discipline:** `decisions.md` is ~3,900 lines. Never read it whole. `grep -n '^## Decision'` for headings, then read only the relevant section. Same for `architecture.md`: read the section you need.
+**Reading discipline:** `decisions.md` is ~4,500 lines. Never read it whole. `grep -n '^## Decision'` for headings, then read only the relevant section. Same for `architecture.md`: read the section you need.
 
 The Notion engineering log is Akshansh's personal record, not a source of truth. Update it only when he explicitly asks.
 
@@ -99,13 +99,13 @@ Reasoning is in `decisions.md` ("Entity and migration conventions", "Database CH
 
 Follow the phase plan: setup → architecture/requirements → schema → JPA entities → APIs/DTOs → reservation/payment → state machine → security → Redis caching → rate limiting → idempotency → transactions/locking → outbox → Kafka → webhooks → microservices/gateway → load testing. Don't jump ahead unless he asks.
 
-**Current position:** entities and migrations are done in all four services; Inventory's `reserve` is implemented, tested, raced and load-run on one laptop (p99 target met at 100 buyers/s, not met at 500 buyers/s; the 5,000-concurrent target is not reached); nothing else is built beyond the Day-1 repositories. Details in `architecture.md` §8 (which wins over this line).
+**Current position:** entities and migrations are done in all four services; Inventory's `reserve` is implemented, tested, raced and load-run on one laptop (p99 target met at 100 buyers/s, not met at 500 buyers/s; the 5,000-concurrent target is not reached); nothing else is built beyond the Day-1 repositories. `docker-compose.yml` is written and config-validated, not started. Details in `architecture.md` §8 (which wins over this line).
 
 **Ports:** gateway `8080` (reserved), identity `8081`, inventory `8082`, order `8083`, notification `8084`. One shared `DB_USERNAME`/`DB_PASSWORD` pair, one separate database per service.
 
 ## Open decisions (stop and decide together)
 
-1. **Locking strategy for `flash_sale_items`: decided** (designed only, not built, not load-tested). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction". Build no retry/backoff around `@Version`.
+1. **Locking strategy for `flash_sale_items`: decided** (implemented, tested, raced; load-measured on one laptop only; see `architecture.md` §8). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction". Build no retry/backoff around `@Version`.
 2. **Isolation level** on the same write path: **decided** (READ COMMITTED), same entry as (1).
 3. **The `reserve` write path: decided**, same entry as (1). Do not re-open it by default; the `WHERE version = ?` form is rejected as the reserve path.
 4. **Derived deadlines and leases** (see design rules), blocked on Feign/Resilience4j config. Pool size and the `lock_timeout` / `statement_timeout` / connection-wait values are open too and come from the load test.

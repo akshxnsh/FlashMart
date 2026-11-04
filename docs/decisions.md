@@ -13,9 +13,10 @@
 > persistence-tested against real Postgres; and Inventory's reserve HTTP
 > contract (DTOs, validation, error mapping), implemented and tested at the
 > HTTP layer with the service mocked. `architecture.md` §8 is the status source
-> of truth. No `reserve` logic, repositories, other controllers, Kafka, Redis or
-> security code exists, and nothing is load-tested — every decision about
-> those remains *designed*.
+> of truth. As of 2026-10-22, no `reserve` logic, repositories, other
+> controllers, Kafka, Redis or security code existed and nothing was
+> load-tested; `reserve` and the Day-1 repositories have since been built (see
+> `architecture.md` §8). Kafka, Redis and security remain *designed*.
 
 ---
 
@@ -4296,8 +4297,10 @@ open. All of it had to be settled before `reserve` is built.
 4. Pessimistic `FOR UPDATE`, a Redis lock, a Redis counter, or a queue.
 
 **Chosen Approach:**
-Option 1. **Status: DESIGNED ONLY. Not built, not tested, no performance
-numbers.**
+Option 1. **Status: implemented in `ReservationServiceImpl` /
+`ReservationTransaction`, tested single-threaded and raced in a contention
+test; load-measured on one laptop (first baseline only, not the 5,000-concurrent
+target). See `architecture.md` §8 for what was and was not exercised.**
 1. **Isolation:** READ COMMITTED (Postgres default, no config change).
 2. **Decrement:** one native `UPDATE`:
    `SET available_stock = available_stock - :qty, version = version + 1
