@@ -4253,6 +4253,27 @@ queries in a repository, not built in this piece).
   (the stale status is not dirty, so it is not written). The silent-ignore test
   is the one that guards `updatable = false`.
 
+**Amendment (2026-11-03, after the tests were run): `@DynamicUpdate` removed,
+set-once columns locked.**
+The two Consequences bullets above ("written, not run" and "break-and-restore
+not done yet") are superseded by this amendment.
+- The tests were run and break-and-restore was done. Of the six original guards,
+  five were killed by a named test. The survivor was `@DynamicUpdate`: removing
+  it failed nothing, because the columns left writable (`orders.buyer_id`,
+  `flash_sale_id`, `idempotency_key`, `failure_detail`; `refunds.order_id`,
+  `payment_ref`, `amount`) never change after insert, so it protected nothing.
+  It is removed from `Order` and `Refund`.
+- `buyer_id`, `flash_sale_id`, `idempotency_key` (`Order`) and `order_id`,
+  `payment_ref`, `amount` (`Refund`) are now `updatable = false` as well. They
+  are written once by `INSERT`. Left writable, a stale entity flushed for
+  another field would rewrite them with stale values.
+- After this, `Order.failure_detail` is the only column an entity `save()` can
+  write. `Refund` has no writable column at all.
+- Each of the six new `updatable = false` is killed by its own test (a setter on
+  a managed entity, flush, native read-back, value unchanged). The option list
+  above is unchanged; the chosen approach is now option 1 without
+  `@DynamicUpdate`.
+
 ---
 
 ## Open Items (not yet decided or not yet built)

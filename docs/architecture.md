@@ -577,18 +577,29 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   so nothing yet writes a CAS. **A1:** the CAS-owned columns of `Order`
   (`status`, `amount`, `payment_ref`, `expires_at`, `payment_reconciled_at`) and
   `Refund` (`status`, `attempts`, `next_retry_at`, `claimed_at`, `last_error`) are
-  `updatable = false` and both entities are `@DynamicUpdate`: implemented, tests
-  written, **NOT yet run**.
+  `updatable = false`, as are the set-once columns `Order.buyer_id`,
+  `flash_sale_id`, `idempotency_key` and `Refund.order_id`, `payment_ref`,
+  `amount`; `@DynamicUpdate` was removed (it protected nothing). Only
+  `Order.failure_detail` is writable by `save()`; `Refund` has no writable
+  column. Implemented and **run on 2026-11-03**; break-and-restore done: 5 of
+  the 6 original guards were killed, `@DynamicUpdate` was the survivor and was
+  removed, and each of the six set-once columns is killed by a named test.
+  **Test totals:** 260 passing before this change (Order 121, Inventory 63,
+  Identity 47, Notification 29, measured on 2026-11-03); Order is now 127, so
+  266 in total (the other three services were not re-run after the change).
   **Day-1 repositories:** `OrderRepository` has one native compare-and-set per
   transition (set amount, `CREATED` to `RESERVATION_FAILED` / `PAYMENT_UNAVAILABLE`,
   `CREATED` or `PENDING_PAYMENT` to `ORDER_EXPIRED` with no time condition,
   `PENDING_PAYMENT` to `PAID` only for the held `payment_ref`, `PENDING_PAYMENT`
   to `PAYMENT_FAILED`), plus two finders; written with winner/loser tests,
-  **NOT yet run**. **Deliberately not built, blocked on B5 and the derived
+  **run on 2026-11-03** (part of the 260-test pass above). Break-and-restore on
+  three of the CAS guards (`markPaid`'s `payment_ref` condition,
+  `markReservationFailed`'s `CREATED` condition, `expire`'s status guard) was
+  killed by a test each. **Deliberately not built, blocked on B5 and the derived
   deadlines:** `CREATED` to `PENDING_PAYMENT` (it stamps `expires_at` from a
   database clock). Inventory has finder-only repositories (`FlashSale`,
-  `FlashSaleItem`, `StockReservation`), written with finder tests, **NOT yet
-  run**; no stock decrement, `@Lock` or retry exists (open decisions 1 to 3).
+  `FlashSaleItem`, `StockReservation`), written with finder tests, **run on
+  2026-11-03** (part of the 260-test pass above); no stock decrement, `@Lock` or retry exists (open decisions 1 to 3).
   **Seed scripts** (`scripts/seed/`: Identity, Inventory, Notification seeds, a
   reset for Inventory and Order, `seed.sh`, a README): **written, NOT yet run**.
   Checked by reading against the migrations only.
@@ -778,8 +789,9 @@ or "recorded, not decided" still need a design decision.
   alone on purpose, each waits for a decision. None is built or tested:
   - **A1:** entity updatability and `@DynamicUpdate`. **Decided** (see
     `decisions.md`, "CAS-owned columns are insert-only in the entities"):
-    implemented, tests written, **NOT yet run** (no Postgres on the machine
-    it was written on); break-and-restore not done.
+    implemented, **run on 2026-11-03**, break-and-restore done; later amended
+    (`@DynamicUpdate` removed, six set-once columns locked, see the amendment
+    in `decisions.md`).
   - **A2:** `refunds.next_retry_at` NULL handling and the refund claim query.
     Not decided.
   - **A3:** redesign of the sweep and refund indexes. Not decided.
