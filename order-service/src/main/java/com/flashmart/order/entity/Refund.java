@@ -12,7 +12,6 @@ import jakarta.persistence.UniqueConstraint;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
-import org.hibernate.annotations.DynamicUpdate;
 import org.hibernate.annotations.Generated;
 import org.hibernate.generator.EventType;
 
@@ -29,13 +28,13 @@ import java.time.Instant;
  * CAS-owned columns (status, attempts, next_retry_at, claimed_at, last_error)
  * are updatable = false: the worker's claim and its claimed_at-fenced finishing
  * write are raw SQL, and a stale entity save must not undo them. order_id,
- * payment_ref and amount are left as they are (not touched by this piece).
+ * payment_ref and amount are set once at insert and never change, so they are
+ * updatable = false too: no column of a Refund can be written by an entity save.
  */
 @Entity
 @Table(name = "refunds", uniqueConstraints = {
         @UniqueConstraint(name = "uk_refunds_payment_ref", columnNames = {"payment_ref"})
 })
-@DynamicUpdate
 @Getter
 @Setter
 @NoArgsConstructor
@@ -45,7 +44,7 @@ public class Refund {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "order_id", nullable = false)
+    @Column(name = "order_id", nullable = false, updatable = false)
     private Long orderId;
 
     /**
@@ -54,11 +53,11 @@ public class Refund {
      * correct — but each is refunded once, and this is what makes a
      * redelivered webhook lose instead of refunding twice.
      */
-    @Column(name = "payment_ref", nullable = false)
+    @Column(name = "payment_ref", nullable = false, updatable = false)
     private String paymentRef;
 
     /** The webhook's reported amount: what was captured, not what we think. */
-    @Column(name = "amount", nullable = false, precision = 14, scale = 2)
+    @Column(name = "amount", nullable = false, precision = 14, scale = 2, updatable = false)
     private BigDecimal amount;
 
     @Enumerated(EnumType.STRING)

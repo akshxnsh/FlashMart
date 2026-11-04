@@ -12,7 +12,6 @@ import jakarta.persistence.UniqueConstraint;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
-import org.hibernate.annotations.DynamicUpdate;
 import org.hibernate.annotations.Generated;
 import org.hibernate.generator.EventType;
 
@@ -42,13 +41,14 @@ import java.time.Instant;
  * flushed for an unrelated field would write every column and overwrite a
  * winning CAS (e.g. the sweep's ORDER_EXPIRED). Setters on them are silently
  * ignored after insert; OrderCasOwnedColumnsTest guards that.
- * @DynamicUpdate makes the remaining UPDATEs name only changed columns.
+ * buyer_id, flash_sale_id and idempotency_key are set once at insert and never
+ * change, so they are updatable = false too; only failure_detail can still be
+ * written by an entity save.
  */
 @Entity
 @Table(name = "orders", uniqueConstraints = {
         @UniqueConstraint(name = "uk_orders_buyer_id_idempotency_key", columnNames = {"buyer_id", "idempotency_key"})
 })
-@DynamicUpdate
 @Getter
 @Setter
 @NoArgsConstructor
@@ -59,11 +59,11 @@ public class Order {
     private Long id;
 
     /** Identity owns this row, so it is a plain id with no foreign key. */
-    @Column(name = "buyer_id", nullable = false)
+    @Column(name = "buyer_id", nullable = false, updatable = false)
     private Long buyerId;
 
     /** Inventory owns this row. Order-level: one order is one brand's sale. */
-    @Column(name = "flash_sale_id", nullable = false)
+    @Column(name = "flash_sale_id", nullable = false, updatable = false)
     private Long flashSaleId;
 
     /**
@@ -78,7 +78,7 @@ public class Order {
     @Column(name = "status", nullable = false, length = 20, updatable = false)
     private OrderStatus status;
 
-    @Column(name = "idempotency_key", nullable = false)
+    @Column(name = "idempotency_key", nullable = false, updatable = false)
     private String idempotencyKey;
 
     /**
