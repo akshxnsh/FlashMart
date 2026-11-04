@@ -768,6 +768,74 @@ was KO. The tool did not count responses by outcome; `RESERVED` below comes from
   3,324 of them never did. One run per size, one machine, one JVM; the numbers
   are not repeated and not compared across configurations.
 
+**Second load run** (2026-11-05, branch `test/load-measurement`, Gatling 3.16.0).
+Same laptop, same machine running the load tool, Inventory and Postgres
+together, default connection pool and timeouts. **Still a first-baseline setup,
+NOT a controlled target run.** What changed against the first load run:
+- Inventory ran as the **packaged jar** (`java -jar`, Java 25.0.2, no JVM flags),
+  not `spring-boot:run` (which had added `-XX:TieredStopAtLevel=1`).
+- A **warm-up** ran first: 200 buyers on product 2 (orders from 9,000,000),
+  ramped over 5 s, request named `warmup`. 200 of 200 were OK in all four runs.
+  The measured scenario started after it finished. The numbers below are the
+  `reserve` request only; the warm-up is not in them.
+- Buyers **arrive over a ramp** (`rampSeconds`, 10 s) in (a) and (b); (c) sends
+  all at once, as run 1 did.
+- Databases reseeded and the jar **restarted before every run** (run 1 reused
+  one JVM).
+- `sample-waits.sh` sampled `pg_stat_activity` for active sessions of the
+  inventory database about every 500 ms (each sample opens a new connection, so
+  the real gap is longer).
+
+Response times are OK-only (answered requests). Requests/s is Gatling's mean
+count/s for `reserve`; it includes the ramp, so it is not a capacity figure.
+
+| Run | Buyers, ramp | OK / KO | p50 / p95 / p99 / max (ms) | Req/s (OK) | RESERVED / OUT_OF_STOCK / other |
+|---|---|---|---|---|---|
+| (a) first attempt | 1,000, 10 s | 1,000 / 0 | 7 / 11 / 13 / 25 | 66.67 | 500 / 500 / 0 |
+| (a) repeated | 1,000, 10 s | 1,000 / 0 | 9 / 23 / 89 / 200 | 66.67 | 500 / 500 / 0 |
+| (b) | 5,000, 10 s | 4,733 / 267 | 2670 / 8241 / 9404 / 10847 | 215.14 | 500 / 4,233 / 0 |
+| (c) | 5,000, all at once | 3,449 / 1,551 | 6950 / 11225 / 11603 / 11672 | 191.61 | 500 / 2,949 / 0 |
+
+(a) was run twice because the first attempt's sampler wrote nothing when no
+session was active, so its sample count was unknowable; the sampler was fixed
+and (a) repeated. Both are listed. Outcomes are counted by the tool from the
+response body, for OK responses only.
+
+- **`verify.sh` exit 0 after every run:** `available_stock` 0, `version` 500, 500
+  reservations, `sum(quantity)` 500, 500 `RESERVED` rows. 1,000 buyers on 500
+  units in (a) and 5,000 in (b) and (c) left no oversell visible in the
+  database. Inventory logged no `ERROR` line in any run.
+- **`Connection refused` did not recur in (a)** (0 KO, both attempts). **It
+  recurred in (b): 267 of 5,000 (5.3%), and in (c): 1,551 of 5,000 (31.0%).** It
+  was the only KO message in both: `j.n.ConnectException: Connection refused:
+  getsockopt`. Against run 1, the same message hit 691 of 1,000 and 3,324 of
+  5,000 buyers.
+- **Response times of KO requests** are the time to the refusal. For all
+  requests (OK and KO) p50 / p95 / p99 / max were 2706 / 8126 / 9393 / 10847 in
+  (b) and 7709 / 11216 / 11561 / 11672 in (c).
+- **Against the target:** in (b) and (c) the OK-only p99 was 9,404 ms and
+  11,603 ms, far above the 500 ms target, with 5.3% and 31.0% of buyers
+  refused. These runs did not meet the target in this setup.
+- **Database waits:** (a) repeated took 28 samples, 27 with no active session,
+  and saw one `Lock/transactionid` and one `Client/ClientRead`; (b) 22 samples,
+  20 with none, one `none/none` (active, no wait) and one `Client/ClientRead`;
+  (c) 23 samples, all with none. (The first (a) attempt kept no sample count; it
+  saw one `Lock/transactionid` and one `IO/WalWrite`.) So when sampled, almost
+  no session was active in Postgres. The sampler can miss waits shorter than its
+  interval, and the reserve transaction is short.
+- **Hypotheses, not shown by these runs:** (1) the large drop from run 1 to (a)
+  (69% refused and about 2 s p50 against 0 refused and 9 ms) came from some mix
+  of the jar versus `spring-boot:run`, the warm-up and the ramp; the runs did
+  not vary them one at a time, so none of the three is singled out. (2) The
+  refusals in (b) and (c) may come from many connections arriving faster than
+  Inventory accepts them (for example a full accept queue), since the refusals
+  were refusals to connect and the database was mostly idle; the accept queue
+  and Tomcat and pool limits were not inspected or changed. (3) The
+  multi-second times in (b) and (c) may be queueing before the database for the
+  same reason. Each needs its own measurement before it is believed.
+- **Not done:** one run per configuration (apart from (a)), one machine, no
+  repeat of (b) or (c), nothing changed in Inventory's pool, Tomcat or timeouts.
+
 **Status of `reserve`:** implemented, tested single-threaded, and raced in the
 contention tests above. A first baseline load run exists (see "First load run"),
 but the 5,000-buyer / p99 target is still unmeasured. Not verified under
