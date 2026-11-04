@@ -5,10 +5,10 @@ import com.flashmart.inventory.dto.reserve.ReserveResponse;
 import com.flashmart.inventory.exception.QuantityMismatchException;
 
 /**
- * Reserves stock for one order item. Contract only: the only bean is
- * {@link NotImplementedReservationService}, which throws, because the write
- * path, locking strategy and isolation level are open decisions
- * (architecture.md §9).
+ * Reserves stock for one order item. Implemented by
+ * {@link ReservationServiceImpl}; the write path (READ COMMITTED, one atomic
+ * conditional UPDATE, one short transaction) is decided in decisions.md,
+ * "Reserve write path".
  *
  * <p>Evaluation order is part of the contract:
  * <ol>
@@ -28,7 +28,9 @@ import com.flashmart.inventory.exception.QuantityMismatchException;
  *
  * <p>When two first calls for the same {@code (orderId, item)} race, the loser
  * must end on the replay path, never with an error, and its stock change must
- * not survive. The mechanism depends on the open write-path decision.
+ * not survive. The mechanism: the unique violation rolls the loser back
+ * before it touches stock, and {@link ReservationServiceImpl} re-reads in a
+ * fresh transaction.
  *
  * <p>Business outcomes are returned, never thrown; only
  * {@link QuantityMismatchException} leaves this method on purpose.
