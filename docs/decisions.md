@@ -828,6 +828,10 @@ what makes it possible for a `reserve()` call to return the order's `brand_id`
 > database clock. Under READ COMMITTED those differ sharply (see Open Items:
 > "The reserve write path is specified two different ways"). Read the
 > Consequences here as one candidate, not the decision.
+>
+> **Third note (2026-11-04) - decided elsewhere.** The reserve write path is
+> now decided in "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction": the `WHERE version = ?` form is rejected as the reserve
+> path. `version` stays for entity saves.
 
 **Context / Problem:**
 The PRD carried `version` on `stock_reservations` as a placeholder without
@@ -4276,6 +4280,80 @@ not done yet") are superseded by this amendment.
 
 ---
 
+## Decision: Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction
+
+**Context / Problem:**
+Thousands of buyers race for a small fixed stock on one hot `flash_sale_items`
+row. Two entries specified the decrement incompatibly (`WHERE id = ? AND
+version = ?` versus one statement checking `available_stock` and liveness
+against the database clock), and the isolation level and locking strategy were
+open. All of it had to be settled before `reserve` is built.
+
+**Options Considered:**
+1. READ COMMITTED with one atomic conditional `UPDATE` (the Postgres default).
+2. REPEATABLE READ or SERIALIZABLE.
+3. The `WHERE version = ?` form as the reserve path.
+4. Pessimistic `FOR UPDATE`, a Redis lock, a Redis counter, or a queue.
+
+**Chosen Approach:**
+Option 1. **Status: DESIGNED ONLY. Not built, not tested, no performance
+numbers.**
+1. **Isolation:** READ COMMITTED (Postgres default, no config change).
+2. **Decrement:** one native `UPDATE`:
+   `SET available_stock = available_stock - :qty, version = version + 1
+   WHERE id = :id AND available_stock >= :qty AND <liveness by DB clock>`.
+   1 row = reserved. 0 rows = classify: not live first (`SALE_NOT_LIVE`), else
+   `OUT_OF_STOCK`. The version bump is required by the raw-SQL rule and is
+   free; `@Version` stays for entity saves.
+3. **One short transaction:** replay check, then insert the reservation, then
+   the stock `UPDATE` last, then commit. 0 rows rolls back the insert. No
+   network call inside the transaction.
+4. **Idempotency:** the replay check, then `UNIQUE(order_id,
+   flash_sale_item_id)`. Two concurrent duplicates: the second waits on the
+   unique index; if the first commits, the second gets a unique violation
+   before touching stock; reserve catches it, re-reads in a fresh transaction
+   and returns the stored result, never a 500.
+5. **Clock:** `now()` (transaction start) decides liveness and `reserved_at`.
+   Rule: live when the transaction began plus stock remaining means the buyer
+   gets the unit. A purchase may commit after `end_time` by up to the lock
+   wait, so the wait must be bounded by `lock_timeout`. This settles the clock
+   choice for reserve; `clock_timestamp()` stays for Identity's trigger and
+   Order's DB-stamped columns.
+6. **Pool and timeouts:** small fixed pool; every wait bounded (connection
+   wait, `lock_timeout`, `statement_timeout`); no infinite waits. No such
+   config exists today (defaults). The numbers come from the load test, not
+   picked, and feed Order's Feign timeout and the `CREATED` deadline.
+7. **Not chosen:** pessimistic `FOR UPDATE`, Redis lock, Redis counter, queue,
+   SERIALIZABLE. A Redis counter or queue in front is the fallback if the load
+   test misses the NFR.
+8. **Many instances:** correctness lives in the database (row lock, atomic
+   `UPDATE`, unique key, DB clock), so it holds. Limits: the single hot row,
+   and instances x pool size under Postgres `max_connections`.
+
+**Why:**
+- REPEATABLE READ / SERIALIZABLE: a frozen snapshot goes stale, and Postgres
+  aborts a write to a row changed after the snapshot, so the hot row would
+  give a retry storm.
+- Under READ COMMITTED a blocked `UPDATE` re-checks its `WHERE` against the
+  newly committed row, so no retry is needed. The `WHERE version = ?` form is
+  rejected as the reserve path.
+
+**Trade-offs:**
+- "Insert first" in (3) is reasoning, **NOT measured**: the reservation FK to
+  the hot `flash_sale_items` row takes a shared lock on the parent (it does not
+  block the non-key `UPDATE`) and may add MultiXact overhead. The load test
+  must compare insert-first vs update-first.
+- A purchase may commit after `end_time` by up to the lock wait (see 5).
+
+**Consequences:**
+- First tests: two threads same order id; two buyers on the last unit;
+  liveness boundary; replay after the sale ended; concurrent duplicate gives
+  one decrement.
+- Pool size and timeout values come from load testing (Open Items).
+- Insert-first vs update-first is measured in the load test (Open Items).
+
+---
+
 ## Open Items (not yet decided or not yet built)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -4315,14 +4393,19 @@ is closed by a reconciliation sweep"), and, in
   stale-claim lease — plus the Order sweep interval and the payment window.
   Blocked on the Feign/Resilience4j timeout configuration by design, not by
   oversight.
-- **Locking strategy for the hot `flash_sale_items` row** — optimistic alone,
+- **DECIDED 2026-11-04: see "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction" (READ COMMITTED, one atomic conditional
+  `UPDATE`; no pessimistic or Redis lock; a Redis counter or queue is the
+  fallback if the load test misses the NFR). Original text kept below.**
+  **Locking strategy for the hot `flash_sale_items` row** — optimistic alone,
   pessimistic, or Redis lock in front. To be decided and load-tested.
   **Paired with it, surfaced by the PRD review and not previously tracked
   here:** the transaction isolation level on the same write path. The two
   interact directly — optimistic locking's safety depends on what isolation
   level sits underneath it — so they should be decided together, not as two
   separate open questions.
-- **The reserve write path is specified two different ways, and they are not
+- **DECIDED 2026-11-04 (this item, and the isolation-level half of the one
+  above): see "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction". Original text kept below.**
+  **The reserve write path is specified two different ways, and they are not
   equivalent.** "Optimistic-lock `version` column on `flash_sale_items`" says
   the decrement is `... WHERE id = ? AND version = ?`; "Inventory's `reserve`
   API contract" (steps 4–5) says liveness and the stock check/decrement happen
@@ -4343,6 +4426,12 @@ is closed by a reconciliation sweep"), and, in
   an entity save of the same row can silently overwrite a concurrent decrement
   with a stale in-memory `available_stock`; any raw SQL must do
   `version = version + 1` itself.
+- **Pool size and timeout values come from load testing.** Connection pool
+  size, connection wait, `lock_timeout` and `statement_timeout` for reserve are
+  not picked; they feed Order's Feign timeout and the `CREATED` deadline. See
+  "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
+- **Insert-first vs update-first in reserve is to be measured.** The load test
+  must compare them. See "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
 - **A backfill republish for the contact caches (designed, not built).**
   Nothing re-sends `BrandUpserted`/`UserUpserted` for brands and buyers that
   existed before Notification was deployed, so their cache rows are absent and
@@ -4351,7 +4440,11 @@ is closed by a reconciliation sweep"), and, in
   deployment step. No schema change fixes it, and a synchronous fallback to
   Identity on a cache miss would undo the reason the cache exists. Kafka phase.
 - **Two database clock functions are in use for the same job (recorded, not
-  decided).** `stock_reservations.reserved_at` defaults to `now()`, which is
+  decided; the reserve part is DECIDED 2026-11-04 in "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction": `now()` decides
+  liveness and `reserved_at` for reserve, `clock_timestamp()` stays for
+  Identity's trigger and Order's DB-stamped columns. Still open for any other
+  "compared against `now()`" column, and for B5.)**
+  `stock_reservations.reserved_at` defaults to `now()`, which is
   `transaction_timestamp()` — the moment the transaction *began*. Identity's
   `bump_updated_at` trigger and every DB-stamped column in Order use
   `clock_timestamp()`, the moment the *statement* runs. Neither is a bug, and

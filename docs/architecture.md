@@ -212,7 +212,7 @@ flash_sale_items(id, flash_sale_id, product_id, sale_price,
   --   it on insert (3999.005::numeric(12,2) = 3999.01, measured)
   -- total_stock fixed (reporting); available_stock is the decremented counter
   -- version: optimistic lock — the contended row under concurrent decrement
-  -- OPEN: optimistic alone vs. pessimistic vs. Redis lock — decide + load-test
+  -- DECIDED (designed only, not built): see decisions.md, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction"
 
 stock_reservations(id, order_id, flash_sale_item_id, quantity, status, reserved_at)
   -- UNIQUE(order_id, flash_sale_item_id) — idempotent reserve on retry
@@ -698,9 +698,10 @@ or "recorded, not decided" still need a design decision.
 - Settle the two derived deadlines (`CREATED`, refund claim lease), the
   Order sweep interval, and the payment window — blocked on real
   Feign/Resilience4j config by design.
-- Decide the locking strategy for `flash_sale_items` — optimistic alone,
-  pessimistic, or Redis — and load-test it. Paired with it: the transaction
-  isolation level on the same write path, undecided until now.
+- **Locking strategy and isolation level for `flash_sale_items`: decided**
+  (designed only, not built, not load-tested). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
+  Pool size and timeout values, and insert-first vs update-first, come from
+  the load test.
 - **Inventory's time columns are `TIMESTAMPTZ` — done (V6), recorded here
   because it constrains `reserve`.** `flash_sales.start_time`/`end_time`,
   `stock_reservations.reserved_at` and `products`' audit columns were zone-less
@@ -733,7 +734,8 @@ or "recorded, not decided" still need a design decision.
   UPDATE unblocks and needs no retry; a `version = ?` clause fails after any
   concurrent write. A native `UPDATE` also does not bump `version`, so mixing
   it with an entity save can silently clobber a decrement. Must be settled
-  before `reserve` is built; recorded, not decided.
+  before `reserve` is built. **Decided** (designed only): see `decisions.md`,
+  "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
 - Enforce "frozen once the sale opens" (price, `total_stock`, times,
   cancellation) in the service layer, against the database clock, in the same
   transaction as the write. A CHECK cannot express it. Not built.
