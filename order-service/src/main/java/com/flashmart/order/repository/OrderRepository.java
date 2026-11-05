@@ -94,18 +94,30 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     int expire(@Param("id") Long id, @Param("expectedStatus") String expectedStatus);
 
     /**
-     * {@code PENDING_PAYMENT -> PAID}, only for the payment this order holds.
-     * A webhook for any other reference matches nothing, and the handler then
-     * refunds it (one-payment invariant).
+     * {@code PENDING_PAYMENT -> PAID}, only for the payment this order holds
+     * AND only for the amount it costs (decisions.md, "Day 6", points 2 and 3).
+     * A webhook for any other reference, or for a different amount, matches
+     * nothing, and the handler then refunds it (one-payment invariant).
+     *
+     * <p>{@code amount} is compared as a {@code NUMERIC}, never as text, so
+     * {@code 499} equals {@code 499.00}.
      */
     @Modifying
     @Query(value = "UPDATE orders SET status = 'PAID' "
-            + "WHERE id = :id AND status = 'PENDING_PAYMENT' AND payment_ref = :paymentRef",
+            + "WHERE id = :id AND status = 'PENDING_PAYMENT' AND payment_ref = :paymentRef "
+            + "AND amount = :amount",
             nativeQuery = true)
-    int markPaid(@Param("id") Long id, @Param("paymentRef") String paymentRef);
+    int markPaid(@Param("id") Long id, @Param("paymentRef") String paymentRef,
+                 @Param("amount") BigDecimal amount);
 
+    /**
+     * {@code PENDING_PAYMENT -> PAYMENT_FAILED}, only for the payment this order
+     * holds: a {@code FAILED} for some other payment {@code Y} must not fail an
+     * order that is waiting on {@code X} (decisions.md, "Day 6", point 2).
+     */
     @Modifying
     @Query(value = "UPDATE orders SET status = 'PAYMENT_FAILED' "
-            + "WHERE id = :id AND status = 'PENDING_PAYMENT'", nativeQuery = true)
-    int markPaymentFailed(@Param("id") Long id);
+            + "WHERE id = :id AND status = 'PENDING_PAYMENT' AND payment_ref = :paymentRef",
+            nativeQuery = true)
+    int markPaymentFailed(@Param("id") Long id, @Param("paymentRef") String paymentRef);
 }
