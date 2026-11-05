@@ -1,6 +1,8 @@
 package com.flashmart.order.controller;
 
+import com.flashmart.order.TestPayments;
 import com.flashmart.order.client.inventory.InventoryClient;
+import com.flashmart.order.client.payment.PaymentGatewayClient;
 import com.flashmart.order.client.inventory.ReserveOutcome;
 import com.flashmart.order.client.inventory.ReserveResponse;
 import org.junit.jupiter.api.AfterEach;
@@ -47,6 +49,15 @@ class OrderControllerTest {
 
     @MockitoBean
     private InventoryClient inventory;
+
+    /** Accepts every initiate; the payment step's own behaviour is tested in OrderPaymentStepTest. */
+    @MockitoBean
+    private PaymentGatewayClient gateway;
+
+    @org.junit.jupiter.api.BeforeEach
+    void gatewayAcceptsEverything() {
+        TestPayments.acceptEverything(gateway);
+    }
 
     @AfterEach
     void cleanUp() {
@@ -153,13 +164,16 @@ class OrderControllerTest {
     }
 
     @Test
-    void aValidOrderIs201WithItsIdAndStatus() throws Exception {
+    void aValidOrderIs201PendingPaymentWithRefAmountAsStringAndExpiry() throws Exception {
         given(inventory.reserve(any())).willReturn(new ReserveResponse(
                 ReserveOutcome.RESERVED, 1L, new BigDecimal("100.00"), 3L, "Suede"));
 
         create("k1", BUYER + 1, body(item(11, 1)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.orderId").isNumber())
-                .andExpect(jsonPath("$.status").value("CREATED"));
+                .andExpect(jsonPath("$.status").value("PENDING_PAYMENT"))
+                .andExpect(jsonPath("$.amount").value("149.00")) // a JSON string: 100.00 + 49.00 fee
+                .andExpect(jsonPath("$.paymentRef").value(org.hamcrest.Matchers.startsWith("pay_order-")))
+                .andExpect(jsonPath("$.expiresAt").isString());
     }
 }

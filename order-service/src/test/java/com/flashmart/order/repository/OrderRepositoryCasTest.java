@@ -146,18 +146,83 @@ class OrderRepositoryCasTest {
     void markPaymentUnavailableWinsFromCreated() {
         Long id = orderIn(OrderStatus.CREATED);
 
-        assertEquals(1, orders.markPaymentUnavailable(id));
+        assertEquals(1, orders.markPaymentUnavailable(id, "payment gateway unavailable"));
 
         assertEquals("PAYMENT_UNAVAILABLE", statusOf(id));
+        assertEquals("payment gateway unavailable", failureDetailOf(id));
     }
 
     @Test
     void markPaymentUnavailableLosesFromAnyOtherStatus() {
         Long id = orderIn(OrderStatus.ORDER_EXPIRED); // the sweep got there first
 
-        assertEquals(0, orders.markPaymentUnavailable(id));
+        assertEquals(0, orders.markPaymentUnavailable(id, "x"));
 
         assertEquals("ORDER_EXPIRED", statusOf(id));
+        assertEquals(null, failureDetailOf(id)); // the loser writes nothing
+    }
+
+    @Test
+    void markPaymentUnavailableLosesToAPendingPaymentOrder() {
+        Long id = orderIn(OrderStatus.PENDING_PAYMENT); // a same-key request started the payment first
+
+        assertEquals(0, orders.markPaymentUnavailable(id, "x"));
+
+        assertEquals("PENDING_PAYMENT", statusOf(id));
+    }
+
+    // ---- CREATED -> PENDING_PAYMENT ----
+
+    private Long pricedCreatedOrder() {
+        Long id = orderIn(OrderStatus.CREATED);
+        orders.setAmount(id, new BigDecimal("59.00"));
+        return id;
+    }
+
+    private double secondsUntilExpiry(Long id) {
+        return ((Number) entityManager.createNativeQuery(
+                        "select extract(epoch from expires_at - clock_timestamp()) from orders where id = :id")
+                .setParameter("id", id).getSingleResult()).doubleValue();
+    }
+
+    @Test
+    void markPendingPaymentSetsStatusRefAndDeadlineInOneStatement() {
+        Long id = pricedCreatedOrder();
+
+        assertEquals(1, orders.markPendingPayment(id, "pay_order-1", 360.0)); // one call, one UPDATE
+
+        assertEquals("PENDING_PAYMENT", statusOf(id));
+        assertEquals("pay_order-1", paymentRefOf(id));
+        double left = secondsUntilExpiry(id);
+        assertTrue(left > 355 && left <= 360, "expires in " + left + " s; want the 360 s window on the DB clock");
+    }
+
+    @Test
+    void markPendingPaymentLosesToASecondRequest() {
+        Long id = pricedCreatedOrder();
+        assertEquals(1, orders.markPendingPayment(id, "pay_order-1", 360.0));
+        double before = secondsUntilExpiry(id);
+
+        assertEquals(0, orders.markPendingPayment(id, "pay_other", 360.0));
+
+        assertEquals("pay_order-1", paymentRefOf(id)); // the winner's ref is kept
+        assertTrue(secondsUntilExpiry(id) <= before, "the loser must not push the deadline out");
+    }
+
+    /**
+     * The sweep expired the order while the gateway call was in flight. The
+     * order has an amount, so V2's amount CHECK cannot stop the write: only the
+     * status guard can (an expired order must never come back to life).
+     */
+    @Test
+    void markPendingPaymentLosesToTheExpirySweep() {
+        Long id = pricedCreatedOrder();
+        assertEquals(1, orders.expire(id, "CREATED"));
+
+        assertEquals(0, orders.markPendingPayment(id, "pay_order-1", 360.0));
+
+        assertEquals("ORDER_EXPIRED", statusOf(id));
+        assertEquals(null, paymentRefOf(id));
     }
 
     // ---- expire (CREATED or PENDING_PAYMENT -> ORDER_EXPIRED) ----

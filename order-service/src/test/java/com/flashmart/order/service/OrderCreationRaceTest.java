@@ -1,6 +1,8 @@
 package com.flashmart.order.service;
 
+import com.flashmart.order.TestPayments;
 import com.flashmart.order.TestRows;
+import com.flashmart.order.client.payment.PaymentGatewayClient;
 import com.flashmart.order.client.inventory.InventoryClient;
 import com.flashmart.order.client.inventory.ReserveOutcome;
 import com.flashmart.order.client.inventory.ReserveResponse;
@@ -37,8 +39,11 @@ import static org.mockito.Mockito.clearInvocations;
  * database, not only on return values. Every round's problems are collected,
  * so a failure reports how many rounds broke.
  *
- * <p>Inventory is a mock at the Feign interface: these races exercise Order's
- * unique indexes and conflict handling, not a real Inventory.
+ * <p>Inventory and the payment gateway are mocks at their Feign interfaces
+ * (the gateway returns {@code "pay_" + key}, as an idempotent gateway would):
+ * these races exercise Order's unique indexes, conflict handling and CAS, not
+ * a real Inventory or a real gateway. The real retry and breaker sit in front
+ * of the gateway mock.
  *
  * <p>NOT {@code @Transactional}. Buyers 6000..6999 belong to this class; each
  * round's rows are deleted in a {@code finally}.
@@ -59,12 +64,16 @@ class OrderCreationRaceTest {
     @MockitoBean
     private InventoryClient inventory;
 
+    @MockitoBean
+    private PaymentGatewayClient gateway;
+
     private long nextBuyer = FROM;
 
     @BeforeEach
     void inventoryReservesEverything() {
         given(inventory.reserve(any())).willAnswer(inv -> new ReserveResponse(
                 ReserveOutcome.RESERVED, 1L, new BigDecimal("10.00"), 3L, "Product"));
+        TestPayments.acceptEverything(gateway);
     }
 
     @AfterEach
@@ -122,12 +131,14 @@ class OrderCreationRaceTest {
      *
      * <p>Asserts: exactly one order row; both answers carry the same order id;
      * one is a new order (201) and one a replay (200); neither is an error.
-     * After the reserve loop exists, the loser finds the order CREATED and
-     * before its deadline and resumes the loop alongside the winner, so the
-     * final state is checked as well: CREATED, every item priced once, amount
-     * = SUM(subtotal), no outbox row. How many times Inventory was called is
-     * NOT asserted (up to twice per item is allowed; Inventory's replay makes
-     * the second harmless, and Inventory here is a mock).
+     * The loser may find the order CREATED and resume alongside the winner;
+     * then both initiate with the same key ({@code order-<id>}), get the same
+     * ref, and race on the PENDING_PAYMENT CAS: one wins (201), the other loses,
+     * re-reads PENDING_PAYMENT and answers 200 with the same body. Final state
+     * checked: PENDING_PAYMENT, one payment_ref that both answers carry, every
+     * item priced once, amount = SUM(subtotal) + fee, no outbox row. How many
+     * times Inventory or the gateway was called is NOT asserted (up to twice
+     * each is allowed; the replay and the shared key make the second harmless).
      */
     @Test
     void sameKeyTwiceAtOnceGivesOneOrderAndTheLoserReplaysIt() throws Exception {
@@ -167,17 +178,22 @@ class OrderCreationRaceTest {
     }
 
     /**
-     * With the reserve loop (Inventory mocked as RESERVED, 10.00 per unit): the
-     * order is CREATED, every item priced exactly once with consistent values,
-     * amount = SUM(subtotal) + 49.00 fee = 79.00 (1 x 10.00 + 2 x 10.00), and no outbox row.
-     * Each response's amount is null or that sum.
+     * Inventory mocked as RESERVED at 10.00 per unit: the order is
+     * PENDING_PAYMENT with payment_ref {@code pay_order-<id>}, every item priced
+     * exactly once with consistent values, amount = SUM(subtotal) + 49.00 fee =
+     * 79.00 (1 x 10.00 + 2 x 10.00), and no outbox row. Every answer carries
+     * that amount and that same paymentRef.
      */
     private List<String> finalStateProblems(long buyer, List<Outcome> outcomes) {
         List<String> problems = new ArrayList<>();
         java.util.Map<String, Object> order = jdbc.queryForMap(
-                "select id, status, amount from orders where buyer_id = ?", buyer);
-        if (!"CREATED".equals(order.get("status"))) {
+                "select id, status, amount, payment_ref from orders where buyer_id = ?", buyer);
+        if (!"PENDING_PAYMENT".equals(order.get("status"))) {
             problems.add("status " + order.get("status"));
+        }
+        String ref = "pay_order-" + order.get("id");
+        if (!ref.equals(order.get("payment_ref"))) {
+            problems.add("payment_ref " + order.get("payment_ref") + " (want " + ref + ")");
         }
         long unpriced = jdbc.queryForObject("select count(*) from order_items where order_id = ? "
                 + "and (unit_price is null or subtotal <> unit_price * quantity)", Long.class, order.get("id"));
@@ -194,9 +210,18 @@ class OrderCreationRaceTest {
             problems.add(outbox + " outbox rows (want 0)");
         }
         for (Outcome o : outcomes) {
-            if (o.result() != null && o.result().body().amount() != null
-                    && o.result().body().amount().compareTo(new BigDecimal("79.00")) != 0) {
+            if (o.result() == null) {
+                continue;
+            }
+            if (o.result().body().amount() == null
+                    || o.result().body().amount().compareTo(new BigDecimal("79.00")) != 0) {
                 problems.add("a response says amount " + o.result().body().amount());
+            }
+            if (!ref.equals(o.result().body().paymentRef())) {
+                problems.add("a response says paymentRef " + o.result().body().paymentRef());
+            }
+            if (!"PENDING_PAYMENT".equals(o.result().body().status())) {
+                problems.add("a response says status " + o.result().body().status());
             }
         }
         return problems;

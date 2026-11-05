@@ -1,6 +1,8 @@
 package com.flashmart.order.service;
 
+import com.flashmart.order.TestPayments;
 import com.flashmart.order.TestRows;
+import com.flashmart.order.client.payment.PaymentGatewayClient;
 import com.flashmart.order.client.inventory.InventoryClient;
 import com.flashmart.order.client.inventory.ReserveOutcome;
 import com.flashmart.order.client.inventory.ReserveResponse;
@@ -55,6 +57,15 @@ class OrderCreationServiceTest {
 
     @MockitoSpyBean
     private OrderCreationTransaction transaction;
+
+    /** Accepts every initiate; the payment step's own behaviour is tested in OrderPaymentStepTest. */
+    @MockitoBean
+    private PaymentGatewayClient gateway;
+
+    @org.junit.jupiter.api.BeforeEach
+    void gatewayAcceptsEverything() {
+        TestPayments.acceptEverything(gateway);
+    }
 
     private long nextBuyer = FROM;
 
@@ -187,7 +198,7 @@ class OrderCreationServiceTest {
         assertEquals(HttpStatus.CONFLICT, e.getStatus());
         assertEquals(ErrorCode.ORDER_ALREADY_OPEN, e.getBody().code());
         assertEquals(id, e.getBody().orderId());
-        assertEquals("CREATED", e.getBody().status());
+        assertEquals("PENDING_PAYMENT", e.getBody().status());
         assertEquals(1, countOrders(buyer));
     }
 

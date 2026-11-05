@@ -21,8 +21,8 @@ import java.util.Optional;
  *
  * <p>These methods do not write outbox rows and do not touch the clock. The
  * service layer wraps them in the same local transaction as any outbox row.
- * Not built yet: {@code CREATED -> PENDING_PAYMENT}, which resets
- * {@code expires_at} to the payment window (payment phase).
+ * The one exception to "no clock" is {@link #markPendingPayment}, which must
+ * reset {@code expires_at} in the same statement as the status.
  *
  * <p>A native {@code UPDATE} bypasses the persistence context, so an
  * {@link Order} already loaded in the same transaction is stale afterwards.
@@ -51,10 +51,34 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             + "WHERE id = :id AND status = 'CREATED'", nativeQuery = true)
     int markReservationFailed(@Param("id") Long id, @Param("failureDetail") String failureDetail);
 
+    /**
+     * {@code CREATED -> PAYMENT_UNAVAILABLE}: no payment could be started
+     * (retries exhausted, breaker open, or the gateway refused with a 4xx).
+     * The cause goes into {@code failure_detail} in the same statement, so only
+     * the winner writes it. Same shape as {@link #markReservationFailed}.
+     */
     @Modifying
-    @Query(value = "UPDATE orders SET status = 'PAYMENT_UNAVAILABLE' "
+    @Query(value = "UPDATE orders SET status = 'PAYMENT_UNAVAILABLE', failure_detail = :failureDetail "
             + "WHERE id = :id AND status = 'CREATED'", nativeQuery = true)
-    int markPaymentUnavailable(@Param("id") Long id);
+    int markPaymentUnavailable(@Param("id") Long id, @Param("failureDetail") String failureDetail);
+
+    /**
+     * {@code CREATED -> PENDING_PAYMENT}, the payment started. ONE statement
+     * sets the status, the gateway's reference and the new deadline (the
+     * payment window, on the database clock), so there is no moment where the
+     * sweep could see PENDING_PAYMENT with the old, short CREATED deadline, or a
+     * payable order without the ref a webhook must match. V7's CHECK backs the
+     * ref, V2's CHECK the amount.
+     *
+     * <p>Losing (0 rows) means the sweep expired the order, or another request
+     * with the same key moved it first.
+     */
+    @Modifying
+    @Query(value = "UPDATE orders SET status = 'PENDING_PAYMENT', payment_ref = :paymentRef, "
+            + "expires_at = clock_timestamp() + make_interval(secs => :windowSeconds) "
+            + "WHERE id = :id AND status = 'CREATED'", nativeQuery = true)
+    int markPendingPayment(@Param("id") Long id, @Param("paymentRef") String paymentRef,
+                           @Param("windowSeconds") double windowSeconds);
 
     /**
      * {@code CREATED -> ORDER_EXPIRED} or {@code PENDING_PAYMENT -> ORDER_EXPIRED},

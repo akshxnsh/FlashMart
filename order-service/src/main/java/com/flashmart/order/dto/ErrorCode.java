@@ -19,5 +19,11 @@ public enum ErrorCode {
     /** 503: Inventory timed out, refused, or answered non-200; the order is RESERVATION_FAILED. */
     INVENTORY_UNAVAILABLE,
     /** 500: Inventory released a reservation of an order Order still holds as CREATED. */
-    INCONSISTENT_STATE
+    INCONSISTENT_STATE,
+    /** 503: no payment could be started (retries exhausted or breaker open); the order is PAYMENT_UNAVAILABLE. Retryable with a new key. */
+    PAYMENT_UNAVAILABLE,
+    /** 500: the payment gateway refused the request (4xx); the order is PAYMENT_UNAVAILABLE. Not retryable. */
+    PAYMENT_REJECTED,
+    /** 409: the order expired while its payment was being started. */
+    ORDER_EXPIRED
 }
