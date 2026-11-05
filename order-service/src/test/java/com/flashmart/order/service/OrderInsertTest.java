@@ -31,27 +31,58 @@ class OrderInsertTest {
     private JdbcTemplate jdbc;
 
     @Test
-    void maxLinesIsDerivedFromTheBlockingPolicyAndThePerCallTimeout() {
-        assertEquals(30, settings.maxLines()); // floor(60 s / 2 s)
-        assertEquals(2.0 * 3 + 5, settings.deadlineSeconds(3));
+    void maxLinesAndTheDeadlineAreDerivedFromConfig() {
+        // perReserveCall = 1 s + 2 s = 3 s; paymentBudget = 2 x (1 s + 2 s) + 0.5 s = 6.5 s
+        assertEquals(17, settings.maxLines()); // floor((60 s - 6.5 s) / 3 s)
+        assertEquals(20.5, settings.deadlineSeconds(3)); // 3 x 3 + 6.5 + 5
+        assertEquals(62.5, settings.deadlineSeconds(17)); // 17 x 3 + 6.5 + 5
     }
 
     @Test
-    void theDeadlineIsPerCallTimeoutTimesLinesPlusMarginOnTheDatabaseClock() {
+    void theDerivationFollowsItsInputsNotConstants() {
+        // inventory 500 + 1500 = 2 s per call; payment 1 attempt x (500 + 500) = 1 s, no wait;
+        // policy 31 s, margin 2 s: maxLines = floor((31 - 1) / 2) = 15; 4 lines = 8 + 1 + 2 = 11 s.
+        CreateOrderSettings other = new CreateOrderSettings(500, 1500, 500, 500, 1, 0, 31_000, 2_000,
+                new java.math.BigDecimal("10.00"));
+        assertEquals(15, other.maxLines());
+        assertEquals(11.0, other.deadlineSeconds(4));
+    }
+
+    @Test
+    void aPolicyTooSmallForOneLineIsRejectedAtStartup() {
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> new CreateOrderSettings(1000, 2000, 1000, 2000, 2, 500, 9_000, 5_000,
+                        new java.math.BigDecimal("49.00"))); // 9 s - 6.5 s = 2.5 s < one 3 s call
+    }
+
+    @Test
+    void theDeadlineIsCallsPlusPaymentBudgetPlusMarginOnTheDatabaseClock() {
         long id = transaction.insert(4101L, 7L, "key-a",
                 List.of(new OrderLine(11L, 1), new OrderLine(12L, 2), new OrderLine(13L, 5)));
 
         // created_at defaults to clock_timestamp() in the same statement, so
-        // the gap is the deadline length alone: 2 s * 3 + 5 s = 11 s.
+        // the gap is the deadline length alone: 3 s * 3 + 6.5 s + 5 s = 20.5 s.
         double gap = jdbc.queryForObject(
                 "select extract(epoch from expires_at - created_at) from orders where id = ?", Double.class, id);
-        assertEquals(11.0, gap, 0.5);
+        assertEquals(20.5, gap, 0.5);
 
         // And it was stamped by the database now, not by some other clock.
         double remaining = jdbc.queryForObject(
                 "select extract(epoch from expires_at - clock_timestamp()) from orders where id = ?",
                 Double.class, id);
-        assertTrue(remaining > 9.0 && remaining <= 11.0, "remaining " + remaining);
+        assertTrue(remaining > 18.5 && remaining <= 20.5, "remaining " + remaining);
+    }
+
+    @Test
+    void theDeadlineOfAFullOrderOfMaxLinesIs62Point5Seconds() {
+        List<OrderLine> lines = java.util.stream.LongStream.rangeClosed(1, settings.maxLines())
+                .mapToObj(p -> new OrderLine(p, 1)).toList();
+        long id = transaction.insert(4103L, 7L, "key-full", lines);
+
+        double gap = jdbc.queryForObject(
+                "select extract(epoch from expires_at - created_at) from orders where id = ?", Double.class, id);
+        assertEquals(17, lines.size());
+        assertEquals(62.5, gap, 0.5);
     }
 
     @Test
