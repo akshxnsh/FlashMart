@@ -95,8 +95,8 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
   -- flash_sale_id: order-level — one order = exactly one brand's sale
   -- amount: SUM(order_items.subtotal) + fee, DECIMAL, stored (the price the buyer
   --   agreed to, frozen). Fee = flat 49.00 per order, config, no column: fee =
-  --   amount - SUM(subtotal). DESIGNED, NOT IMPLEMENTED (Day 5 entry); today's
-  --   code still sets amount = SUM(subtotal). NULL until the last item is priced; set once by a CAS
+  --   amount - SUM(subtotal). IMPLEMENTED and TESTED (Day 5, fee commit; `order.fee`
+  --   in config, 49.00, provisional). NULL until the last item is priced; set once by a CAS
   --   guarded on status = CREATED; a test checks it equals SUM(subtotal).
   --   Computed once from SUM(order_items.subtotal) after the last item is
   --   priced, never accumulated item by item (recorded, not built)
@@ -640,12 +640,16 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   - `POST /api/orders` (gateway not built): `Idempotency-Key` (non-blank, max 255)
     and a temporary, forgeable `X-Buyer-Id` header (TODO Day 8: gateway-signed
     identity). Bean Validation added to Order. Quantity 1..5 per line and on the
-    merged total of a duplicated product; at most `maxLines` = floor(60 s / 2 s) =
-    30 distinct products. A bad request is a `400` and Inventory is never called
+    merged total of a duplicated product; at most `maxLines` = floor((60 s - 6.5 s) / 3 s) =
+    17 distinct products (Day 5: derived in `CreateOrderSettings` from config, not
+    typed in; tested: 17 accepted, 18 is a `400`). A bad request is a `400` and Inventory is never called
     (tested).
   - The insert is a native `INSERT ... RETURNING id` with `expires_at =
-    clock_timestamp() + 2 s x lines + 5 s`, and the unpriced items, in one
-    transaction (tested: the gap is the deadline length on the database clock).
+    clock_timestamp() + 3 s x lines + 6.5 s + 5 s`, and the unpriced items, in one
+    transaction (tested: the gap is the deadline length on the database clock;
+    3 lines = 20.5 s, 17 lines = 62.5 s, from config). The 6.5 s is the payment
+    call's budget (2 attempts x (1 s + 2 s) + 500 ms); the payment client does
+    not exist, only its budget is in the deadline.
   - Unique-violation losers: any SQLState `23505`, re-queried in a new
     transaction, constraint name never read: (a) same key: `409
     IDEMPOTENCY_KEY_REUSED` if the stored sale or merged items differ (checked
@@ -668,7 +672,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     The client is **tested against a JDK `HttpServer` stub**, not verified against
     Inventory: decoding with the price as a string, a slow stub hitting the read
     timeout, a refused connection, a `400`. No in-call retries. Values: connect timeout 1 s, reserve (read) timeout 2 s, max-blocking policy 60 s, deadline margin 5 s, all **provisional**, taken from Inventory load runs on one laptop that were not repeated.
-    The deadline must be re-derived on Day 5 with retry attempts.
+    Day 5: the deadline is now re-derived (3 s per call, 6.5 s payment budget).
   - Races, real threads on real Postgres, Inventory mocked at the Feign interface
     or at `InventoryCalls` (no real Inventory process), 50 rounds each, all passed:
     (i) same buyer, sale and key twice at once: one order, one `201` and one `200`
@@ -698,18 +702,26 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     `OrderCancelled` is not tested), any load. The late-reservation gap (a
     timed-out reserve that still commits in Inventory after the order failed) is
     still covered only by Day 7 designs.
-- **Day 5 payment step (2026-11-05): DESIGNED, NOT IMPLEMENTED, NOT TESTED.**
-  Decisions are written in `decisions.md`, "Day 5: payment step, resilience and
-  derived deadlines"; no code has started. Provisional, unmeasured, recheck
-  Day 9 (the gateway stub has no real latency data). Summary of what the code
-  will have to change: flat 49.00 fee in `amount`; `initiate` with 2 attempts
+- **Day 5, fee and deadline (branch `feat/day5-fee-deadline`): IMPLEMENTED and
+  TESTED** on real Postgres; all values **provisional**, unmeasured, recheck
+  Day 9. Design: `decisions.md`, "Day 5: payment step, resilience and derived
+  deadlines", points 1 and 6. `amount = SUM(subtotal) + 49.00` in the existing
+  CREATED-guarded CAS (no column, no migration; a later fee change does not move
+  a priced order; free-only order = 49.00; the `amount > 0` guard rejects zero
+  and negative). `maxLines` (17) and the deadline come from `payment.*`,
+  `inventory.*` and `order.create.*` config. Break-and-restore: removing
+  `status = 'CREATED'` from `setAmount` had left the old test green (it used an
+  order that already had an amount); a new test with a NULL-amount, non-CREATED
+  order fails without the guard. Not exercised: any payment call.
+- **Day 5, rest of the payment step: DESIGNED, NOT IMPLEMENTED, NOT TESTED.**
+  Decisions are written; no payment client, Resilience4j, sweep or stub exists.
+  What the code will still have to add: `initiate` with 2 attempts
   (connect 1 s, read 2 s, 500 ms wait, 6.5 s ceiling) behind a Resilience4j
   breaker; `PAYMENT_UNAVAILABLE` + `OrderCancelled` in one transaction;
-  `maxLines` 17 and the 3 s-per-call deadline. **Payment stub: a separate small
+  the buyer outcomes. **Payment stub: a separate small
   Spring Boot app on port 8085, its own process, not in-process**, so real
   timeouts, retries and the breaker are exercised over real HTTP. Designed, not
-  built; it is not the Razorpay Clone and verifies none of its behaviours. **Until then the running code
-  still has `maxLines` 30 and 2 s per call.**
+  built; it is not the Razorpay Clone and verifies none of its behaviours.
 - **Not built anywhere:** repositories beyond the Day-1 ones above (apart from
   the ones `reserve` added), service implementations other than Inventory's
   `reserve` and Order's create path, any controller other than Inventory's
@@ -978,9 +990,8 @@ or "recorded, not decided" still need a design decision.
   (3 s per reserve call = connect 1 s + read 2 s; retry ceiling 6.5 s;
   `maxLines` = floor((60 - 6.5) / 3) = 17; deadline = 3 s x lines + 6.5 s + 5 s
   margin); payment window 6 min; sweep interval 30 s; refund claim lease 2 h.
-  **The code and config still say `maxLines` 30 and 2 s per call** (Day 4,
-  "Order creation: retries, conflicts, deadlines and Inventory failures") until
-  Day 5 code changes them. Pool size and DB timeout values stay open.
+  **Implemented and tested for the fee and the deadline** (`maxLines` 17, 3 s per
+  call; §8); the payment client, breaker, sweep and stub are not built. Pool size and DB timeout values stay open.
 - **Locking strategy and isolation level for `flash_sale_items`: decided**
   (implemented, tested single-threaded and raced in a contention test; first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
   Pool size and timeout values, and insert-first vs update-first, come from
@@ -1030,11 +1041,11 @@ or "recorded, not decided" still need a design decision.
   past. Put it on the create request only (on update it would hide the real
   "frozen" reason), with a fixed clock in tests. The authoritative rule stays
   the service-layer check against the DB clock.
-- **Closed by decision (designed, not implemented): zero-amount order.**
+- **Closed by decision; fee implemented and tested: zero-amount order.**
   `sale_price` may still be `0.00`, but a flat 49.00 fee on every order makes
   the payable amount > 0 (`decisions.md`, "Day 5: payment step, resilience and
   derived deadlines"). An `amount > 0` assertion before `initiate` is a bug
-  guard only. Untested until the fee is built.
+  guard only. The fee and the guard are tested (§8); the guard is not yet wired to an `initiate` call, which does not exist.
 - **FR-B1 (buyer browse) has no endpoint.** It waits for security and
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
@@ -1119,8 +1130,8 @@ or "recorded, not decided" still need a design decision.
   verified). The HTTP client is Spring Cloud OpenFeign 2025.1.2 on Boot 4.1.1:
   it resolves and the context starts; its behaviour is tested against a stub,
   not against Inventory. Values: connect timeout 1 s, reserve (read) timeout 2 s, max-blocking policy 60 s, deadline margin 5 s, all **provisional**, taken from Inventory load runs on one laptop that were not repeated; recheck on Day 9. The deadline
-  must be re-derived on Day 5 with retry attempts: **done on paper** (3 s per
-  call, `maxLines` 17; designed, not implemented, see the Day 5 item above).
+  was re-derived on Day 5 with retry attempts: **implemented and tested** (3 s per
+  call, `maxLines` 17; see the Day 5 items above).
 
 The PRD is `docs/Flashmart.prd` (Revision 4, markdown). The earlier
 `FlashMart_Project_Plan_v3.pdf` reference was stale — no such file exists or

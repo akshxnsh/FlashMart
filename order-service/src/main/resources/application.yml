@@ -50,10 +50,25 @@ inventory:
   # and of maxLines.
   reserve-timeout-ms: 2000
 
+# Payment call budget (decisions.md, "Day 5: payment step, resilience and derived
+# deadlines", point 3). PROVISIONAL, unmeasured, recheck Day 9. The payment
+# client is not built yet; these numbers only feed the CREATED deadline.
+payment:
+  connect-timeout-ms: 1000
+  read-timeout-ms: 2000
+  attempts: 2
+  wait-ms: 500
+
 order:
+  # Flat fee added to every order's amount (BigDecimal; a JSON string at every
+  # boundary). Not stored: fee = amount - SUM(order_items.subtotal).
+  fee: 49.00
   create:
     # Policy: the longest a crashed order may block its buyer (one live order
-    # per buyer and sale). maxLines = floor(max-blocking-time / reserve-timeout).
+    # per buyer and sale). CreateOrderSettings derives from it:
+    #   perReserveCall = inventory connect + read (3 s)
+    #   paymentBudget  = attempts * (connect + read) + (attempts - 1) * wait (6.5 s)
+    #   maxLines       = floor((max-blocking-time - paymentBudget) / perReserveCall)
+    #   expires_at     = clock_timestamp() + perReserveCall * lines + paymentBudget + margin
     max-blocking-time-ms: 60000
-    # expires_at = clock_timestamp() + reserve-timeout * lines + margin.
     deadline-margin-ms: 5000

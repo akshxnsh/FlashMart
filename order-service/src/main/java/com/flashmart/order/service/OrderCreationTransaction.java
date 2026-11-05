@@ -3,6 +3,7 @@ package com.flashmart.order.service;
 import com.flashmart.order.entity.OrderStatus;
 import com.flashmart.order.repository.OrderRepository;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Component;
@@ -24,6 +25,7 @@ import java.util.TreeMap;
  * flushed over a CAS), and translates a unique violation into Spring's
  * {@code DataIntegrityViolationException}.
  */
+@Slf4j
 @Component
 @RequiredArgsConstructor
 public class OrderCreationTransaction {
@@ -152,16 +154,39 @@ public class OrderCreationTransaction {
     }
 
     /**
-     * Sets {@code amount = SUM(subtotal)} through the existing write-once CAS,
-     * only once no item is left unpriced. Returns the rows changed; {@code 0}
-     * means another loop set it, the order is no longer {@code CREATED}, or an
-     * item is still unpriced. The caller re-reads either way.
+     * Sets {@code amount = SUM(subtotal) + fee} through the existing write-once
+     * CAS (guarded on {@code status = 'CREATED' AND amount IS NULL}), only once
+     * no item is left unpriced. Returns the rows changed; {@code 0} means
+     * another loop set it, the order is no longer {@code CREATED}, or an item is
+     * still unpriced. The caller re-reads either way.
+     *
+     * <p>The fee is not stored: it is {@code amount - SUM(subtotal)} for any
+     * order, whatever the config says later.
      */
     @Transactional
     public int setAmountFromItems(long orderId) {
         BigDecimal sum = jdbc.queryForObject("SELECT CASE WHEN count(*) FILTER (WHERE unit_price IS NULL) = 0 "
                 + "THEN sum(subtotal) END FROM order_items WHERE order_id = ?", BigDecimal.class, orderId);
-        return sum == null ? 0 : orders.setAmount(orderId, sum);
+        if (sum == null) {
+            return 0;
+        }
+        BigDecimal amount = sum.add(settings.fee());
+        requirePayable(orderId, amount);
+        return orders.setAmount(orderId, amount);
+    }
+
+    /**
+     * A bug guard, not a business rule: the fee makes every amount positive, so
+     * a non-positive one means the fee config or the pricing is broken. Fails
+     * loudly rather than letting a zero payment through. Deliberately no
+     * database CHECK: a zero-amount order row is legal; only paying for one is not.
+     */
+    void requirePayable(long orderId, BigDecimal amount) {
+        if (amount == null || amount.signum() <= 0) {
+            log.error("order {} has a non-positive payable amount {}: fee config or pricing is broken",
+                    orderId, amount);
+            throw new IllegalStateException("order " + orderId + " has a non-positive payable amount: " + amount);
+        }
     }
 
     /** {@code product_id -> quantity}, the stored half of the key-reuse comparison. */
