@@ -4,6 +4,7 @@ import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -15,6 +16,7 @@ import java.time.Duration;
  * libraries (no Boot starter). Every number comes from {@code payment.*}
  * (decisions.md, Day 5, points 3 and 4; PROVISIONAL).
  */
+@Slf4j
 @Configuration
 public class PaymentResilienceConfig {
 
@@ -23,6 +25,12 @@ public class PaymentResilienceConfig {
      * {@code minimum-calls} are recorded. Timeouts, connect errors and 5xx are
      * failures; a 4xx is ignored (it says nothing about the gateway's health).
      * Open for {@code open-ms}, then {@code half-open-calls} trial calls decide.
+     *
+     * <p>Every state transition is logged at WARN with the failure rate at that
+     * moment. Observability only: the breaker's behaviour is unchanged. Note
+     * that OPEN becomes HALF_OPEN lazily (resilience4j's default): at the first
+     * call after {@code open-ms}, not when the time passes, so that line appears
+     * when a request arrives.
      */
     @Bean
     public CircuitBreaker paymentCircuitBreaker(@Value("${payment.breaker.window-size}") int windowSize,
@@ -30,7 +38,7 @@ public class PaymentResilienceConfig {
                                                 @Value("${payment.breaker.failure-rate-percent}") float failureRate,
                                                 @Value("${payment.breaker.open-ms}") long openMs,
                                                 @Value("${payment.breaker.half-open-calls}") int halfOpenCalls) {
-        return CircuitBreaker.of("payment-gateway", CircuitBreakerConfig.custom()
+        CircuitBreaker breaker = CircuitBreaker.of("payment-gateway", CircuitBreakerConfig.custom()
                 .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
                 .slidingWindowSize(windowSize)
                 .minimumNumberOfCalls(minimumCalls)
@@ -40,6 +48,12 @@ public class PaymentResilienceConfig {
                 .recordException(PaymentCalls::isTransient)
                 .ignoreException(PaymentCalls::isClientError)
                 .build());
+        breaker.getEventPublisher().onStateTransition(event -> log.warn(
+                "payment circuit breaker {} -> {} (failure rate {}%, {} calls in window, {} failed)",
+                event.getStateTransition().getFromState(), event.getStateTransition().getToState(),
+                breaker.getMetrics().getFailureRate(), breaker.getMetrics().getNumberOfBufferedCalls(),
+                breaker.getMetrics().getNumberOfFailedCalls()));
+        return breaker;
     }
 
     /**
