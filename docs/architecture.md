@@ -717,8 +717,10 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     timed-out reserve that still commits in Inventory after the order failed) is
     still covered only by Day 7 designs. (The relay was built on Day 6, and the
     sweep, Inventory's consumers and Version A of the republish on Day 7, below;
-    stock release after `OrderCancelled` is tested since Day 7. Version B of the
-    gap remains open, see §9.)
+    stock release after `OrderCancelled` is tested on Inventory's side with
+    hand-written messages on an embedded broker, and seen once end to end in the
+    manual run (not an automated test through Order's real producer). Version B
+    of the gap remains open, see §9.)
 - **Day 5, fee and deadline (merged from `feat/day5-fee-deadline`): IMPLEMENTED and
   TESTED** on real Postgres; all values **provisional**, unmeasured, recheck
   Day 9. Design: `decisions.md`, "Day 5: payment step, resilience and derived

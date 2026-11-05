@@ -5102,8 +5102,7 @@ redelivered webhook cannot insert a second refund row.
 
 ## Decision: Day 7: Inventory consumers, late-reservation cleanup, expiry sweep and its index
 
-**Status:** **decided; Inventory consumers, Order expiry sweep (with drain loop), V9 partial index and late-reservation republish implemented and tested; Inventory stale-reservation reconciler and reconciliation sweep designed only.** Every point below is on
-paper only. Every value that is a number or a timing is **provisional and
+**Status:** **decided; Inventory consumers, Order expiry sweep (with drain loop), V9 partial index and late-reservation republish implemented and tested; Inventory stale-reservation reconciler and reconciliation sweep designed only.** The reasoning below is the Day 7 design as written; what was built is in architecture.md §8. Every value that is a number or a timing is **provisional and
 unmeasured**. The Razorpay Clone does not exist, so nothing here that touches
 the gateway is verified.
 
