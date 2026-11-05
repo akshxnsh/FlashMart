@@ -43,9 +43,14 @@ public class CreateOrderSettings {
                                @Value("${order.create.deadline-margin-ms}") long marginMs,
                                @Value("${order.fee}") BigDecimal fee) {
         if (inventoryConnectMs <= 0 || inventoryReadMs <= 0 || paymentConnectMs <= 0 || paymentReadMs <= 0
-                || paymentAttempts < 1 || paymentWaitMs < 0 || marginMs < 0 || fee == null
-                || fee.signum() < 0) {
-            throw new IllegalStateException("bad create-order timing/fee config");
+                || paymentAttempts < 1 || paymentWaitMs < 0 || marginMs < 0) {
+            throw new IllegalStateException("bad create-order timing config");
+        }
+        // The fee is what makes every payable amount positive (a free item would
+        // otherwise give a zero payment). Zero would silently reopen that case.
+        if (fee == null || fee.signum() <= 0) {
+            throw new IllegalStateException("order.fee must be greater than zero, was " + fee
+                    + " (the fee is what keeps every payable amount above zero)");
         }
         this.perReserveCallMs = inventoryConnectMs + inventoryReadMs;
         this.paymentBudgetMs = paymentAttempts * (paymentConnectMs + paymentReadMs)

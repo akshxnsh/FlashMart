@@ -49,6 +49,19 @@ class OrderInsertTest {
     }
 
     @Test
+    void aFeeOfZeroOrLessFailsToStartAndAPositiveOneStarts() {
+        for (String bad : new String[] {"0", "0.00", "-0.01", "-49.00"}) {
+            IllegalStateException e = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                    () -> new CreateOrderSettings(1000, 2000, 1000, 2000, 2, 500, 60_000, 5_000,
+                            new java.math.BigDecimal(bad)), "fee " + bad);
+            assertTrue(e.getMessage().contains("order.fee"), e.getMessage());
+        }
+        CreateOrderSettings ok = new CreateOrderSettings(1000, 2000, 1000, 2000, 2, 500, 60_000, 5_000,
+                new java.math.BigDecimal("49.00"));
+        assertEquals(0, new java.math.BigDecimal("49.00").compareTo(ok.fee()));
+    }
+
+    @Test
     void aPolicyTooSmallForOneLineIsRejectedAtStartup() {
         org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
                 () -> new CreateOrderSettings(1000, 2000, 1000, 2000, 2, 500, 9_000, 5_000,
