@@ -172,6 +172,31 @@ public class OrderCreationTransaction {
     }
 
     /**
+     * Late reservation, Version A (decisions.md, "Day 7", point 5): a NEW
+     * {@code OrderCancelled} for an order that Inventory just reserved stock
+     * for but that is already in a failure state. In ONE statement: the guard
+     * and the reason are read from the row itself, so the event is written only
+     * while the order is {@code RESERVATION_FAILED}, {@code PAYMENT_UNAVAILABLE},
+     * {@code ORDER_EXPIRED} or {@code PAYMENT_FAILED}, and NEVER for
+     * {@code PAID} (that would release paid stock) or a live order. All four
+     * are terminal, so the state cannot move under it.
+     *
+     * <p>No CAS on {@code orders.status}: this writes no status. A duplicate
+     * {@code OrderCancelled} is expected and harmless (Inventory's release is
+     * guarded on {@code status = 'RESERVED'}).
+     *
+     * @return rows written: 1, or 0 when the order is not in a failure state
+     */
+    @Transactional
+    public int republishCancelled(long orderId) {
+        return jdbc.update("INSERT INTO outbox (aggregate_id, event_type, payload_json) "
+                + "SELECT id, 'OrderCancelled', jsonb_build_object('order_id', id, 'reason', status, 'buyer_id', buyer_id) "
+                + "FROM orders WHERE id = ? "
+                + "AND status IN ('RESERVATION_FAILED', 'PAYMENT_UNAVAILABLE', 'ORDER_EXPIRED', 'PAYMENT_FAILED')",
+                orderId);
+    }
+
+    /**
      * Writes {@code OrderCancelled{order_id, reason, buyer_id}} if and only if
      * the CAS ({@code rows}) won. Runs inside the caller's transaction. The
      * reason is the failure state the order moved to.
