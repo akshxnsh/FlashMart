@@ -1,0 +1,8 @@
+server:
+  # 8080 gateway (reserved), identity 8081, inventory 8082, order 8083,
+  # notification 8084, payment stub 8085.
+  port: 8085
+
+spring:
+  application:
+    name: payment-stub
