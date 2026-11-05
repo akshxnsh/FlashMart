@@ -21,6 +21,13 @@ spring:
       ddl-auto: validate
     show-sql: true
 
+  jackson:
+    deserialization:
+      # Jackson 3 accepts a JSON float where an int is expected and TRUNCATES
+      # it by default, so {"quantity": 2.5} would order 2 units. Off, so a
+      # fractional count is a 400. Same setting as Inventory.
+      accept-float-as-int: false
+
   cloud:
     openfeign:
       client:
