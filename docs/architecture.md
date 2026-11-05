@@ -814,8 +814,44 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     in `markPaymentFailed`, and `ON CONFLICT` on the refund insert each failed
     their tests when removed.
   - **Not exercised:** a real or stub gateway sending webhooks or retrying a
-    `409`; the relay (outbox rows are written, never published); the refund
-    worker (rows are `PENDING`, nobody pays them out); the reconciliation sweep.
+    `409`; the relay (outbox rows are written, never published; since built,
+    see the next item); the refund worker (rows are `PENDING`, nobody pays them
+    out); the reconciliation sweep.
+- **Day 6 outbox relay + Kafka producer (order-service, `feat/day6-relay`):
+  IMPLEMENTED; TESTED AGAINST AN EMBEDDED BROKER (`@EmbeddedKafka`, in-JVM
+  KRaft) and real Postgres; docker-compose Kafka NOT run; not load-tested.**
+  Decisions: `decisions.md`, "Day 6", point 6. Delivery is **at-least-once**.
+  - Plain `spring-kafka`, wired by hand (`OutboxKafkaConfig`): `acks=all`,
+    idempotent producer, String key/value; request, delivery and max-block
+    timeouts all equal the ack timeout. Topics `payment-confirmed` and
+    `order-cancelled` (1 partition) created by `NewTopic` beans. Key = order
+    id; value = `payload_json` as stored (jsonb text: flat, bare, money as
+    strings; jsonb's own key order and spacing).
+  - `OutboxRelay.runOnce()`: one transaction; claim up to 50 unpublished rows
+    by `created_at, id` with `FOR UPDATE SKIP LOCKED`; per row send, wait for
+    the ack (send + ack capped at 5 s), then `published_at = clock_timestamp()`.
+    First failure: `attempts + 1`, `last_error` (with root cause), stop the
+    batch. Scheduled every 1 s (fixed delay); `outbox.relay.enabled=false`
+    removes the schedule (off in the test config). Poll 1 s, batch 50, ack 5 s
+    are **provisional, unmeasured**; recheck Day 9.
+  - Tested: right topic, key and exact stored payload, then marked; a second
+    pass sends nothing; topics exist with 1 partition. Broker unreachable
+    (unused port, 1 s ack timeout): the pass fails in about one ack timeout,
+    nothing marked, first row `attempts` 1 + `last_error`, later rows untouched;
+    a working relay then sends all three in order. A `published_at` UPDATE
+    failing after the ack (test trigger) rolls the pass back and the next pass
+    re-sends: **2 messages, 0 lost**. Two relay instances (real threads): A holds
+    rows 1-3 inside its first send, B skips them, sends 4-6 and finishes while
+    A still holds; each row reaches Kafka once. End to end: webhook SUCCESS ->
+    outbox -> relay -> a real consumer on `payment-confirmed` (amount `"499.00"`,
+    no `brand_id`, no envelope).
+  - Break-and-restore: marking before the ack made the unreachable-broker test
+    fail (a row marked published with no ack, i.e. a lost event); removing
+    `SKIP LOCKED` made the two-instance test fail (B waited on A's locks).
+  - **Not exercised:** a separate broker process (the docker-compose Kafka was
+    not started), a real process crash (the crash window is simulated by a
+    failing UPDATE), any consumer service (Inventory's consumer is Day 7), a
+    multi-partition topic, broker failover, any load or relay lag measurement.
 - **Payment stub (`payment-stub/`, merged from `feat/day5-payment-stub`): BUILT
   and TESTED ALONE (its own suite); run against Order only in the failure demo
   above; NOT verified against a real gateway.** Listens on 127.0.0.1 only.
@@ -839,7 +875,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   the ones `reserve` added), service implementations other than Inventory's
   `reserve` and Order's create path, any controller other than Inventory's
   reserve endpoint, Order's `POST /api/orders` and `POST /webhooks/payment`, the API
-  Gateway, Kafka, Redis, security. All four services
+  Gateway, Kafka consumers (Order's relay publishes; nothing consumes), Redis, security. All four services
   share one local Postgres credential pair but each owns a separate database.
 
 **Tested on `main` after Day 5: 386 tests, all passing, 0 failures, 0 errors,
