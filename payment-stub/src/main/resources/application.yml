@@ -9,3 +9,23 @@ server:
 spring:
   application:
     name: payment-stub
+
+# Signed webhooks to Order (decisions.md, "Day 6", points 1 and 4).
+webhook:
+  # From the environment only, never committed; Order must use the same value.
+  # Blank fails startup (WebhookSettings).
+  secret: ${PAYMENT_WEBHOOK_SECRET:}
+  url: ${ORDER_WEBHOOK_URL:http://localhost:8083/webhooks/payment}
+  # The stub's ASSUMPTION about a real gateway's retry policy (the Razorpay
+  # Clone is unverified): every 2 s on any non-2xx or I/O error, give up after
+  # 120 s from the first attempt.
+  retry-interval-ms: 2000
+  max-duration-ms: 120000
+  # Per attempt. Below Order's 2 s payment read timeout, because in
+  # BEFORE_REPLY mode the first attempt runs inside the initiate call.
+  request-timeout-ms: 1000
+  # AFTER_REPLY auto-webhooks start this long after the initiate call.
+  after-reply-delay-ms: 500
+  # A copy of Order's longest CREATED deadline (17 lines: 62.5 s, decisions.md
+  # "Day 5", point 6), only to WARN at startup if max-duration-ms is not longer.
+  order-max-created-deadline-ms: 62500
