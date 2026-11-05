@@ -1,11 +1,16 @@
 package com.flashmart.order.service;
 
+import com.flashmart.order.entity.OrderStatus;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
 
 /**
  * The short database transactions of the create path. Each public method is
@@ -20,6 +25,14 @@ import java.util.List;
 @Component
 @RequiredArgsConstructor
 public class OrderCreationTransaction {
+
+    private static final String SNAPSHOT = "SELECT id, buyer_id, flash_sale_id, status, amount, "
+            + "clock_timestamp() < expires_at AS before_deadline FROM orders ";
+
+    private static final RowMapper<OrderSnapshot> SNAPSHOT_ROW = (rs, n) -> new OrderSnapshot(
+            rs.getLong("id"), rs.getLong("buyer_id"), rs.getLong("flash_sale_id"),
+            OrderStatus.valueOf(rs.getString("status")), rs.getBigDecimal("amount"),
+            rs.getBoolean("before_deadline"));
 
     private final JdbcTemplate jdbc;
     private final CreateOrderSettings settings;
@@ -51,5 +64,41 @@ public class OrderCreationTransaction {
                     ps.setInt(3, line.quantity());
                 });
         return id;
+    }
+
+    /** The order this buyer created with this key, if any. Rule (a): a replay. */
+    @Transactional(readOnly = true)
+    public Optional<OrderSnapshot> findByKey(long buyerId, String idempotencyKey) {
+        return jdbc.query(SNAPSHOT + "WHERE buyer_id = ? AND idempotency_key = ?",
+                SNAPSHOT_ROW, buyerId, idempotencyKey).stream().findFirst();
+    }
+
+    /**
+     * The buyer's live-or-paid order for this sale, if any. Rule (b). The
+     * predicate is the one {@code uk_orders_buyer_sale_live_or_paid} (V6)
+     * enforces, so at most one row can match.
+     */
+    @Transactional(readOnly = true)
+    public Optional<OrderSnapshot> findLiveOrPaid(long buyerId, long flashSaleId) {
+        return jdbc.query(SNAPSHOT + "WHERE buyer_id = ? AND flash_sale_id = ? "
+                        + "AND status IN ('CREATED', 'PENDING_PAYMENT', 'PAID')",
+                SNAPSHOT_ROW, buyerId, flashSaleId).stream().findFirst();
+    }
+
+    /** A fresh read, for reporting the real state after losing a CAS. */
+    @Transactional(readOnly = true)
+    public OrderSnapshot read(long orderId) {
+        return jdbc.queryForObject(SNAPSHOT + "WHERE id = ?", SNAPSHOT_ROW, orderId);
+    }
+
+    /** {@code product_id -> quantity}, the stored half of the key-reuse comparison. */
+    @Transactional(readOnly = true)
+    public Map<Long, Integer> quantitiesOf(long orderId) {
+        Map<Long, Integer> quantities = new TreeMap<>();
+        jdbc.query("SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+                rs -> {
+                    quantities.put(rs.getLong("product_id"), rs.getInt("quantity"));
+                }, orderId);
+        return quantities;
     }
 }
