@@ -27,3 +27,19 @@ spring:
       # it by default, so {"quantity": 2.5} would reserve 2 units and return
       # 200. Turned off so a fractional count is a 400, not a silent change.
       accept-float-as-int: false
+
+# Kafka consumers (decisions.md, "Day 7", points 3 and 4). Locally the
+# docker-compose broker. Order creates the two topics; Inventory never does.
+kafka:
+  bootstrap: ${KAFKA_BOOTSTRAP:localhost:9092}
+  # false: no listener containers start (tests that do not use Kafka).
+  consumers-enabled: true
+  consumer:
+    group-id: inventory-service
+    # Retry of a transient failure (DB down) is forever, with growing waits.
+    # All three numbers PROVISIONAL, unmeasured, recheck Day 9. The cap stays
+    # far below max.poll.interval.ms (5 min default) so a long wait is not
+    # mistaken for a dead consumer.
+    backoff-initial-ms: 1000
+    backoff-multiplier: 2.0
+    backoff-max-ms: 30000
