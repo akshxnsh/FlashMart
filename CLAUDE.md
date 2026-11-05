@@ -101,7 +101,7 @@ Follow the phase plan: setup → architecture/requirements → schema → JPA en
 
 **Current position:** entities and migrations are done in all four services; Inventory's `reserve` is implemented, tested, raced and load-run on one laptop (p99 target met at 100 buyers/s, not met at 500 buyers/s; the 5,000-concurrent target is not reached); Day 4 (`POST /api/orders`: insert, unique-violation handling, reserve loop) is implemented, tested and raced with Inventory mocked (not run against a real Inventory, not load-tested); Day 5 decisions (payment step, resilience, deadlines) are written; the fee, the `CREATED` deadline and the payment step (initiate with retry and breaker, PENDING_PAYMENT / PAYMENT_UNAVAILABLE CAS) are built and tested, the payment step against a JDK stub and mocks only (not the real payment-stub, not load-tested); nothing else is built beyond the Day-1 repositories. `docker-compose.yml` is written and config-validated, not started. Details in `architecture.md` §8 (which wins over this line).
 
-**Ports:** gateway `8080` (reserved), identity `8081`, inventory `8082`, order `8083`, notification `8084`, payment stub `8085` (planned, not built). One shared `DB_USERNAME`/`DB_PASSWORD` pair, one separate database per service.
+**Ports:** gateway `8080` (reserved), identity `8081`, inventory `8082`, order `8083`, notification `8084`, payment stub `8085` (built, tested alone, not run against Order). One shared `DB_USERNAME`/`DB_PASSWORD` pair, one separate database per service.
 
 ## Open decisions (stop and decide together)
 
