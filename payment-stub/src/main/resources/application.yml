@@ -2,6 +2,9 @@ server:
   # 8080 gateway (reserved), identity 8081, inventory 8082, order 8083,
   # notification 8084, payment stub 8085.
   port: 8085
+  # Loopback only: /admin/mode is unauthenticated, so the stub must not be
+  # reachable from other machines.
+  address: 127.0.0.1
 
 spring:
   application:
