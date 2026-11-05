@@ -3,3 +3,13 @@
 # their own webhooks with it, so the suite runs without PAYMENT_WEBHOOK_SECRET.
 payment-webhook:
   secret: test-only-webhook-secret
+
+# Test-only, NOT the production pool size (still open, from the load test).
+# Spring caches one context per distinct test configuration and each keeps
+# its Hikari pool open, so 10+ contexts x the default 10 exceeded local
+# Postgres's max_connections (100): "sorry, too many clients already". 4 is
+# enough for the 2-thread races plus the main thread polling pg_stat_activity.
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 4
