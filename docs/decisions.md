@@ -1825,6 +1825,12 @@ than silently violating an unwritten assumption.
 
 ## Decision: An order keeps exactly one payment; every other captured payment is refunded
 
+> **Correction (2026-11-05, from "Day 6: webhook, one-payment edge cases,
+> PaymentConfirmed, outbox relay", points 1 to 3):** the `PAID` CAS also matches
+> the webhook's amount (numeric), a `FAILED` CAS also matches `payment_ref`, and
+> a webhook for an order still `CREATED` gets `409` with no write. Implemented and
+> tested on Day 6. The text below is unchanged.
+
 **Context / Problem:**
 The previous terminal-state guard enumerated cases by which terminal state an
 order was in, and refunded only a late `SUCCESS` arriving after
@@ -1889,6 +1895,12 @@ this case.
 ---
 
 ## Decision: Refunds are issued through a `refunds` command-outbox table, not a direct call
+
+> **Correction (2026-11-05, from "Day 6", B1):** the losing webhook's insert is
+> `INSERT ... ON CONFLICT (payment_ref) DO NOTHING`, so a redelivery adds no
+> second row; it leaves `next_retry_at` NULL, whose meaning is open item A2.
+> Implemented and tested on Day 6; the worker below is still not built. The
+> text below is unchanged.
 
 **Context / Problem:**
 The refund is an external HTTP call that must happen after a database commit —
@@ -2968,6 +2980,13 @@ Order must expose a status-check endpoint. The call is off the hot path.
 
 ## Decision: Deadlines and leases are derived from the timeouts they race, never picked
 
+> **Correction (2026-11-05, from "Day 5: payment step, resilience and derived
+> deadlines"):** the numbers now exist. The `CREATED` deadline is derived from
+> the Feign and Resilience4j config (3 s per call, 6.5 s payment budget, 17
+> lines; implemented and tested); the payment window (6 min), sweep interval
+> (30 s) and refund lease (2 h) are decided as policy. All provisional and
+> unmeasured, recheck Day 9; not load-tested. The text below is unchanged.
+
 **Context / Problem:**
 Two values in this design are deadlines racing an in-flight operation: the
 short `CREATED` deadline (racing the reservation loop plus the initiate call)
@@ -3879,6 +3898,11 @@ now an Open Item.
 
 ## Decision: The payment webhook finds its order by our order id, never by `payment_ref`; `payment_ref` gets a partial `UNIQUE`
 
+> **Correction (2026-11-05, from "Day 6", points 3 and 4):** the unknown-order
+> case below is decided: `404` plus a WARN, nothing written. The `PAID` CAS also
+> matches the amount. Implemented and tested on Day 6. The text below is
+> unchanged.
+
 **Context / Problem:**
 No document said how an incoming payment webhook locates its `orders` row. The
 obvious key, `payment_ref`, is `NULL` whenever Order crashed after the gateway
@@ -4538,7 +4562,12 @@ writing.
 merged); points 2 to 5 and the payment window (7) **implemented and tested
 against a JDK HttpServer stub and mocks only** (`feat/day5-payment-step`): not
 against the real payment-stub, not against a real gateway, not load-tested.
-Points 8 and 9 are not built (sweep Day 7, refund worker stretch). Every number
+Points 8 and 9 are not built (sweep Day 7, refund worker stretch). **Update
+2026-11-06:** points 2 to 5 were since also **verified under failure against
+the real payment-stub on one laptop** (`docs/testing.md`, Day 5 failure demo);
+point 10's stub is **built and tested** (`feat/day5-payment-stub`, and its
+webhook sender on Day 6), so "Designed, not built" in point 10 and "not
+started" under Consequences are out of date. Every number
 below is **PROVISIONAL and unmeasured**; recheck on Day 9. The Razorpay Clone
 does not exist, so no stub gives real latency data. Nothing here may be read as
 verified (CLAUDE.md, Working style 7).
@@ -4726,7 +4755,7 @@ is closed by a reconciliation sweep"), and, in
   which Notion renders natively. On 2026-10-22 they were updated for the
   implementation-phase reserve changes (item-in-sale check, replay quantity
   check, the quantity cap, `ITEM_NOT_IN_SALE` → `RESERVATION_FAILED`).
-- **UPDATED (designed, not implemented): see "Day 5: payment step, resilience and derived deadlines".** The `CREATED` deadline is re-derived (3 s per call, 17 lines, 6.5 s retry ceiling); payment window (6 min), sweep interval (30 s) and refund lease (2 h) are decided, all provisional. Earlier text: The `CREATED` deadline was provisionally derived (60 s policy, 2 s per call, 5 s margin; see "Order creation: retries, conflicts, deadlines and Inventory failures"). Original text: **The two derived deadlines** — the short `CREATED` deadline and the refund
+- **UPDATED: see "Day 5: payment step, resilience and derived deadlines". The deadline, payment window and retry/breaker values are implemented and tested (payment ones against a stub only); the sweep interval and refund lease are unused (sweep and refund worker not built).** The `CREATED` deadline is re-derived (3 s per call, 17 lines, 6.5 s retry ceiling); payment window (6 min), sweep interval (30 s) and refund lease (2 h) are decided, all provisional. Earlier text: The `CREATED` deadline was provisionally derived (60 s policy, 2 s per call, 5 s margin; see "Order creation: retries, conflicts, deadlines and Inventory failures"). Original text: **The two derived deadlines** — the short `CREATED` deadline and the refund
   stale-claim lease — plus the Order sweep interval and the payment window.
   Blocked on the Feign/Resilience4j timeout configuration by design, not by
   oversight.
@@ -4828,7 +4857,7 @@ is closed by a reconciliation sweep"), and, in
   create request only (on update it would hide the real "frozen" reason), with
   a fixed clock in tests. The authoritative rule stays the service-layer check
   against the DB clock.
-- **A zero-amount order is untested.** A free item is allowed (`sale_price >=
+- **CLOSED by decision ("Day 5", point 1); fee and `amount > 0` guard implemented and tested. Original text kept below.** **A zero-amount order is untested.** A free item is allowed (`sale_price >=
   0`, and the API's `@PositiveOrZero` matches), so an order can total `0.00`,
   and a payment gateway may refuse a zero-amount payment. Decide in the
   payment phase.
@@ -4836,24 +4865,24 @@ is closed by a reconciliation sweep"), and, in
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
 - **DECIDED 2026-11-05 (implemented, tested (races mock Inventory)): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **Order's handling of `RESERVATION_RELEASED`** mid-loop: stop, no CAS, no event, re-read the real status.
-- **Decided, not built:** all three reserve "no" outcomes end the order as
+- **Decided; implemented and tested (Day 4):** all three reserve "no" outcomes end the order as
   `RESERVATION_FAILED`. See "Reserve contract revised".
 - **DECIDED 2026-11-05 (implemented, tested (races mock Inventory)): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **For Order's API piece: what a retried create with the same idempotency key
   returns when the order is already `RESERVATION_FAILED`.** `failure_detail` is
   debug only, so the retry cannot read the original outcome from it. Not
   decided.
-- **Bean Validation exists in Inventory only.** Identity, Order and
-  Notification add `spring-boot-starter-validation` in their own API phase
-  (see the Correction on "Service scaffolding").
-- **Order's create-order request must reject `quantity > 5`** before any
+- **Bean Validation exists in Inventory and Order** (Order added it on Day 4).
+  Identity and Notification add `spring-boot-starter-validation` in their own
+  API phase (see the Correction on "Service scaffolding").
+- **Done (Day 4), tested.** **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` instead of firing an
   Inventory alert. See "Per-item quantity cap of 5".
 - **DECIDED 2026-11-05 (implemented, tested (races mock Inventory)): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **For Order's API piece: a unique violation on order insert must map to
   `409`** and return the existing live-or-paid order, so the buyer can finish
   paying it. Never a `500`. See "One live-or-paid order per buyer per sale".
 - **A buyer cannot start a new order while an unpaid one is open**, until it
-  pays or expires. The wait is bounded by the payment window (value still
-  open).
+  pays or expires. The wait is bounded by the payment window (6 min, provisional,
+  "Day 5" point 7; plus up to one sweep interval once the sweep exists).
 - **One person with two accounts is not covered** by the one-live-order rule.
   The cap of 5 is also still per item per order.
 - **DECIDED 2026-11-05 (implemented, tested (races mock Inventory)): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **A retried create while the order is still `CREATED`** now re-runs the reserve loop (amends "abort").
@@ -4863,7 +4892,8 @@ is closed by a reconciliation sweep"), and, in
 - **Identity, API phase (designed, not built):** a lost signup race must read
   "email already taken", not a 500; the JWT must say whether its subject is a
   brand or a user; published `outbox` rows need a cleanup job. See "Identity's
-  remaining tables".
+  remaining tables". Since Day 6 Order's relay marks its own `outbox` rows
+  published, so Order has the same unbuilt cleanup need (noted, not decided).
 - **Razorpay Clone is not built yet**, and three of its behaviours are
   requirements FlashMart's design leans on: idempotency keys honoured on
   `initiate`, idempotency keys honoured on `refund`, and a payment-status
@@ -4880,25 +4910,53 @@ is closed by a reconciliation sweep"), and, in
 - **Found by independent review, Oct 29, not decided.** An independent static
   review of Order V1-V6 happened on 2026-10-29; the reviewer could not run the
   tests. What it found and V7 fixed is in §4 (V7). The items below were left
-  alone on purpose, each waits for a decision. None is built or tested:
-  - **A1:** entity updatability and `@DynamicUpdate`. Not decided.
+  alone on purpose, each waiting for a decision; each line says where it
+  stands now (A2 and A3 are still undecided):
+  - **A1:** entity updatability and `@DynamicUpdate`. **Decided** ("CAS-owned
+    columns are insert-only in the entities (A1)"); implemented, run on
+    2026-11-03, break-and-restore done, later amended.
   - **A2:** `refunds.next_retry_at` NULL handling and the refund claim query.
-    Not decided.
+    Not decided. **Now live:** since Day 6 the webhook handler writes `PENDING`
+    refund rows with `next_retry_at` NULL; whoever builds the refund worker must
+    decide what NULL means before writing the claim query (a claim on
+    `next_retry_at <= now()` alone would never pick these rows).
   - **A3:** redesign of the sweep and refund indexes. Not decided.
   - **B1:** `ON CONFLICT DO NOTHING` for the refund insert. **Decided 2026-11-05
-    (derived); not implemented** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
+    (derived); implemented and tested on Day 6** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
   - **B2, B3:** the retried create (and the `409` it returns) and a request
     fingerprint. **Decided 2026-11-05; implemented, tested (races mock Inventory)** ("Order creation: retries, conflicts, deadlines and Inventory failures"; no fingerprint column).
   - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`.
-    **Decided 2026-11-05: answer `409`, change nothing; not implemented** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
+    **Decided 2026-11-05: answer `409`, change nothing; implemented and tested on Day 6** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
   - **B5:** which clock function stamps `expires_at`. **Decided 2026-11-05:**
-    `clock_timestamp()`, DB-stamped ("Order creation: retries, conflicts, deadlines and Inventory failures").
+    `clock_timestamp()`, DB-stamped ("Order creation: retries, conflicts, deadlines and Inventory failures"). Implemented and tested (Day 4).
   - A `CHECK` on `payment_reconciled_at`, and a `CHECK` that `PROCESSING`
-    implies `claimed_at`. **Decided 2026-11-05; V8, not written yet.**
+    implies `claimed_at`. **Decided 2026-11-05; V8 implemented and tested.**
+- **Test isolation (noted, not fixed):** 4 Order entity tests
+  (`OrderPersistenceTest`, `OrderSchemaHardeningTest`, two in
+  `OutboxEventPersistenceTest`) count absolute rows in the shared dev database,
+  so they fail after a manual run leaves orders or outbox rows behind. Run
+  `scripts/seed/seed.sh` before the suite until they count only their own rows.
+- **New with Day 6 (recorded, none decided here; details in "Day 6: webhook,
+  one-payment edge cases, PaymentConfirmed, outbox relay"):**
+  - **OPEN:** `brand_contacts` and `BrandUpserted` have no consumer (no
+    `brand_id` in `PaymentConfirmed`).
+  - **Relay lock time unmeasured:** a slow broker that still acks can hold the
+    claim transaction for up to batch x ack timeout (50 x 5 s); recheck Day 9.
+  - **Duplicate observed** with Kafka paused (2 of 2 clean end-to-end runs);
+    cause likely, not proven; consumers must be idempotent.
+  - **Known edge:** wrong amount, then the same ref with the right amount, would
+    leave a `PAID` order with a refund row for its own payment; the refund
+    worker should check before paying out.
 
 ## Decision: Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay
 
-**Status:** **DECIDED 2026-11-05, NOT implemented, NOT tested.** Every number in
+**Status:** **DECIDED 2026-11-05.** **Update 2026-11-06:** points 1 to 5
+implemented and tested on real Postgres, the webhook raced against a simulated
+sweep (`feat/day6-webhook`); point 6 implemented and tested against an embedded
+broker (`feat/day6-relay`); both run once end to end on real processes and the
+docker-compose Kafka, with the payment-stub as gateway, on one laptop
+(`docs/testing.md`, "Day 6 end to end"). Not load-tested, no consumer, not a real
+gateway. See `architecture.md` §8. Every number in
 point 6 is **PROVISIONAL and unmeasured**; recheck on Day 9. The Razorpay Clone
 does not exist, so every behaviour asked of the gateway here is **designed, not
 verified** (CLAUDE.md, Working style 7).
@@ -4970,8 +5028,12 @@ redelivered webhook cannot insert a second refund row.
    crash between the two means a duplicate, which consumers already tolerate
    (Kafka is at-least-once; consumers are idempotent by unique key and CAS).
    Claim with `FOR UPDATE SKIP LOCKED`; **stop the batch at the first failure**,
-   which bounds the time the row locks are held to one ack timeout; record
-   `attempts` and `last_error`. Values: poll **1 s**, batch **50**, ack timeout
+   so a failing pass holds the row locks for about one ack timeout; record
+   `attempts` and `last_error`. *(Corrected 2026-11-06; the earlier wording said
+   this "bounds the time the row locks are held to one ack timeout". That holds
+   only once a send fails. A slow broker that still acks within the timeout can
+   hold the claim transaction, its row locks and its pooled connection, for up to
+   batch x ack timeout (50 x 5 s = 250 s). Unmeasured; recheck Day 9.)* Values: poll **1 s**, batch **50**, ack timeout
    **5 s**.
 
 **Why:**
@@ -4996,9 +5058,24 @@ redelivered webhook cannot insert a second refund row.
   replayed forever; accepted because replay changes nothing.
 - Point 6: a duplicate `PaymentConfirmed` or `OrderCancelled` is expected, not a
   bug. One failed row stops the whole batch for that poll.
+- **Observed (2026-11-05, end-to-end run, added 2026-11-06):** with Kafka paused,
+  the same order's `PaymentConfirmed` was on the topic **twice in 2 of 2 clean
+  runs** (offsets and timestamps in `docs/testing.md`, "Day 6 end to end"). Likely
+  cause, consistent with Order's log but **not proven**: the paused broker
+  appended the timed-out, client-cancelled request when it resumed, and the
+  relay's re-send went out under a new producer epoch, which the idempotent
+  producer does not deduplicate. No decision follows; it is the at-least-once
+  case above, seen for real.
+- **Known edge (added 2026-11-06, no decision):** a wrong-amount `SUCCESS`
+  (point 3) leaves the order `PENDING_PAYMENT` with a `refunds` row for the ref
+  it holds. If the same ref later arrived with the right amount, the `PAID` CAS
+  would win while that refund row still exists. It needs a gateway that reports
+  two amounts for one payment. The future refund worker should check that the
+  order is not `PAID` with that ref before paying out. Not built, not tested.
 
 **Consequences:**
-- **Closes B4 and B1** in the open items (decided, not implemented).
+- **Closes B4 and B1** in the open items (decided; since implemented and tested,
+  see Status).
 - `architecture.md` corrected: a late `FAILED` is guarded by `payment_ref`
   (it no longer "needs no such care"), and `PaymentConfirmed` has no `brand_id`
   for now.
