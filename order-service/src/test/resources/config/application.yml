@@ -1,0 +1,5 @@
+# Test-only overrides, layered over src/main/resources/application.yml
+# (classpath:/config/ wins over classpath:/). Not a real secret: tests sign
+# their own webhooks with it, so the suite runs without PAYMENT_WEBHOOK_SECRET.
+payment-webhook:
+  secret: test-only-webhook-secret
