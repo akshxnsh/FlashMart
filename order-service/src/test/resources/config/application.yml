@@ -4,6 +4,15 @@
 payment-webhook:
   secret: test-only-webhook-secret
 
+# No relay schedule and no topic creation in tests, so no test context talks
+# to a broker unless it asks to (OutboxRelayTest runs the relay by hand
+# against @EmbeddedKafka and turns topic creation back on).
+kafka:
+  create-topics: false
+outbox:
+  relay:
+    enabled: false
+
 # Test-only, NOT the production pool size (still open, from the load test).
 # Spring caches one context per distinct test configuration and each keeps
 # its Hikari pool open, so 10+ contexts x the default 10 exceeded local

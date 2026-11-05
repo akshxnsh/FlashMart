@@ -60,6 +60,13 @@
 			<groupId>io.github.resilience4j</groupId>
 			<artifactId>resilience4j-retry</artifactId>
 		</dependency>
+		<!-- Plain spring-kafka, wired by hand in OutboxKafkaConfig: no Boot Kafka
+		     auto-configuration, so nothing connects to a broker unless the relay
+		     or the topic creation asks it to. Version from the Boot BOM. -->
+		<dependency>
+			<groupId>org.springframework.kafka</groupId>
+			<artifactId>spring-kafka</artifactId>
+		</dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-actuator</artifactId>
@@ -113,6 +120,12 @@
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webmvc-test</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<!-- @EmbeddedKafka: an in-JVM KRaft broker for the relay tests. -->
+		<dependency>
+			<groupId>org.springframework.kafka</groupId>
+			<artifactId>spring-kafka-test</artifactId>
 			<scope>test</scope>
 		</dependency>
 	</dependencies>
