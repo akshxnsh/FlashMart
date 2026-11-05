@@ -95,8 +95,10 @@ public class Order {
      * a deadline, and the deadline values are still open.
      *
      * <p>That makes this the one place a pod clock could leak in. Production
-     * writes it as {@code now() + interval} in SQL, with Java supplying only
-     * the duration; this mapping exists so the row can be inserted at all.
+     * never sets it from Java: {@code OrderCreationTransaction.insert} writes it
+     * as {@code clock_timestamp() + make_interval(...)} in a native INSERT, with
+     * Java supplying only the duration. This mapping exists so the row can be
+     * read, and inserted by tests.
      */
     @Column(name = "expires_at", nullable = false, updatable = false)
     private Instant expiresAt;
