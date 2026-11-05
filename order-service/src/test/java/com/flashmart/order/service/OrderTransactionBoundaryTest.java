@@ -92,6 +92,60 @@ class OrderTransactionBoundaryTest {
         assertEquals(0L, jdbc.queryForObject("select count(*) from outbox where aggregate_id = ?", Long.class, id));
     }
 
+    private long createdOrder(long buyer) {
+        return jdbc.queryForObject("insert into orders (buyer_id, flash_sale_id, status, idempotency_key, "
+                + "expires_at) values (?, ?, 'CREATED', 'k1', clock_timestamp() + interval '1 minute') returning id",
+                Long.class, buyer, SALE);
+    }
+
+    private long outboxRows(long id) {
+        return jdbc.queryForObject("select count(*) from outbox where aggregate_id = ?", Long.class, id);
+    }
+
+    @Test
+    void thePaymentUnavailableCasAndItsOutboxRowRollBackTogether() {
+        long buyer = FROM + 2;
+        long id = createdOrder(buyer);
+
+        assertThrows(IllegalStateException.class, () -> new TransactionTemplate(transactionManager).execute(tx -> {
+            assertTrue(transaction.failPaymentUnavailable(id, buyer, "payment gateway unavailable"));
+            throw new IllegalStateException("roll the surrounding transaction back");
+        }));
+
+        Map<String, Object> order = jdbc.queryForMap("select status, failure_detail from orders where id = ?", id);
+        assertEquals("CREATED", order.get("status"));
+        assertNull(order.get("failure_detail"));
+        assertEquals(0L, outboxRows(id));
+    }
+
+    @Test
+    void onlyTheWinningPaymentUnavailableCasWritesAnOutboxRow() {
+        long buyer = FROM + 3;
+        long id = createdOrder(buyer);
+
+        assertTrue(transaction.failPaymentUnavailable(id, buyer, "first"));
+        assertFalse(transaction.failPaymentUnavailable(id, buyer, "second")); // loses: already PAYMENT_UNAVAILABLE
+
+        assertEquals(1L, outboxRows(id));
+        String payload = jdbc.queryForObject("select payload_json::text from outbox where aggregate_id = ?",
+                String.class, id);
+        assertTrue(payload.contains("\"reason\": \"PAYMENT_UNAVAILABLE\"") && payload.contains("\"order_id\": " + id)
+                && payload.contains("\"buyer_id\": " + buyer), payload);
+        assertEquals("first", jdbc.queryForObject("select failure_detail from orders where id = ?", String.class, id));
+    }
+
+    @Test
+    void aPaymentUnavailableCasThatLosesToTheSweepWritesNothing() {
+        long buyer = FROM + 4;
+        long id = createdOrder(buyer);
+        jdbc.update("update orders set status = 'ORDER_EXPIRED' where id = ?", id);
+
+        assertFalse(transaction.failPaymentUnavailable(id, buyer, "x"));
+
+        assertEquals(0L, outboxRows(id));
+        assertEquals("ORDER_EXPIRED", jdbc.queryForObject("select status from orders where id = ?", String.class, id));
+    }
+
     @Test
     void noTransactionAndNoConnectionIsHeldWhileInventoryIsCalled() {
         List<Boolean> transactionActive = new CopyOnWriteArrayList<>();

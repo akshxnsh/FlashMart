@@ -144,13 +144,45 @@ public class OrderCreationTransaction {
      */
     @Transactional
     public boolean fail(long orderId, long buyerId, String failureDetail) {
-        int won = orders.markReservationFailed(orderId, failureDetail);
-        if (won == 1) {
-            jdbc.update("INSERT INTO outbox (aggregate_id, event_type, payload_json) VALUES (?, ?, ?::jsonb)",
-                    orderId, "OrderCancelled",
-                    "{\"order_id\":" + orderId + ",\"reason\":\"RESERVATION_FAILED\",\"buyer_id\":" + buyerId + "}");
+        return cancelIfWon(orders.markReservationFailed(orderId, failureDetail), orderId, buyerId,
+                OrderStatus.RESERVATION_FAILED);
+    }
+
+    /**
+     * {@code CREATED -> PAYMENT_UNAVAILABLE} and its {@code OrderCancelled}, in
+     * one transaction, exactly like {@link #fail}: the outbox row is written
+     * only if this caller's CAS won, so the event exists if and only if the
+     * state change committed.
+     */
+    @Transactional
+    public boolean failPaymentUnavailable(long orderId, long buyerId, String failureDetail) {
+        return cancelIfWon(orders.markPaymentUnavailable(orderId, failureDetail), orderId, buyerId,
+                OrderStatus.PAYMENT_UNAVAILABLE);
+    }
+
+    /**
+     * {@code CREATED -> PENDING_PAYMENT} with the gateway's reference and the
+     * payment window, in one statement. No outbox row: nothing downstream reacts
+     * to a payment starting. Returns the rows changed; {@code 0} is a loss.
+     */
+    @Transactional
+    public int markPendingPayment(long orderId, String paymentRef, long paymentWindowMs) {
+        return orders.markPendingPayment(orderId, paymentRef, paymentWindowMs / 1000.0);
+    }
+
+    /**
+     * Writes {@code OrderCancelled{order_id, reason, buyer_id}} if and only if
+     * the CAS ({@code rows}) won. Runs inside the caller's transaction. The
+     * reason is the failure state the order moved to.
+     */
+    private boolean cancelIfWon(int rows, long orderId, long buyerId, OrderStatus reason) {
+        if (rows != 1) {
+            return false;
         }
-        return won == 1;
+        jdbc.update("INSERT INTO outbox (aggregate_id, event_type, payload_json) VALUES (?, ?, ?::jsonb)",
+                orderId, "OrderCancelled",
+                "{\"order_id\":" + orderId + ",\"reason\":\"" + reason.name() + "\",\"buyer_id\":" + buyerId + "}");
+        return true;
     }
 
     /**
