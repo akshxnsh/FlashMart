@@ -110,7 +110,10 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
   --   while CREATED, reset to the payment window on entering PENDING_PAYMENT.
   --   One column, because an order has exactly one live deadline. The move is
   --   ONE statement (status + payment_ref + expires_at), so no gap lets the
-  --   sweep expire a healthy order. Written as now() + interval in SQL (DB clock)
+  --   sweep expire a healthy order. V2 says "written as now() + interval"; superseded
+  --   (designed, not built): clock_timestamp() + duration, DB-stamped by a native
+  --   INSERT ... RETURNING id (decisions.md, "Order creation: retries, conflicts,
+  --   deadlines and Inventory failures")
   -- failure_detail: nullable, debug only — never drives state
   -- payment_reconciled_at: nullable; set once the reconciliation sweep has
   --   settled this order (DB clock). Bounds and idempotency-guards the sweep
@@ -152,9 +155,10 @@ order_items(id, order_id, product_id, product_name, quantity, unit_price, subtot
   -- RECORDED, NOT BUILT: product_name/unit_price/subtotal are written once —
   --   the pricing UPDATE carries WHERE unit_price IS NULL, on top of the
   --   orders.status = 'CREATED' guard
-  -- RECORDED, NOT BUILT: recovery is abort (decisions.md, "saga_state is
-  --   dropped"). IF a resume path is ever added (e.g. a retried create while
-  --   the order is still CREATED), it runs only over rows WHERE unit_price IS NULL
+  -- RECORDED, NOT BUILT: recovery was abort (decisions.md, "saga_state is
+  --   dropped"); amended 2026-11-05: abort by expiry OR resume on a retried
+  --   create while CREATED ("Order creation: retries, conflicts, deadlines and
+  --   Inventory failures"). The resume runs only over rows WHERE unit_price IS NULL
 
 refunds(id, order_id, payment_ref, amount, status, attempts,
         next_retry_at, claimed_at, last_error, created_at, updated_at)
@@ -450,7 +454,7 @@ synchronous status check in §3.
 `PAYMENT_FAILED`, `ORDER_EXPIRED`, `PAYMENT_UNAVAILABLE`, `RESERVATION_FAILED`.
 
 - `CREATED → PENDING_PAYMENT` — every item reserved, `amount` set, gateway returned 202. Saves `payment_ref`, resets `expires_at` to the payment window.
-- `CREATED → RESERVATION_FAILED` — an item came back `OUT_OF_STOCK`, `SALE_NOT_LIVE` or `ITEM_NOT_IN_SALE` (decided; no new state, no migration). A state exists only if something downstream reacts differently to it, and every reserve "no" gets the same reaction: release everything, send no email, tell the buyer in the reply. Which outcome it was goes in `failure_detail` (debug only) and in the buyer's reply. What Order does on `RESERVATION_RELEASED` is not yet specified (§9).
+- `CREATED → RESERVATION_FAILED` — an item came back `OUT_OF_STOCK`, `SALE_NOT_LIVE` or `ITEM_NOT_IN_SALE` (decided; no new state, no migration). A state exists only if something downstream reacts differently to it, and every reserve "no" gets the same reaction: release everything, send no email, tell the buyer in the reply. Which outcome it was goes in `failure_detail` (debug only) and in the buyer's reply. An Inventory timeout or refusal mid-loop also ends as `RESERVATION_FAILED` (`503 INVENTORY_UNAVAILABLE`, cause in `failure_detail`). On `RESERVATION_RELEASED` Order stops without a CAS or event and reports the real status. Both decided 2026-11-05, designed not built (§9).
 - `CREATED → PAYMENT_UNAVAILABLE` — circuit breaker open on initiate.
 - `CREATED → ORDER_EXPIRED` — didn't finish the loop + initiate before its deadline.
 - `PENDING_PAYMENT → PAID` — webhook success *for the payment this order holds*.
@@ -884,9 +888,11 @@ or "recorded, not decided" still need a design decision.
   order" plus scanning `PAID` orders is judged not worth it against that
   likelihood. This is the one place in the design that leans on prevention
   rather than independent correction.
-- Settle the two derived deadlines (`CREATED`, refund claim lease), the
-  Order sweep interval, and the payment window — blocked on real
-  Feign/Resilience4j config by design.
+- The `CREATED` deadline is **provisionally derived** (60 s policy, 2 s per-call
+  timeout, 5 s margin, `maxLines` 30; decisions.md, "Order creation: retries,
+  conflicts, deadlines and Inventory failures"). Still open: the refund claim
+  lease, the Order sweep interval and the payment window, plus the retry
+  multiplier (Day 5) — blocked on real Feign/Resilience4j config by design.
 - **Locking strategy and isolation level for `flash_sale_items`: decided**
   (implemented, tested single-threaded and raced in a contention test; first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
   Pool size and timeout values, and insert-first vs update-first, come from
@@ -901,8 +907,9 @@ or "recorded, not decided" still need a design decision.
   That was the two-clocks problem the DB-clock rule exists to remove,
   reintroduced through the column type. Any new time column must be
   `TIMESTAMPTZ`; never compare a zone-less column against `now()`.
-- **Two database clock functions are in use for the same job (recorded, not
-  decided).** `stock_reservations.reserved_at` defaults to `now()`
+- **Two database clock functions are in use for the same job (recorded; the
+  deadline case is decided 2026-11-05: deadlines use `clock_timestamp()`, audit
+  stamps may use `now()`, `reserved_at` stays `now()`).** `stock_reservations.reserved_at` defaults to `now()`
   (`transaction_timestamp()` — when the transaction began); Identity's
   `updated_at` trigger and Order's DB-stamped columns use `clock_timestamp()`
   (when the statement runs). Neither is a bug: a strictly increasing
@@ -941,33 +948,37 @@ or "recorded, not decided" still need a design decision.
 - **FR-B1 (buyer browse) has no endpoint.** It waits for security and
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
-- **What Order does when `reserve` returns `RESERVATION_RELEASED`** mid-loop is
-  not specified. Recorded, not decided.
+- **Decided 2026-11-05, designed not built:** on `RESERVATION_RELEASED`
+  mid-loop Order stops the loop, writes no CAS and no event, re-reads the real
+  status and reports it; if still `CREATED`, it alerts and does not guess.
 - **Decided, not built:** all three reserve "no" outcomes (`OUT_OF_STOCK`,
   `SALE_NOT_LIVE`, `ITEM_NOT_IN_SALE`) end the order as `RESERVATION_FAILED`.
   No new state, no migration (§6).
-- **For Order's API piece: what a retried create with the same idempotency key
-  returns when the order is already `RESERVATION_FAILED`.** `failure_detail`
-  is debug only and never drives behaviour, so the retry cannot read the
-  original outcome from it. Not decided.
+- **Decided 2026-11-05, designed not built:** a retried create on a
+  `RESERVATION_FAILED` order replays the failure with no reason and never
+  calls Inventory; a new attempt needs a new key. `failure_detail` stays
+  debug only.
 - **Bean Validation exists in Inventory only.** Identity, Order and
   Notification add `spring-boot-starter-validation` in their own API phase.
 - **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` from Order instead of
   firing an Inventory alert. Not built.
-- **For Order's API piece: a unique violation on order insert must map to `409`**
-  and return the existing live-or-paid order, so the buyer can finish paying it.
-  Never a `500`. Needed by `uk_orders_buyer_sale_live_or_paid`. Not built.
+- **Decided 2026-11-05, not built:** any unique violation on order insert is
+  caught and re-queried in a new transaction (never parsing constraint names):
+  same `(buyer_id, idempotency_key)` is a replay; else `409 ORDER_ALREADY_OPEN`
+  with the existing order; else `409 CONFLICT_RETRY`. Never a `500`.
 - **A buyer cannot start a new order while an unpaid one is open**, until it
   pays or expires. The wait is bounded by the payment window (value still
   open, see the derived deadlines). Accepted cost of the one-live-order rule.
 - **One person with two accounts is not covered** by the one-live-order rule:
   the rule is per `buyer_id`, and Identity does not link accounts. The cap of
   5 is also still per item per order.
-- **A retried create while the order is still `CREATED` is not specified**
-  (`UNIQUE(buyer_id, idempotency_key)` finds the row; what the request then
-  does is undecided). Recovery today is abort; see the conditional rule on
-  `order_items` (§4).
+- **Decided 2026-11-05, not built:** a retried create while `CREATED` re-runs
+  the reserve loop (abort by expiry **or** resume on retry), safe only if every
+  write is CAS/write-once and the outbox row is written only when the CAS wins.
+  A **hypothesis** until a two-thread test proves it. Also: same key with a
+  different request is `409 IDEMPOTENCY_KEY_REUSED`, checked before replay.
+  See the conditional rule on `order_items` (§4).
 - Identity, for the API phase: a lost signup race must surface as "email
   already taken", not a 500; the JWT must say whether its subject is a brand
   or a user (brand 7 and user 7 share an id); published `outbox` rows need a
@@ -991,13 +1002,24 @@ or "recorded, not decided" still need a design decision.
   - **A3:** redesign of the sweep and refund indexes. Not decided.
   - **B1:** `ON CONFLICT` for the refund insert. Not decided.
   - **B2, B3:** the retried create (and the `409` it returns) and a request
-    fingerprint. Not decided. See also the two retried-create items above.
+    fingerprint. **Decided 2026-11-05, designed not built** (no fingerprint
+    column; compare against stored `flash_sale_id` and `order_items`).
   - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`. Not
     decided.
-  - **B5:** which clock function stamps `expires_at`. Not decided. See also
-    the `now()` vs `clock_timestamp()` item.
+  - **B5:** which clock function stamps `expires_at`. **Decided 2026-11-05:**
+    `clock_timestamp()`, stamped by the database (native `INSERT ... RETURNING
+    id`). Not built.
   - A `CHECK` on `payment_reconciled_at`, and a `CHECK` that `PROCESSING`
-    implies `claimed_at`. Not decided.
+    implies `claimed_at`. **Decided 2026-11-05; V8, not written yet.**
+- **New, 2026-11-05 ("Order creation: retries, conflicts, deadlines and
+  Inventory failures"), all designed not built:** an Inventory timeout or
+  refusal mid-loop ends the order as `RESERVATION_FAILED` + `OrderCancelled`,
+  `503 INVENTORY_UNAVAILABLE`. **Known gap:** a timed-out call can commit after
+  the release and orphan a reservation; covered only by the Day 7 republish and
+  the reconciler (designed, not verified). The HTTP client is Spring Cloud
+  OpenFeign (2025.1.x train); its compatibility with Boot 4.1.1 is unverified
+  until it resolves and starts. The 2 s per-call timeout and 5 s margin are
+  provisional; recheck on Day 9.
 
 The PRD is `docs/Flashmart.prd` (Revision 4, markdown). The earlier
 `FlashMart_Project_Plan_v3.pdf` reference was stale — no such file exists or
