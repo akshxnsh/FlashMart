@@ -1,0 +1,6 @@
+# Test-only overrides, layered over src/main/resources/application.yml
+# (classpath:/config/ wins over classpath:/). No listener containers start in
+# tests, so no test context talks to a broker unless it asks to
+# (InventoryConsumerKafkaTest turns them back on against @EmbeddedKafka).
+kafka:
+  consumers-enabled: false
