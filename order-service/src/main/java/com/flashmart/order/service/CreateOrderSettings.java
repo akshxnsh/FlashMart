@@ -3,6 +3,8 @@ package com.flashmart.order.service;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.math.BigDecimal;
+
 /**
  * The numbers the create path is derived from (decisions.md, "Order creation:
  * retries, conflicts, deadlines and Inventory failures", point 7). All
@@ -23,17 +25,26 @@ public class CreateOrderSettings {
     private final long reserveTimeoutMs;
     private final long maxBlockingMs;
     private final long marginMs;
+    private final BigDecimal fee;
 
     public CreateOrderSettings(@Value("${inventory.reserve-timeout-ms}") long reserveTimeoutMs,
                                @Value("${order.create.max-blocking-time-ms}") long maxBlockingMs,
-                               @Value("${order.create.deadline-margin-ms}") long marginMs) {
-        if (reserveTimeoutMs <= 0 || maxBlockingMs < reserveTimeoutMs || marginMs < 0) {
+                               @Value("${order.create.deadline-margin-ms}") long marginMs,
+                               @Value("${order.fee}") BigDecimal fee) {
+        if (reserveTimeoutMs <= 0 || maxBlockingMs < reserveTimeoutMs || marginMs < 0
+                || fee == null || fee.signum() < 0) {
             throw new IllegalStateException("bad create-order timing config: reserve=" + reserveTimeoutMs
                     + " ms, max-blocking=" + maxBlockingMs + " ms, margin=" + marginMs + " ms");
         }
         this.reserveTimeoutMs = reserveTimeoutMs;
         this.maxBlockingMs = maxBlockingMs;
         this.marginMs = marginMs;
+        this.fee = fee;
+    }
+
+    /** The flat fee added to every order's amount (decisions.md, "Day 5", point 1). */
+    public BigDecimal fee() {
+        return fee;
     }
 
     /** 30 with the current config (60 s / 2 s). */

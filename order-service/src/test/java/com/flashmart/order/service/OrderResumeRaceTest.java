@@ -179,8 +179,8 @@ class OrderResumeRaceTest {
                 }
                 Map<String, Object> row = jdbc.queryForMap("select status, amount from orders where id = ?", id);
                 if (!"CREATED".equals(row.get("status"))
-                        || ((BigDecimal) row.get("amount")).compareTo(new BigDecimal("30.00")) != 0) {
-                    problems.add("order " + row + " (want CREATED, 30.00)");
+                        || ((BigDecimal) row.get("amount")).compareTo(new BigDecimal("79.00")) != 0) {
+                    problems.add("order " + row + " (want CREATED, 79.00)");
                 }
                 if (outboxRows(id) != 0) {
                     problems.add(outboxRows(id) + " outbox rows (want 0)");

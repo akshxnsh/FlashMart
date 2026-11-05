@@ -51,6 +51,9 @@ inventory:
   reserve-timeout-ms: 2000
 
 order:
+  # Flat fee added to every order's amount (BigDecimal; a JSON string at every
+  # boundary). PROVISIONAL. Not stored: fee = amount - SUM(order_items.subtotal).
+  fee: 49.00
   create:
     # Policy: the longest a crashed order may block its buyer (one live order
     # per buyer and sale). maxLines = floor(max-blocking-time / reserve-timeout).

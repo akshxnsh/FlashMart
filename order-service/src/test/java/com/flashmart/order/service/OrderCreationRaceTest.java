@@ -169,7 +169,7 @@ class OrderCreationRaceTest {
     /**
      * With the reserve loop (Inventory mocked as RESERVED, 10.00 per unit): the
      * order is CREATED, every item priced exactly once with consistent values,
-     * amount = SUM(subtotal) = 30.00 (1 x 10.00 + 2 x 10.00), and no outbox row.
+     * amount = SUM(subtotal) + 49.00 fee = 79.00 (1 x 10.00 + 2 x 10.00), and no outbox row.
      * Each response's amount is null or that sum.
      */
     private List<String> finalStateProblems(long buyer, List<Outcome> outcomes) {
@@ -185,8 +185,8 @@ class OrderCreationRaceTest {
             problems.add(unpriced + " items unpriced or inconsistent");
         }
         BigDecimal amount = (BigDecimal) order.get("amount");
-        if (amount == null || amount.compareTo(new BigDecimal("30.00")) != 0) {
-            problems.add("amount " + amount + " (want 30.00)");
+        if (amount == null || amount.compareTo(new BigDecimal("79.00")) != 0) {
+            problems.add("amount " + amount + " (want 79.00)");
         }
         long outbox = jdbc.queryForObject("select count(*) from outbox where aggregate_id = ?",
                 Long.class, order.get("id"));
@@ -195,7 +195,7 @@ class OrderCreationRaceTest {
         }
         for (Outcome o : outcomes) {
             if (o.result() != null && o.result().body().amount() != null
-                    && o.result().body().amount().compareTo(new BigDecimal("30.00")) != 0) {
+                    && o.result().body().amount().compareTo(new BigDecimal("79.00")) != 0) {
                 problems.add("a response says amount " + o.result().body().amount());
             }
         }

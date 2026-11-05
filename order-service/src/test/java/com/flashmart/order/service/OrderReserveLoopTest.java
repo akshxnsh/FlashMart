@@ -125,10 +125,10 @@ class OrderReserveLoopTest {
 
         assertTrue(result.created());
         assertEquals("CREATED", result.body().status());
-        assertEquals(new BigDecimal("225.50"), result.body().amount()); // 2 x 100.00 + 25.50
+        assertEquals(new BigDecimal("274.50"), result.body().amount()); // 2 x 100.00 + 25.50 + 49.00 fee
         long id = result.body().orderId();
         assertEquals(2, pricedItems(id));
-        assertEquals(0, new BigDecimal("225.50").compareTo((BigDecimal) order(id).get("amount")));
+        assertEquals(0, new BigDecimal("274.50").compareTo((BigDecimal) order(id).get("amount")));
         assertTrue(outbox(id).isEmpty());
     }
 
@@ -246,7 +246,7 @@ class OrderReserveLoopTest {
 
         assertFalse(retry.created());
         assertEquals(id, retry.body().orderId());
-        assertEquals(new BigDecimal("30.00"), retry.body().amount());
+        assertEquals(new BigDecimal("79.00"), retry.body().amount());
         verify(inventory, never()).reserve(new ReserveRequest(id, SALE, 11L, 1));
         verify(inventory).reserve(new ReserveRequest(id, SALE, 12L, 1));
         verify(inventory).reserve(new ReserveRequest(id, SALE, 13L, 1));

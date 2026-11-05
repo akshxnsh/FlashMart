@@ -92,6 +92,22 @@ class OrderRepositoryCasTest {
         assertEquals(0, new BigDecimal("199.98").compareTo(amountOf(id)));
     }
 
+    /**
+     * The test below cannot see the {@code status = 'CREATED'} guard: its order
+     * already has an amount, so {@code amount IS NULL} stops the write alone.
+     * This one has a NULL amount and a non-CREATED status, so only the status
+     * guard can stop it (a failed order must never be priced after the fact).
+     */
+    @Test
+    void setAmountLosesOnANonCreatedOrderThatStillHasNoAmount() {
+        Long id = orderIn(OrderStatus.RESERVATION_FAILED); // amount IS NULL
+
+        assertEquals(0, orders.setAmount(id, new BigDecimal("5.00")));
+
+        assertEquals(null, amountOf(id));
+        assertEquals("RESERVATION_FAILED", statusOf(id));
+    }
+
     @Test
     void setAmountLosesWhenTheOrderIsNotCreated() {
         Long id = orderIn(OrderStatus.PENDING_PAYMENT); // already has amount 100.00
