@@ -1072,6 +1072,12 @@ or "recorded, not decided" still need a design decision.
   **Implemented and tested for the fee and the deadline** (`maxLines` 17, 3 s per
   call; §8); the payment client and breaker are implemented and tested against a
   stub only (§8); the sweep is not built. Pool size and DB timeout values stay open.
+- **Test isolation (noted, not fixed):** 4 Order entity tests
+  (`OrderPersistenceTest`, `OrderSchemaHardeningTest`, two in
+  `OutboxEventPersistenceTest`) count absolute rows in the shared dev database,
+  so they failed after the Day 5 demo left orders and outbox rows behind, and
+  passed after `seed.sh` reset them. Reset before running the suite until they
+  count only their own rows.
 - **Locking strategy and isolation level for `flash_sale_items`: decided**
   (implemented, tested single-threaded and raced in a contention test; first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
   Pool size and timeout values, and insert-first vs update-first, come from
