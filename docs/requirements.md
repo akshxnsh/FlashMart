@@ -216,6 +216,15 @@ must not assume any of it is proven.
   never by the gateway's payment reference, which FlashMart may not have saved
   yet in exactly the crash window a webhook is most likely to arrive in.
 
+**Status (2026-11-06):** still **designed, not verified** for the Razorpay
+Clone. The local `payment-stub` (not the Clone, not a real gateway) imitates
+the shape of RZP-1, 4, 5, 6, 7, 8 and 9 (idempotent initiate keyed by
+`Idempotency-Key`, `202` only, HMAC-SHA256-signed webhooks carrying our order id,
+its payment ref and the amount as a string), so FlashMart's own side of those
+contracts is tested against it (`architecture.md` §8). That proves nothing about
+the Clone. The stub has no refund and no status lookup, so RZP-2 and RZP-3 are not
+exercised at all.
+
 **Correctness does not depend on RZP-1–3 being honoured** — if idempotency
 ever fails to dedupe, FlashMart's one-payment invariant and already-refunded
 check catch the failure independently (see "An order keeps exactly one
