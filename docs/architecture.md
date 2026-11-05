@@ -852,6 +852,32 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     not started), a real process crash (the crash window is simulated by a
     failing UPDATE), any consumer service (Inventory's consumer is Day 7), a
     multi-partition topic, broker failover, any load or relay lag measurement.
+    (A separate broker process has since been used; see the next item.)
+- **Day 6 webhook + relay ALSO VERIFIED against real processes and the
+  docker-compose Kafka, on one laptop (`docs/testing.md`, "Day 6 end to end").**
+  Not load-tested; the gateway is the payment-stub, not a real gateway and not
+  the Razorpay Clone; no consumer service. Real inventory, order and payment-stub
+  processes, local Postgres, `apache/kafka:4.3.1` in Docker. Script run 3 times
+  (run 1's Kafka read-back broken by a script bug, runs 2 and 3 clean). Observed:
+  happy path to `PAID` and one `payment-confirmed` message (money as strings, no
+  `brand_id`); SUCCESS x3 = one message, 0 refunds; a second ref on a `PAID`
+  order = one refund row however often sent; wrong amount = `PENDING_PAYMENT` +
+  refund of the webhook amount; early webhook = stub sees `409` then `200` about
+  2 s later; bad signature `401`; a row written with the relay off is published
+  after Order restarts (a stop, not a crash at the ack instant); with Kafka
+  paused 31.5 s the relay failed a pass about every 6 s (`attempts` rose 0 to 5)
+  and published as the broker resumed. **That paused run produced a DUPLICATE
+  message (2 of 2 clean runs)**: the first send, timed out and cancelled by the
+  client, was still appended by the broker after the pause, and the re-send
+  added a second copy. At-least-once as designed; consumers must be idempotent.
+- **Payment-stub webhook sender (`feat/day6-stub-webhook`): BUILT and TESTED
+  (its own suite, against a fake Order) and used in the run above.** Signs the
+  exact bytes it sends (HMAC-SHA256, `PAYMENT_WEBHOOK_SECRET`, blank fails
+  startup); retries every 2 s on any non-2xx or I/O error, gives up after 120 s
+  (the stub's ASSUMPTION about a gateway, WARN at startup if not above Order's
+  62.5 s longest CREATED deadline); `/admin/webhook` (stored-payment defaults,
+  any field overridable, `times` for redelivery); `/admin/auto-webhook` (OFF,
+  SUCCESS, FAILED; `BEFORE_REPLY` sends attempt 1 before the initiate `202`).
 - **Payment stub (`payment-stub/`, merged from `feat/day5-payment-stub`): BUILT
   and TESTED ALONE (its own suite); run against Order only in the failure demo
   above; NOT verified against a real gateway.** Listens on 127.0.0.1 only.
@@ -870,7 +896,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   lookup (4 tests failed) and on the per-key atomicity (the race test failed in
   3 of 3 runs). **Money is a decimal string here; real gateways use integer
   minor units**, so this is not a model of one. It is not the Razorpay Clone and
-  proves none of RZP-1 to RZP-9. Not built: webhooks, refund, status lookup.
+  proves none of RZP-1 to RZP-9. Not built: refund, status lookup (webhooks since built, see the Day 6 items above).
 - **Not built anywhere:** repositories beyond the Day-1 ones above (apart from
   the ones `reserve` added), service implementations other than Inventory's
   `reserve` and Order's create path, any controller other than Inventory's

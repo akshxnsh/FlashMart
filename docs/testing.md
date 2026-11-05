@@ -418,3 +418,234 @@ echo "== after 5: did the breaker open? probe with orders while the stub is HEAL
 for i in 1 2; do step "probe order #$i" $b "probe-$b"; b=$((b+1)); done
 echo "== end"
 ```
+
+## Day 6 end to end: webhook, outbox relay and a real Kafka (2026-11-05)
+
+**Label: verified against real processes and the docker-compose Kafka, on one
+laptop.** The full script was run 3 times. Run 1's Kafka read-back was broken
+by a script bug (Git Bash rewrote `/opt/kafka/...` inside `docker compose exec`),
+so its "0 messages" lines are void; runs 2 and 3 read Kafka correctly. The
+tables below are run 3, with run 2 noted where it differed. No load. The gateway
+is the payment-stub, not a real gateway and not the Razorpay Clone. Nothing
+consumes the topics (Inventory's consumer is Day 7), so no stock confirmation or
+release was observed.
+
+### Setup
+
+- Windows 11, Java 25.0.2, local PostgreSQL 18, Docker Desktop 29.9.2 with
+  **only** the Kafka service from `docker-compose.yml` (`docker compose up -d
+  kafka`, image `apache/kafka:4.3.1`, reported `healthy`). Postgres from compose
+  was not started (the local one owns 5432).
+- `inventory-service` (8082), `order-service` (8083, `--kafka.create-topics=true`,
+  `--spring.jpa.show-sql=false`) and `payment-stub` (127.0.0.1:8085) from
+  `mvnw -DskipTests package` jars, run with `java -jar`; default config otherwise
+  (relay poll 1 s, batch 50, ack timeout 5 s; stub webhook retry every 2 s for up
+  to 120 s, 1 s per attempt).
+- `DB_USERNAME`, `DB_PASSWORD`, `PAYMENT_WEBHOOK_SECRET` exported from the
+  repo-root `.env` (gitignored) into every process; never printed.
+- `scripts/seed/seed.sh` first. Every order: sale 1, product 2 (799.00) x 1, so
+  amount 848.00 with the fee. Buyers 201..205, one per order.
+- Order created both topics itself on start-up (`kafka-topics.sh --list`:
+  `__consumer_offsets order-cancelled payment-confirmed`).
+
+### Results (run 3)
+
+| # | Scenario | What was sent | Observed |
+|---|---|---|---|
+| 1 | Happy path | order 17007, then `/admin/webhook` SUCCESS | `201 PENDING_PAYMENT`; webhook `200` on attempt 1; order `PAID`; outbox row published about 2 s later, `attempts` 0; 0 refunds; one message on `payment-confirmed`, key `17007`, value `{"items": [{"quantity": 1, "subtotal": "799.00", "product_id": 2, "unit_price": "799.00", "product_name": "Zephyr Court Tee"}], "amount": "848.00", "buyer_id": 201, "order_id": 17007}`: money as strings, no `brand_id`, no envelope (key order is jsonb's) |
+| 2 | Same SUCCESS x3 | `times: 3` on order 17007 | three deliveries, each `200` on attempt 1; still `PAID`; 0 refunds; still **1** message for 17007 |
+| 3 | Another ref on a PAID order, twice | `payment_ref: pay_second_17007`, sent twice | `200` both times; **1** refund row (`pay_second_17007 848.00 PENDING`) after the first and still 1 after the second; order still `PAID` with its own ref |
+| 4 | Wrong amount | order 17008, SUCCESS with `amount: "1.00"` | `200`; order stays `PENDING_PAYMENT`; 1 refund row for the held ref with amount **1.00** (the webhook's); no outbox row |
+| 5 | Early webhook | auto SUCCESS + `BEFORE_REPLY`, order 17009 | stub log: attempt 1 at +9 ms -> `409 TOO_EARLY`; attempt 2 at +2023 ms -> `200 PAID`. Order answered the buyer `201 PENDING_PAYMENT`, then ended `PAID`; 1 message. Run 2: +9 ms `409`, +2020 ms `200` |
+| 6 | Bad signature | `X-Signature: 00ff`, sent with curl straight to Order | `401 INVALID_SIGNATURE`; order 17008 unchanged |
+| 7 | Event outlives an Order restart | Order restarted with `outbox.relay.enabled=false`; order 17010 paid; Order stopped; restarted with the relay on | relay off: order `PAID`, outbox row `published_at` NULL, 0 messages. After restart with the relay on: published within the start-up (published_at 22:43:50.03, before the script saw the health check pass at 22:43:50.27); 1 message |
+| 8 | Kafka paused | order 17011; `docker compose pause kafka`; SUCCESS; 31.5 s later `unpause` | webhook `200`, order `PAID` throughout. Outbox row sampled every ~5 s: `attempts` 0, 1, 2, 3, 4, 5 (one failed pass about every 6 s: 5 s ack/metadata wait + 1 s poll). First `last_error`: `no broker ack within 5000 ms`; later ones `Topic payment-confirmed not present in metadata after 5000 ms`. Published at 22:44:38.12, i.e. as soon as the broker resumed (the unpause command returned at 22:44:38.20). **2 messages** for 17011 (see below). Run 2: same pattern, 2 messages for 17006 |
+
+Totals, run 3: 4 outbox rows, 0 unpublished; messages per paid order 1, 1, 1, **2**.
+
+### What it shows
+
+- Every Day 6 webhook rule held against real processes: redelivery is a no-op,
+  a second ref is refunded exactly once, a wrong amount is refunded and does not
+  pay, a bad signature is `401`, and the early webhook is `409` and then applied
+  on the stub's retry 2 s later.
+- No event was lost in any scenario: a row written while the relay was off, or
+  while Kafka was paused, was published once the relay or the broker was back.
+- **A duplicate, observed 2 of 2 times (runs 2 and 3) with Kafka paused.** The
+  two copies of 17011 are offsets 13 and 14 with producer timestamps 22:44:07.097
+  (the relay's first send, 0.4 s after the pause) and 22:44:38.111 (the re-send
+  after the unpause). Order's log at 22:44:12 shows the client timing out,
+  "Cancelled in-flight PRODUCE request ... due to node 1 being disconnected",
+  and bumping its producer epoch. The likely explanation, consistent with the
+  log but not proven: the paused broker still held that request and appended it
+  when it resumed, and the relay's later send was a new record under the new
+  epoch, which the idempotent producer does not deduplicate. This is the
+  at-least-once behaviour decided in Day 6, point 6: consumers must be
+  idempotent. Run 1's topic also holds two copies of its paused-scenario order
+  (17001), seen after the script was fixed.
+- During the pause each failed pass held its row lock for about 5 to 6 s (the
+  ack or metadata timeout), as designed.
+
+### Not shown
+
+- Not a real gateway and not the Razorpay Clone: the stub's retry policy (every
+  2 s, give up at 120 s) is its own assumption.
+- Not a crash at the exact instant between the ack and the commit: scenario 7
+  stops Order (the shell's `kill`, while nothing was in flight) with the relay
+  off, which simulates "written but not yet published", nothing more.
+- No consumer service, so nothing de-duplicates the duplicate here.
+- One laptop, one broker, one partition, no load, no timings beyond the single
+  observations above.
+
+### Left behind after the run
+
+The Order database held the rows of the last run; `seed.sh` was run right
+after, before the test suite (4 Order tests count absolute rows). The
+`payment-confirmed` topic holds all three runs' messages until the container is
+removed (`docker compose stop kafka` keeps them).
+
+### The script
+
+Run from the repo root in Git Bash, after `docker compose up -d kafka` is
+healthy and the three jars are built. It starts and stops its own processes.
+
+```bash
+#!/usr/bin/env bash
+# Day 6 end-to-end run: real inventory (8082), order (8083) and payment-stub
+# (8085) processes, local Postgres, the docker-compose Kafka. One laptop.
+#
+# Run from the repo root, in Git Bash, after:
+#   docker compose up -d kafka            (and wait for "healthy")
+#   (cd order-service && ./mvnw -q -DskipTests package)   # same for inventory-service, payment-stub
+# Reads DB_USERNAME, DB_PASSWORD, PAYMENT_WEBHOOK_SECRET from ./.env (never
+# printed). LOGDIR (default $TMP/flashmart-e2e, outside the repo) gets the logs.
+set -uo pipefail
+set -a; . ./.env; set +a
+export PGPASSWORD="$DB_PASSWORD"
+LOGDIR="${LOGDIR:-${TMP:-/tmp}/flashmart-e2e}"; mkdir -p "$LOGDIR"
+
+ORDER=http://localhost:8083
+STUB=http://127.0.0.1:8085
+SALE=1; PRODUCT=2        # Court Tee 799.00 + 49.00 fee = 848.00
+
+# Git Bash rewrites /opt/... into a Windows path unless told not to.
+kx() { MSYS_NO_PATHCONV=1 docker compose exec -T kafka "$@"; }
+q() { psql -w -h localhost -U "$DB_USERNAME" -d "$1" -Atc "$2"; }
+ts() { date +%H:%M:%S.%3N; }
+wait_up() { # wait_up <url> : until anything answers
+  for _ in $(seq 1 120); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$1")" != "000" ] && return 0; sleep 1
+  done; echo "!! $1 never came up"; exit 1
+}
+start_order() { # start_order <log> [extra args]
+  local log="$1"; shift
+  java -jar order-service/target/order-service-0.0.1-SNAPSHOT.jar --spring.jpa.show-sql=false \
+    --kafka.create-topics=true "$@" > "$LOGDIR/$log" 2>&1 &
+  ORDER_PID=$!; wait_up "$ORDER/actuator/health"; echo "  [$(ts) order up, pid $ORDER_PID, $*]"
+}
+stop_order() { kill "$ORDER_PID"; wait "$ORDER_PID" 2>/dev/null; echo "  [$(ts) order stopped]"; }
+
+create() { # create <buyer> -> prints the order id; body to stdout of the caller via $LAST
+  LAST=$(curl -s -w ' HTTP %{http_code}' -X POST "$ORDER/api/orders" -H 'Content-Type: application/json' \
+    -H "X-Buyer-Id: $1" -H "Idempotency-Key: e2e-$1" \
+    -d "{\"flashSaleId\":$SALE,\"items\":[{\"productId\":$PRODUCT,\"quantity\":1}]}")
+  echo "  create buyer $1: $LAST" >&2
+  q order-service "select id from orders where buyer_id = $1 order by id desc limit 1"
+}
+hook() { # hook '<json>' : /admin/webhook on the stub
+  echo "  stub /admin/webhook $1 -> $(curl -s -X POST "$STUB/admin/webhook" -H 'Content-Type: application/json' -d "$1")"
+}
+row() { q order-service "select status || ' ref=' || coalesce(payment_ref,'-') || ' amount=' || amount from orders where id = $1"; }
+refunds() { q order-service "select count(*) || ' row(s) ' || coalesce(string_agg(payment_ref || ' ' || amount || ' ' || status, '; '), '') from refunds where order_id = $1"; }
+outbox() { q order-service "select coalesce(string_agg(event_type || ' published_at=' || coalesce(published_at::text,'NULL') || ' attempts=' || attempts || ' last_error=' || coalesce(left(last_error, 160),'-'), ' | '), 'none') from outbox where aggregate_id = $1"; }
+# Messages on payment-confirmed with key <order id>, read inside the container.
+messages() {
+  kx /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:29092 \
+    --topic payment-confirmed --from-beginning --formatter-property print.key=true --formatter-property key.separator=' => ' \
+    --timeout-ms 6000 2>/dev/null | grep "^$1 => "
+}
+count_messages() { messages "$1" | wc -l | tr -d ' '; }
+
+echo "== setup $(ts)"
+bash scripts/seed/seed.sh > /dev/null && echo "  seeded"
+java -jar inventory-service/target/inventory-service-0.0.1-SNAPSHOT.jar > "$LOGDIR/inventory.log" 2>&1 &
+INV_PID=$!
+java -jar payment-stub/target/payment-stub-0.0.1-SNAPSHOT.jar > "$LOGDIR/stub.log" 2>&1 &
+STUB_PID=$!
+wait_up "$STUB/admin/mode"; wait_up http://localhost:8082/api/reservations
+start_order order-1.log
+echo "  topics: $(kx /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list | tr '\n' ' ')"
+
+echo "== 1) happy path $(ts)"
+id1=$(create 201); echo "  order $id1: $(row "$id1")"
+hook "{\"order_id\":$id1}"
+sleep 3
+echo "  order: $(row "$id1")"; echo "  outbox: $(outbox "$id1")"; echo "  refunds: $(refunds "$id1")"
+echo "  payment-confirmed messages for $id1:"; messages "$id1" | sed 's/^/    /'
+
+echo "== 2) same SUCCESS x3 $(ts)"
+hook "{\"order_id\":$id1,\"times\":3}"
+sleep 3
+echo "  order: $(row "$id1")"; echo "  refunds: $(refunds "$id1")"
+echo "  messages for $id1: $(count_messages "$id1")"
+
+echo "== 3) another ref on the PAID order, sent twice $(ts)"
+hook "{\"order_id\":$id1,\"payment_ref\":\"pay_second_$id1\"}"
+echo "  refunds after 1st: $(refunds "$id1")"
+hook "{\"order_id\":$id1,\"payment_ref\":\"pay_second_$id1\"}"
+echo "  refunds after 2nd: $(refunds "$id1")"; echo "  order: $(row "$id1")"
+
+echo "== 4) wrong amount $(ts)"
+id4=$(create 202); echo "  order $id4: $(row "$id4")"
+hook "{\"order_id\":$id4,\"amount\":\"1.00\"}"
+echo "  order: $(row "$id4")"; echo "  refunds: $(refunds "$id4")"; echo "  outbox: $(outbox "$id4")"
+
+echo "== 5) early webhook: auto SUCCESS, BEFORE_REPLY $(ts)"
+curl -s -X POST "$STUB/admin/auto-webhook" -H 'Content-Type: application/json' \
+  -d '{"status":"SUCCESS","timing":"BEFORE_REPLY"}' > /dev/null
+id5=$(create 203); echo "  order $id5 right after create: $(row "$id5")"
+sleep 5
+curl -s -X POST "$STUB/admin/auto-webhook" -H 'Content-Type: application/json' -d '{"status":"OFF"}' > /dev/null
+echo "  order: $(row "$id5")"; echo "  outbox: $(outbox "$id5")"
+echo "  stub log:"; grep "webhook order=$id5 " "$LOGDIR/stub.log" | sed 's/.*: webhook/    webhook/' | cut -c1-170
+echo "  messages for $id5: $(count_messages "$id5")"
+
+echo "== 6) bad signature $(ts)"
+echo "  -> $(curl -s -w ' HTTP %{http_code}' -X POST "$ORDER/webhooks/payment" -H 'Content-Type: application/json' \
+  -H 'X-Signature: 00ff' -d "{\"order_id\":$id4,\"payment_ref\":\"x\",\"status\":\"SUCCESS\",\"amount\":\"848.00\"}")"
+echo "  order $id4 unchanged: $(row "$id4")"
+
+echo "== 7) relay off, stop, restart with relay on $(ts)"
+stop_order
+start_order order-2-relay-off.log --outbox.relay.enabled=false
+id7=$(create 204); hook "{\"order_id\":$id7}"
+sleep 4
+echo "  order: $(row "$id7")"; echo "  outbox (relay off): $(outbox "$id7")"
+echo "  messages for $id7 (relay off): $(count_messages "$id7")"
+stop_order
+start_order order-3.log
+sleep 4
+echo "  outbox (relay on): $(outbox "$id7")"; echo "  messages for $id7: $(count_messages "$id7")"
+
+echo "== 8) Kafka paused $(ts)"
+id8=$(create 205)
+docker compose pause kafka > /dev/null 2>&1; PAUSED=$(date +%s); echo "  [$(ts) kafka paused]"
+hook "{\"order_id\":$id8}"
+echo "  order: $(row "$id8")"
+for i in 1 2 3 4 5 6; do sleep 5; echo "  +$(( $(date +%s) - PAUSED ))s outbox: $(outbox "$id8")"; done
+docker compose unpause kafka > /dev/null 2>&1; UNPAUSED=$(date +%s); echo "  [$(ts) kafka unpaused]"
+for i in $(seq 1 120); do
+  p=$(q order-service "select published_at is not null from outbox where aggregate_id = $id8")
+  [ "$p" = "t" ] && break; sleep 1
+done
+echo "  published $(( $(date +%s) - UNPAUSED ))s after unpause (1 s polling): $(outbox "$id8")"
+echo "  order: $(row "$id8")"; echo "  messages for $id8: $(count_messages "$id8")"
+
+echo "== totals $(ts)"
+echo "  outbox: $(q order-service "select count(*) || ' rows, ' || count(*) filter (where published_at is null) || ' unpublished' from outbox")"
+for id in $id1 $id5 $id7 $id8; do echo "  payment-confirmed messages for $id: $(count_messages "$id")"; done
+echo "  relay WARN lines in order-3.log: $(grep -c 'not published, batch stopped' "$LOGDIR/order-3.log")"
+
+stop_order; kill "$INV_PID" "$STUB_PID"; wait 2>/dev/null; echo "== processes stopped $(ts)"
+
+```

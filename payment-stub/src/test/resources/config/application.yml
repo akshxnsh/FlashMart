@@ -1,0 +1,4 @@
+# Test-only overrides (classpath:/config/ wins over classpath:/). Not a real
+# secret: the tests verify signatures with it.
+webhook:
+  secret: test-only-webhook-secret

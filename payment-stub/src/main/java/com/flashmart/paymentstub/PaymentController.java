@@ -16,10 +16,17 @@ public class PaymentController {
 
     private final PaymentStore store;
     private final ModeState modes;
+    private final AutoWebhookState autoWebhooks;
+    private final WebhookSender webhooks;
+    private final WebhookSettings webhookSettings;
 
-    public PaymentController(PaymentStore store, ModeState modes) {
+    public PaymentController(PaymentStore store, ModeState modes, AutoWebhookState autoWebhooks,
+                             WebhookSender webhooks, WebhookSettings webhookSettings) {
         this.store = store;
         this.modes = modes;
+        this.autoWebhooks = autoWebhooks;
+        this.webhooks = webhooks;
+        this.webhookSettings = webhookSettings;
     }
 
     @PostMapping("/api/payments/initiate")
@@ -49,10 +56,14 @@ public class PaymentController {
             default -> { }
         }
 
-        Payment payment = store.createIfAbsent(key, request);
+        PaymentStore.Result stored = store.createOrFind(key, request);
+        Payment payment = stored.payment();
         if (!payment.request().equals(request)) {
             return ResponseEntity.badRequest().body(new ErrorResponse("IDEMPOTENCY_KEY_REUSED",
                     "this Idempotency-Key was used with a different request"));
+        }
+        if (stored.created()) {
+            autoWebhook(payment);
         }
 
         if (mode.mode() == Mode.SLOW_AFTER) {
@@ -61,6 +72,20 @@ public class PaymentController {
         return ResponseEntity.status(HttpStatus.ACCEPTED).body(new PaymentResponse(
                 payment.paymentRef(), payment.request().orderId(),
                 payment.request().amount().toPlainString(), payment.status()));
+    }
+
+    /** Only for a payment this call created: a replayed initiate is not a new payment and sends nothing. */
+    private void autoWebhook(Payment payment) {
+        AutoWebhookState.Current auto = autoWebhooks.get();
+        if (auto.status() == AutoWebhookState.Status.OFF) {
+            return;
+        }
+        WebhookMessage message = WebhookMessage.of(payment, auto.status().name());
+        if (auto.timing() == AutoWebhookState.Timing.BEFORE_REPLY) {
+            webhooks.firstAttemptNowRestLater(message);
+        } else {
+            webhooks.deliverLater(message, webhookSettings.afterReplyDelayMs());
+        }
     }
 
     private static ResponseEntity<ErrorResponse> invalid(String message) {
