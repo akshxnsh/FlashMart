@@ -4888,3 +4888,123 @@ is closed by a reconciliation sweep"), and, in
     `clock_timestamp()`, DB-stamped ("Order creation: retries, conflicts, deadlines and Inventory failures").
   - A `CHECK` on `payment_reconciled_at`, and a `CHECK` that `PROCESSING`
     implies `claimed_at`. **Decided 2026-11-05; V8, not written yet.**
+
+## Decision: Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay
+
+**Status:** **DECIDED 2026-11-05, NOT implemented, NOT tested.** Every number in
+point 6 is **PROVISIONAL and unmeasured**; recheck on Day 9. The Razorpay Clone
+does not exist, so every behaviour asked of the gateway here is **designed, not
+verified** (CLAUDE.md, Working style 7).
+
+**Context / Problem:**
+Day 5 left the webhook handler as the backstop for a payment that exists but
+that Order never recorded. Writing it exposed six open edges: a webhook that
+arrives while the order is still `CREATED` (B4); a `FAILED` webhook for a
+payment other than the one the order holds; a `SUCCESS` webhook whose amount is
+wrong; what the webhook looks like on the wire and how it is authenticated;
+what `PaymentConfirmed` carries; and how the outbox row gets to Kafka. Also
+derived here: the `refunds` insert uses `ON CONFLICT DO NOTHING` (B1), so a
+redelivered webhook cannot insert a second refund row.
+
+**Options Considered:**
+1. Early webhook (order still `CREATED`): (a) answer `409`, change nothing, let
+   the gateway retry; (b) refund the payment; (c) jump `CREATED → PAID`;
+   (d) store the webhook and apply it later.
+2. `FAILED` CAS: (a) match `status = 'PENDING_PAYMENT'` only; (b) also match
+   `payment_ref`.
+3. `SUCCESS` with a wrong amount: (a) ignore the amount; (b) also match the
+   amount in the `PAID` CAS.
+4. Webhook authentication: (a) HMAC over the raw body; (b) HMAC plus a
+   timestamp window; (c) none (stub only).
+5. `PaymentConfirmed` payload: (a) with `brand_id`; (b) without.
+6. Relay: (a) set `published_at` before publishing; (b) publish, wait for ack,
+   then set it; (c) a transactional Kafka producer.
+
+**Chosen Approach:**
+
+1. **Early webhook (B4): `409`, change nothing.** If the order is still
+   `CREATED`, a `SUCCESS` (and equally a `FAILED`) webhook gets `409`. No write,
+   no refund. The gateway retries, by which time Order has normally moved the
+   order to `PENDING_PAYMENT`. Rejected: (b) refund it, because the buyer loses
+   the unit on a timing blip (the webhook beat Order's own CAS by milliseconds);
+   (c) `CREATED → PAID`, because it breaks the state machine; (d) store and apply
+   later, because it is a new table for a rare race.
+2. **`FAILED` CAS also matches `payment_ref`.** The CAS is `PENDING_PAYMENT →
+   FAILED` only `WHERE status = 'PENDING_PAYMENT' AND payment_ref = X`, like
+   `markPaid`. A `FAILED` for another payment `Y` must not fail an order that
+   holds `X`. Such a webhook matches zero rows and is a no-op (nothing was
+   captured).
+3. **`markPaid` also matches the amount.** `... AND amount = :webhookAmount`,
+   compared as numbers (`NUMERIC(14,2)`), never as strings, so `499` equals
+   `499.00`. A mismatch loses the CAS and takes the existing "otherwise refund"
+   path: the refund row uses the **webhook's** amount, the order stays
+   `PENDING_PAYMENT`, and the sweep expires it. A WARN is logged.
+4. **Webhook contract.** Body: `{order_id, payment_ref, status, amount}`, with
+   `status` = `SUCCESS | FAILED` and `amount` a JSON string.
+   - **Signature:** HMAC-SHA256 over the **raw body bytes**, checked **before**
+     the JSON is parsed, compared in constant time. The secret comes from an env
+     var (`PAYMENT_WEBHOOK_SECRET`, added to `.env.example`); the payment stub
+     uses the same one.
+   - **Codes:** `401` bad or missing signature; `400` malformed body; `404`
+     unknown order (plus a WARN); `409` early (point 1); `200` **only after the
+     transaction commits**.
+   - **No timestamp window.** A replayed webhook is harmless because redelivery
+     is already a no-op: the CAS matches nothing, and the refund insert is `ON
+     CONFLICT DO NOTHING` (B1).
+5. **`PaymentConfirmed` for now:** `{order_id, buyer_id, items[], amount}`, with
+   items as in `architecture.md` §3. **No `brand_id`**: `orders` has no brand
+   column, and only Notification (a stretch item) would use it. Adding an
+   optional field later is safe under the flat-payload convention. The per-order
+   brand email is therefore not needed.
+6. **Outbox relay (all PROVISIONAL).** One topic per event: `payment-confirmed`
+   and `order-cancelled`; **key = order id**, so one order's events keep their
+   order within a partition. Producer: `acks=all`, idempotent. The relay
+   **publishes, waits for the broker ack, and only then sets `published_at`**. A
+   crash between the two means a duplicate, which consumers already tolerate
+   (Kafka is at-least-once; consumers are idempotent by unique key and CAS).
+   Claim with `FOR UPDATE SKIP LOCKED`; **stop the batch at the first failure**,
+   which bounds the time the row locks are held to one ack timeout; record
+   `attempts` and `last_error`. Values: poll **1 s**, batch **50**, ack timeout
+   **5 s**.
+
+**Why:**
+- A `409` is the cheapest correct answer to "too early": no state changes, and
+  the gateway's own retry does the waiting.
+- Matching `payment_ref` (point 2) and amount (point 3) in the CAS keeps the
+  rule "every write to `orders.status` is a compare-and-set" and sends every
+  mismatch down the one refund path that already exists.
+- Checking the HMAC on raw bytes first means no parser runs on unauthenticated
+  input, and re-serialising JSON cannot change the bytes being signed.
+- Ack-then-mark trades a possible duplicate for never losing an event.
+
+**Trade-offs:**
+- Point 1 **depends on the gateway retrying a `409`**. The Razorpay Clone does
+  not exist, so this is unverified; the payment stub must be built to retry. If
+  the gateway gives up, nothing recovers the payment: the reconciliation sweep is
+  designed only.
+- Point 3: a gateway bug that sends wrong amounts would cause correct payments
+  to be refunded. Accepted: refunding is safer than marking `PAID` on money we
+  cannot match.
+- No timestamp on the webhook (point 4) means a captured valid request can be
+  replayed forever; accepted because replay changes nothing.
+- Point 6: a duplicate `PaymentConfirmed` or `OrderCancelled` is expected, not a
+  bug. One failed row stops the whole batch for that poll.
+
+**Consequences:**
+- **Closes B4 and B1** in the open items (decided, not implemented).
+- `architecture.md` corrected: a late `FAILED` is guarded by `payment_ref`
+  (it no longer "needs no such care"), and `PaymentConfirmed` has no `brand_id`
+  for now.
+- **OPEN, not decided here:** `brand_contacts` and `BrandUpserted` now have no
+  consumer. Whether to drop them, keep them for the Notification stretch, or add
+  `brand_id` back is a separate decision.
+- Tests required when built: `409` on an early `SUCCESS` and an early `FAILED`
+  with no row changed; a `FAILED` for another `payment_ref` leaves the order
+  alone; a wrong amount loses the CAS and writes a refund row with the webhook
+  amount; `499` equals `499.00`; a bad signature gives `401` before any parse;
+  a tampered body gives `401`; redelivery of the same webhook is a no-op and adds
+  no second refund row; two relays on one outbox never claim the same row at
+  once; a crash after publish and before `published_at` gives a duplicate, not a
+  loss.
+- Not verified: anything involving the real gateway (retry on `409`, signing
+  scheme, payments and webhooks carrying our order id).
