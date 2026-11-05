@@ -102,6 +102,9 @@ order:
     enabled: true
     interval-ms: 30000
     batch-size: 100
+    # A tick runs another pass at once while the last one picked a full batch,
+    # at most this many in a row. PROVISIONAL, unmeasured.
+    max-passes-per-tick: 10
 
 # HMAC-SHA256 secret the gateway signs webhooks with (decisions.md, "Day 6",
 # point 4). From the environment only, never committed. Blank fails startup

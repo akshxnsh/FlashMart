@@ -131,6 +131,72 @@ class ExpirySweepTest {
         ids.forEach(id -> assertEquals(1, rows.cancelled(id)));
     }
 
+    // ---- drain: a tick keeps going while batches come back full ----
+
+    @Test
+    void aBacklogBiggerThanTheBatchDrainsInOneTick() {
+        List<Long> ids = new ArrayList<>();
+        for (int i = 0; i < 7; i++) {
+            ids.add(order(OrderStatus.CREATED, "-" + (10 - i) + " minutes"));
+        }
+        ExpirySweep small = new ExpirySweep(jdbc, transaction, 3);
+
+        // 3 + 3 full batches, then 1 (short): three passes, all seven expired.
+        assertEquals(new ExpirySweep.Drain(3, 7, 7, 0), small.drain(10));
+
+        ids.forEach(id -> {
+            assertEquals("ORDER_EXPIRED", rows.status(id));
+            assertEquals(1, rows.cancelled(id));
+        });
+    }
+
+    @Test
+    void aShortBatchStopsTheLoopAfterOnePass() {
+        order(OrderStatus.CREATED, "-2 minutes");
+        order(OrderStatus.CREATED, "-1 minute");
+        ExpirySweep small = new ExpirySweep(jdbc, transaction, 3);
+
+        assertEquals(new ExpirySweep.Drain(1, 2, 2, 0), small.drain(10), "2 < 3: no second pass");
+        assertEquals(new ExpirySweep.Drain(1, 0, 0, 0), small.drain(10), "nothing due: one empty pass");
+    }
+
+    @Test
+    void aFullBatchExactlyTheSizeOfTheBacklogCostsOneExtraEmptyPass() {
+        order(OrderStatus.CREATED, "-2 minutes");
+        order(OrderStatus.CREATED, "-1 minute");
+        ExpirySweep small = new ExpirySweep(jdbc, transaction, 2);
+
+        assertEquals(new ExpirySweep.Drain(2, 2, 2, 0), small.drain(10));
+    }
+
+    @Test
+    void theCapStopsATickEvenWhileBatchesStayFull() {
+        List<Long> ids = new ArrayList<>();
+        for (int i = 0; i < 7; i++) {
+            ids.add(order(OrderStatus.CREATED, "-" + (10 - i) + " minutes"));
+        }
+        ExpirySweep small = new ExpirySweep(jdbc, transaction, 2);
+
+        assertEquals(new ExpirySweep.Drain(2, 4, 4, 0), small.drain(2), "cap of 2 passes x batch of 2");
+        assertEquals(List.of("ORDER_EXPIRED", "ORDER_EXPIRED", "ORDER_EXPIRED", "ORDER_EXPIRED", "CREATED",
+                "CREATED", "CREATED"), statuses(ids), "the rest waits for the next tick");
+    }
+
+    // A pass that expires nothing ends the tick, so a batch that keeps failing
+    // is not retried in a tight loop: it waits for the next tick.
+    @Test
+    void aPassThatExpiresNothingEndsTheTick() {
+        long a = order(OrderStatus.CREATED, "-3 minutes");
+        long b = order(OrderStatus.CREATED, "-2 minutes");
+        jdbc.update("CREATE FUNCTION test_fail_outbox() RETURNS trigger AS $$ BEGIN "
+                + "RAISE EXCEPTION 'injected outbox failure'; END $$ LANGUAGE plpgsql");
+        jdbc.update("CREATE TRIGGER trg_test_fail_outbox BEFORE INSERT ON outbox FOR EACH ROW "
+                + "WHEN (NEW.aggregate_id IN (" + a + ", " + b + ")) EXECUTE FUNCTION test_fail_outbox()");
+        ExpirySweep small = new ExpirySweep(jdbc, transaction, 2);
+
+        assertEquals(new ExpirySweep.Drain(1, 2, 0, 2), small.drain(10), "full batch, but nothing expired: stop");
+    }
+
     // The outbox insert fails for ONE order (a trigger raises for its id). Its
     // transaction rolls back whole (status kept, no event); the others in the
     // same pass still expire; the next pass picks it up again.

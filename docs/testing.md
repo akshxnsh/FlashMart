@@ -653,3 +653,274 @@ echo "  relay WARN lines in order-3.log: $(grep -c 'not published, batch stopped
 stop_order; kill "$INV_PID" "$STUB_PID"; wait 2>/dev/null; echo "== processes stopped $(ts)"
 
 ```
+
+## Day 7 end to end: consumers, expiry sweep and a real Kafka (2026-11-06)
+
+**Label: verified against real processes and the docker-compose Kafka, on one
+laptop, one run.** Every number below is from that one run (the script ran once
+to completion; no earlier attempt is hidden). The gateway is the payment-stub,
+not a real gateway and not the Razorpay Clone. One broker, one partition per
+topic, one Inventory instance, one Order instance, no load. Timings are single
+observations, not measurements.
+
+### Setup
+
+- Same machine and stack as Day 6: local PostgreSQL 18, Docker Desktop 29.9.2
+  with **only** the Kafka service (`docker compose up -d kafka`, `healthy`).
+  `inventory-service` (8082), `order-service` (8083, `--kafka.create-topics=true`)
+  and `payment-stub` (8085) from `mvnw -DskipTests package` jars, `java -jar`.
+  Env (DB credentials, `PAYMENT_WEBHOOK_SECRET`, `KAFKA_BOOTSTRAP`) exported from
+  the gitignored `.env`; never printed. Order was started **first** so it created
+  the topics, then Inventory.
+- `scripts/seed/seed.sh` first. Start stock: item 1 (Runner Shoe, 4999.00)
+  500, item 2 (Court Tee, 799.00) 50, both at version 0. Single-item orders
+  buy product 2 x 1 (848.00 with the fee).
+- Defaults otherwise: sweep every 30 s, batch 100, relay poll 1 s. For scenarios
+  C and F **only**, Order was restarted with `--order.payment-window-ms=20000`
+  (a command-line override, not committed). Scenarios A, B, D, E and G ran with
+  the 360 s default window.
+- The jar included the same day's drain loop (a sweep tick keeps going while a
+  pass picks a full batch). It was not exercised here: no pass ever picked 100
+  orders.
+
+### Results
+
+| # | Scenario | Observed |
+|---|---|---|
+| 0 | Inventory start-up | The `payment-confirmed` topic still held **15 messages from the Day 6 run** (end offset 15). Inventory reads a new group from `earliest`, so it consumed them all and logged **15 ERRORs**, "PaymentConfirmed for order 16997 ... Inventory holds NO reservation for it ... Nothing changed" (those orders do not exist in the freshly seeded database). Stock unchanged: 500/v0, 50/v0. |
+| A | Failed payment releases stock | Order 44448, stock 49/v1 after reserving. Stub `FAILED` -> order `PAYMENT_FAILED` 0.1 s later -> `OrderCancelled {reason: PAYMENT_FAILED}` published 1.3 s later (`attempts` 0) -> reservation `RELEASED` 0.2 s after that. Webhook to released: **1.9 s**. Stock back to 50, **v2** (one reserve + one add-back). |
+| B | Paid | Order 44449, `PAID` 0.3 s after the webhook, `PaymentConfirmed` published 0.6 s later, reservation `CONFIRMED` 0.2 s after. Webhook to confirmed: 1.3 s. Stock stayed **49/v3** (the unit is sold; confirming does not touch stock). |
+| C | Expiry (window 20 s) | Order 44452, `expires_at` 23:11:04.169 UTC. Became `ORDER_EXPIRED` **29.4 s after creation**, `updated_at` 23:11:13.519, i.e. **9.35 s after `expires_at`**. Sweep log: `1 pass(es), 1 due, 1 expired, 0 failed`. `OrderCancelled {reason: ORDER_EXPIRED}` published 0.1 s later, reservation `RELEASED` 0.1 s after that, stock 48/v8 -> 49/v9. The delay depends on where the 30 s tick falls: this tick fell about 30 s after Order started (up at 04:40:43.8, order expired at 04:41:13.5), so one run shows one point in the 0 to 30 s range, not a distribution. |
+| D | The same `OrderCancelled` again, on the real broker | Original for order 44448 read back from the topic (1 copy), then **3 copies re-produced** to `order-cancelled` with the console producer (4 copies on the topic). Inventory logged "nothing to release" 3 times within 0.1 s. Stock and version **identical before and after: item 1 500/v0, item 2 49/v3**; the reservation stayed `RELEASED`. |
+| E | Kafka paused | Order 44450 created, `docker compose pause kafka`, stub `FAILED`. Order `PAYMENT_FAILED` 0.3 s later. Sampled at +5.4, +11.0, +16.4 s: order `PAYMENT_FAILED`, outbox row **unpublished**, reservation still `RESERVED`, stock still 48/v4 (the unit not given back). Unpaused at +17.5 s: published 0.2 s later (`attempts` **2**), reservation `RELEASED` 0.2 s after that (**0.6 s from unpause**, all three waits added up). Stock 49/v5. Order logged two producer ERRORs while paused (sends at 04:40:00 and 04:40:06; the relay stops its batch at the first failure). |
+| E (dup) | Duplicate seen again | The topic held **2 copies** of 44450's `OrderCancelled`, as Day 6 saw for `PaymentConfirmed` under a pause. Inventory logged one "released 1 reservation(s)" and one "nothing to release". Stock went up by exactly one (48 -> 49, v4 -> v5). |
+| F | Inventory down | Orders 44453, 44454, 44455 created and reserved (stock 46/v12), then Inventory killed. Stub `FAILED` for 44453 and 44454; 44455 left to expire (20 s window). All three terminal after 27.9 s (`PAYMENT_FAILED`, `PAYMENT_FAILED`, `ORDER_EXPIRED`) and all three `OrderCancelled` rows published within 0.1 s each, while Inventory was still down: reservations `RESERVED`, stock still 46/v12. Inventory restarted: 44453 `RELEASED` **5.4 s** after the start-up check passed, 44454 and 44455 0.2 s after that. Stock **49/v15**: +3 units, version +3, exactly one "released" log line per order. |
+| G | Multi-item order | Order 44451: product 1 x 2 + product 2 x 1 (10846.00). Reserved: item 1 x2, item 2 x1 (stock 498/v1, 48/v6). Stub `FAILED` -> `PAYMENT_FAILED`; both reservations `RELEASED` 1.0 s after the order changed state. Stock item 1 500/v2, item 2 49/v7. |
+
+End of run: item 1 500/v2 (back to start; version 2 = one reserve + one release),
+item 2 **49**/v15 (50 minus the one paid unit of scenario B). 0 unpublished
+outbox rows. No ERROR in Inventory after the 15 start-up ones; Order's only
+ERRORs were the two producer errors in E.
+
+### What it shows
+
+- The loop closes on real processes: payment failure and expiry each reached
+  Inventory through Order's outbox and the broker and gave the stock back, and
+  payment success confirmed the reservation without touching stock.
+- A duplicate `OrderCancelled` (3 hand-produced copies in D, 1 broker-made copy
+  in E) added no stock. In D the item's version did not move either, so the
+  guarded `UPDATE` matched no rows and nothing was written.
+- Events outlived both a paused broker (E) and a stopped Inventory (F): nothing
+  was lost, and stock came back once per order. In F the three messages waited
+  on the topic until Inventory returned.
+- Expiry fell inside window + sweep interval (29.4 s after creation against a
+  20 s window + 30 s tick), for this one order.
+
+### Surprises
+
+- **Start-up backlog.** A new Inventory group reads every message still on the
+  topic. The 15 Day 6 messages produced 15 "needs a human" ERRORs, because their
+  orders do not exist in the freshly seeded database. Harmless here, but after a
+  reseed on a topic with old messages it is noisy, and it looks exactly like a
+  genuinely lost reservation in the log. Not changed.
+- In F the first order took 5.4 s to be released after Inventory came up, the
+  other two 0.2 s. The first probably includes the consumer joining its group;
+  not isolated, one observation.
+
+### Not covered
+
+- A crash between the database commit and the offset commit: nothing was killed
+  in that window (F kills Inventory between messages, not mid-transaction).
+  Duplicate handling is shown by D and E, not by an actual crash.
+- Several Inventory or Order instances, more than one partition, a consumer
+  rebalance, the drain loop on a real backlog, load, a malformed message on the
+  real broker (tested only against the embedded broker), a real gateway or the
+  Razorpay Clone. Nothing here is exactly-once: duplicates are expected and
+  were seen.
+- The mid-loop reservation failure variant of G (a multi-item order failing
+  while still in the reserve loop); G used a payment failure.
+
+### Left behind after the run
+
+The databases were reseeded (`seed.sh`) and the Kafka container stopped, not
+removed: `payment-confirmed` and `order-cancelled` keep this run's messages (and
+the Day 6 ones), so the next Inventory start reads them all again.
+
+### The script
+
+Run from the repo root in Git Bash, after `docker compose up -d kafka` is
+healthy and the three jars are built. It starts and stops its own processes
+(the short payment window for C and F is a command-line override).
+
+```bash
+#!/usr/bin/env bash
+# Day 7 end-to-end run: real inventory (8082), order (8083) and payment-stub
+# (8085) processes, local Postgres, the docker-compose Kafka. One laptop.
+#
+# Run from the repo root, in Git Bash, after:
+#   docker compose up -d kafka            (and wait for "healthy")
+#   (cd order-service && ./mvnw -q -DskipTests package)   # same for inventory-service, payment-stub
+# Reads DB_USERNAME, DB_PASSWORD, PAYMENT_WEBHOOK_SECRET from ./.env (never
+# printed). LOGDIR (default $TMP/flashmart-e2e7, outside the repo) gets the logs.
+set -uo pipefail
+set -a; . ./.env; set +a
+export KAFKA_BOOTSTRAP=localhost:9092
+export PGPASSWORD="$DB_PASSWORD"
+LOGDIR="${LOGDIR:-${TMP:-/tmp}/flashmart-e2e7}"; mkdir -p "$LOGDIR"; rm -f "$LOGDIR"/*.log
+
+ORDER=http://localhost:8083
+STUB=http://127.0.0.1:8085
+SALE=1; P1=1; P2=2     # product 1 = Runner Shoe 4999.00 (item 1, 500 units); product 2 = Court Tee 799.00 (item 2, 50 units)
+
+kx() { MSYS_NO_PATHCONV=1 docker compose exec -T kafka "$@"; }
+q() { psql -w -h localhost -U "$DB_USERNAME" -d "$1" -Atc "$2"; }
+ts() { date +%H:%M:%S.%3N; }
+now_s() { date +%s.%N; }
+elapsed() { awk -v a="$1" -v b="$(now_s)" 'BEGIN{printf "%.1f", b-a}'; }
+wait_up() { for _ in $(seq 1 120); do [ "$(curl -s -o /dev/null -w '%{http_code}' "$1")" != "000" ] && return 0; sleep 1; done; echo "!! $1 never came up"; exit 1; }
+
+start_order() { # start_order <log> [extra args]
+  local log="$1"; shift
+  java -jar order-service/target/order-service-0.0.1-SNAPSHOT.jar --spring.jpa.show-sql=false \
+    --kafka.create-topics=true "$@" > "$LOGDIR/$log" 2>&1 &
+  ORDER_PID=$!; wait_up "$ORDER/actuator/health"; echo "  [$(ts) order up, pid $ORDER_PID, $*]"
+}
+stop_order() { kill "$ORDER_PID"; wait "$ORDER_PID" 2>/dev/null; echo "  [$(ts) order stopped]"; }
+start_inventory() { # start_inventory <log>
+  java -jar inventory-service/target/inventory-service-0.0.1-SNAPSHOT.jar --spring.jpa.show-sql=false > "$LOGDIR/$1" 2>&1 &
+  INV_PID=$!; wait_up http://localhost:8082/api/reservations; echo "  [$(ts) inventory up, pid $INV_PID]"
+}
+stop_inventory() { kill "$INV_PID"; wait "$INV_PID" 2>/dev/null; echo "  [$(ts) inventory stopped]"; }
+
+create() { # create <buyer> <json items> -> prints the order id
+  LAST=$(curl -s -w ' HTTP %{http_code}' -X POST "$ORDER/api/orders" -H 'Content-Type: application/json' \
+    -H "X-Buyer-Id: $1" -H "Idempotency-Key: e2e7-$1" -d "{\"flashSaleId\":$SALE,\"items\":$2}")
+  echo "  create buyer $1: $LAST" >&2
+  q order-service "select id from orders where buyer_id = $1 order by id desc limit 1"
+}
+hook() { echo "  stub /admin/webhook $1 -> $(curl -s -X POST "$STUB/admin/webhook" -H 'Content-Type: application/json' -d "$1")"; }
+
+ostatus() { q order-service "select status from orders where id = $1"; }
+orow() { q order-service "select status || ' amount=' || amount || ' expires_at=' || to_char(expires_at at time zone 'UTC','HH24:MI:SS.MS') || ' updated_at=' || to_char(updated_at at time zone 'UTC','HH24:MI:SS.MS') from orders where id = $1"; }
+outbox() { q order-service "select coalesce(string_agg(event_type || ' ' || payload_json::text || ' published_at=' || coalesce(to_char(published_at at time zone 'UTC','HH24:MI:SS.MS'),'NULL') || ' attempts=' || attempts, ' | '), 'none') from outbox where aggregate_id = $1"; }
+unpublished() { q order-service "select count(*) from outbox where aggregate_id = $1 and published_at is null"; }
+resv() { q inventory-service "select coalesce(string_agg('item' || flash_sale_item_id || 'x' || quantity || ':' || status, ' ' order by flash_sale_item_id), 'none') from stock_reservations where order_id = $1"; }
+resv_count() { q inventory-service "select count(*) from stock_reservations where order_id = $1 and status = '$2'"; }
+stock() { q inventory-service "select string_agg('item' || id || '=' || available_stock || '/v' || version, ' ' order by id) from flash_sale_items where id in (1,2)"; }
+snap() { echo "  stock: $(stock)"; }
+# wait <seconds> <description> <command that succeeds when done> : prints the elapsed time
+waitfor() { local t0 end; t0=$(now_s); end=$(( $(date +%s) + $1 )); shift; local what="$1"; shift
+  until "$@"; do [ "$(date +%s)" -ge "$end" ] && { echo "  !! TIMEOUT waiting for $what"; return 1; }; sleep 0.25; done
+  echo "  -> $what after $(elapsed "$t0") s"; }
+is_status() { [ "$(ostatus "$1")" = "$2" ]; }
+is_published() { [ "$(unpublished "$1")" = "0" ]; }
+all_resv() { [ "$(resv_count "$1" "$2")" -ge "$3" ]; }
+ilog() { grep -c "$1" "$LOGDIR/inventory.log" 2>/dev/null || true; }
+# Messages on a topic with this key (inside the container).
+topic_msgs() { # topic key
+  kx /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:29092 --topic "$1" --from-beginning \
+    --formatter-property print.key=true --formatter-property key.separator='|' --timeout-ms 6000 2>/dev/null | grep "^$2|"; }
+
+echo "== setup $(ts)"
+bash scripts/seed/seed.sh > /dev/null && echo "  seeded"
+echo "  start stock: $(stock)"
+echo "  payment-confirmed end offset before the run: $(kx /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:29092 --topic payment-confirmed | tail -1)"
+java -jar payment-stub/target/payment-stub-0.0.1-SNAPSHOT.jar > "$LOGDIR/stub.log" 2>&1 &
+STUB_PID=$!; wait_up "$STUB/admin/mode"
+start_order order-1.log
+echo "  topics: $(kx /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list | tr '\n' ' ')"
+start_inventory inventory.log
+sleep 8
+echo "  inventory consumed the topic backlog from earlier runs: ERROR lines in its log: $(grep -c ' ERROR ' "$LOGDIR/inventory.log"), 'no reservation' lines: $(ilog 'NO reservation')"
+START="$(stock)"; echo "  stock after the backlog: $START"
+
+echo; echo "== A) failed payment releases stock $(ts)"
+idA=$(create 301 "[{\"productId\":$P2,\"quantity\":1}]"); echo "  order $idA: $(orow "$idA")"; echo "  reservations: $(resv "$idA")"; snap
+T=$(now_s); hook "{\"order_id\":$idA,\"status\":\"FAILED\"}"
+waitfor 30 "order PAYMENT_FAILED" is_status "$idA" PAYMENT_FAILED
+waitfor 30 "OrderCancelled published" is_published "$idA"
+waitfor 30 "reservation RELEASED" all_resv "$idA" RELEASED 1
+echo "  webhook to RELEASED: $(elapsed "$T") s"
+echo "  order: $(orow "$idA")"; echo "  outbox: $(outbox "$idA")"; echo "  reservations: $(resv "$idA")"; snap
+
+echo; echo "== B) paid: reservation CONFIRMED, stock stays down $(ts)"
+idB=$(create 302 "[{\"productId\":$P2,\"quantity\":1}]"); echo "  order $idB: $(orow "$idB")"; snap
+T=$(now_s); hook "{\"order_id\":$idB}"
+waitfor 30 "order PAID" is_status "$idB" PAID
+waitfor 30 "PaymentConfirmed published" is_published "$idB"
+waitfor 30 "reservation CONFIRMED" all_resv "$idB" CONFIRMED 1
+echo "  webhook to CONFIRMED: $(elapsed "$T") s"
+echo "  order: $(orow "$idB")"; echo "  outbox: $(outbox "$idB" | cut -c1-230)"; echo "  reservations: $(resv "$idB")"; snap
+
+echo; echo "== D) the SAME OrderCancelled again, on the real broker $(ts)"
+MSG=$(topic_msgs order-cancelled "$idA" | head -1); echo "  original message on the topic: $MSG"
+echo "  copies on the topic before: $(topic_msgs order-cancelled "$idA" | wc -l | tr -d ' ')"
+BEFORE_STOCK=$(stock); BEFORE_LOG=$(ilog "order $idA: nothing to release"); echo "  before: $BEFORE_STOCK ; reservations: $(resv "$idA"); 'nothing to release' log lines for it: $BEFORE_LOG"
+for i in 1 2 3; do echo "$MSG" | kx /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:29092 --topic order-cancelled --property parse.key=true --property 'key.separator=|' 2>/dev/null; done
+echo "  re-produced 3 copies; copies on the topic now: $(topic_msgs order-cancelled "$idA" | wc -l | tr -d ' ')"
+waitfor 30 "inventory logged 3 duplicates" bash -c "[ \"\$(grep -c 'order $idA: nothing to release' '$LOGDIR/inventory.log')\" -ge $((BEFORE_LOG + 3)) ]"
+echo "  after:  $(stock) ; reservations: $(resv "$idA"); 'nothing to release' log lines: $(ilog "order $idA: nothing to release")"
+[ "$(stock)" = "$BEFORE_STOCK" ] && echo "  stock and version UNCHANGED" || echo "  !! stock or version CHANGED"
+
+echo; echo "== E) Kafka paused: the event waits, then is published and released $(ts)"
+idE=$(create 303 "[{\"productId\":$P2,\"quantity\":1}]"); echo "  order $idE"; snap
+docker compose pause kafka > /dev/null 2>&1; PAUSED=$(now_s); echo "  [$(ts) kafka paused]"
+hook "{\"order_id\":$idE,\"status\":\"FAILED\"}"
+waitfor 20 "order PAYMENT_FAILED" is_status "$idE" PAYMENT_FAILED
+for i in 1 2 3; do sleep 5; echo "  +$(elapsed "$PAUSED") s order=$(ostatus "$idE") unpublished=$(unpublished "$idE") reservations: $(resv "$idE") stock: $(stock)"; done
+docker compose unpause kafka > /dev/null 2>&1; UNP=$(now_s); echo "  [$(ts) kafka unpaused, $(elapsed "$PAUSED") s after the pause]"
+waitfor 60 "OrderCancelled published" is_published "$idE"
+waitfor 60 "reservation RELEASED" all_resv "$idE" RELEASED 1
+echo "  unpause to RELEASED: $(elapsed "$UNP") s"
+echo "  outbox: $(outbox "$idE")"; echo "  reservations: $(resv "$idE")"; snap
+echo "  copies of the event on the topic for $idE: $(topic_msgs order-cancelled "$idE" | wc -l | tr -d ' ')"
+echo "  inventory log lines for order $idE: $(grep "order $idE:" "$LOGDIR/inventory.log" | sed 's/.*: OrderCancelled/OrderCancelled/' | tr '\n' ';')"
+
+echo; echo "== G) multi-item order, payment fails: every item released $(ts)"
+idG=$(create 304 "[{\"productId\":$P1,\"quantity\":2},{\"productId\":$P2,\"quantity\":1}]"); echo "  order $idG: $(orow "$idG")"; echo "  reservations: $(resv "$idG")"; snap
+hook "{\"order_id\":$idG,\"status\":\"FAILED\"}"
+waitfor 30 "order PAYMENT_FAILED" is_status "$idG" PAYMENT_FAILED
+waitfor 30 "both reservations RELEASED" all_resv "$idG" RELEASED 2
+echo "  outbox: $(outbox "$idG")"; echo "  reservations: $(resv "$idG")"; snap
+
+echo; echo "== restart Order with a SHORT payment window (20 s), for C and F only $(ts)"
+stop_order
+start_order order-2-short-window.log --order.payment-window-ms=20000
+
+echo; echo "== C) expiry: create, never pay $(ts)"
+idC=$(create 305 "[{\"productId\":$P2,\"quantity\":1}]"); echo "  order $idC: $(orow "$idC")"; snap
+T=$(now_s); echo "  created at $(ts)"
+waitfor 120 "order ORDER_EXPIRED" is_status "$idC" ORDER_EXPIRED
+echo "  seconds since the order was created: $(elapsed "$T")  (window 20 s + sweep interval 30 s = at most about 50 s)"
+echo "  order: $(orow "$idC")"
+waitfor 30 "OrderCancelled published" is_published "$idC"
+waitfor 30 "reservation RELEASED" all_resv "$idC" RELEASED 1
+echo "  outbox: $(outbox "$idC")"; echo "  reservations: $(resv "$idC")"; snap
+echo "  expiry delay = updated_at - expires_at: $(q order-service "select round(extract(epoch from updated_at - expires_at)::numeric, 2) from orders where id = $idC") s"
+echo "  sweep log: $(grep -h 'expiry sweep' "$LOGDIR/order-2-short-window.log" | sed 's/.*expiry sweep/expiry sweep/' | tr '\n' ';')"
+
+echo; echo "== F) Inventory down: 2 failed + 1 expired, then Inventory starts $(ts)"
+id1=$(create 306 "[{\"productId\":$P2,\"quantity\":1}]"); id2=$(create 307 "[{\"productId\":$P2,\"quantity\":1}]"); id3=$(create 308 "[{\"productId\":$P2,\"quantity\":1}]")
+echo "  orders $id1 $id2 $id3 created"; F_BEFORE="$(stock)"; echo "  stock with all three reserved: $F_BEFORE"
+stop_inventory
+hook "{\"order_id\":$id1,\"status\":\"FAILED\"}"; hook "{\"order_id\":$id2,\"status\":\"FAILED\"}"
+waitfor 120 "all three terminal" bash -c "[ \"\$(psql -w -h localhost -U '$DB_USERNAME' -d order-service -Atc \"select count(*) from orders where id in ($id1,$id2,$id3) and status in ('PAYMENT_FAILED','ORDER_EXPIRED')\")\" = 3 ]"
+for id in $id1 $id2 $id3; do waitfor 30 "$id published" is_published "$id"; done
+echo "  statuses: $(for id in $id1 $id2 $id3; do echo -n "$id=$(ostatus "$id") "; done)"
+echo "  Inventory is DOWN. reservations: $(for id in $id1 $id2 $id3; do echo -n "$id:$(resv "$id") "; done)"; snap
+start_inventory inventory-2.log
+for id in $id1 $id2 $id3; do waitfor 60 "$id RELEASED" all_resv "$id" RELEASED 1; done
+sleep 3
+echo "  reservations: $(for id in $id1 $id2 $id3; do echo -n "$id:$(resv "$id") "; done)"; snap
+echo "  stock before the outage's releases: $F_BEFORE"
+echo "  inventory-2 log, per order: $(for id in $id1 $id2 $id3; do echo -n "$id x$(grep -c "order $id: released" "$LOGDIR/inventory-2.log") "; done)"
+
+echo; echo "== end state $(ts)"
+snap; echo "  start was: $START"
+echo "  ERROR lines in inventory logs (after the backlog): $(grep -c ' ERROR ' "$LOGDIR/inventory.log") / $(grep -c ' ERROR ' "$LOGDIR/inventory-2.log")"
+echo "  unpublished outbox rows: $(q order-service "select count(*) from outbox where published_at is null")"
+
+echo; echo "== stopping $(ts)"
+stop_order; stop_inventory; kill "$STUB_PID"; wait "$STUB_PID" 2>/dev/null
+echo "done"
+```

@@ -54,6 +54,33 @@ public class ExpirySweep {
     /** What one pass did: candidates read, orders this pass expired, orders that threw. */
     public record Result(int picked, int expired, int failed) {}
 
+    /** What one tick did: passes run, and the totals over them. */
+    public record Drain(int passes, int picked, int expired, int failed) {}
+
+    /**
+     * Runs passes back to back while the last one picked a FULL batch (there
+     * may be more due), so a backlog bigger than {@code batch-size} is cleared
+     * in one tick instead of one batch per interval. Stops when a pass picks
+     * fewer than {@code batch-size}, when a pass expired nothing (all of it
+     * failed or was won by someone else: looping again at once would only
+     * repeat that), or after {@code maxPasses} (PROVISIONAL, config), so one
+     * tick can never loop forever.
+     */
+    public Drain drain(int maxPasses) {
+        int passes = 0, picked = 0, expired = 0, failed = 0;
+        while (passes < maxPasses) {
+            Result r = runOnce();
+            passes++;
+            picked += r.picked();
+            expired += r.expired();
+            failed += r.failed();
+            if (r.picked() < batchSize || r.expired() == 0) {
+                break;
+            }
+        }
+        return new Drain(passes, picked, expired, failed);
+    }
+
     public Result runOnce() {
         List<Due> due = jdbc.query(DUE_ORDERS,
                 (rs, n) -> new Due(rs.getLong("id"), rs.getLong("buyer_id"), rs.getString("status")), batchSize);
