@@ -4485,6 +4485,9 @@ writing.
    **Known gap:** a timed-out call can still commit *after* the release and
    orphan a reservation. Covered only by the Day 7 republish and the reconciler,
    which is designed, **not built, not verified**.
+   *(Correction / see Day 7: "Day 7: Inventory consumers, late-reservation
+   cleanup, expiry sweep and its index", point 5. The republish covers only one
+   of the two versions of this gap; the old text above is left as written.)*
 9. **HTTP client.** Spring Cloud OpenFeign through the 2025.1.x release train
    (2025.1.2 states compatibility with Boot 4.0.7 and 4.1.0). Order is on Boot
    4.1.1 (`order-service/pom.xml`), so compatibility is **unverified until it
@@ -4920,7 +4923,10 @@ is closed by a reconciliation sweep"), and, in
     refund rows with `next_retry_at` NULL; whoever builds the refund worker must
     decide what NULL means before writing the claim query (a claim on
     `next_retry_at <= now()` alone would never pick these rows).
-  - **A3:** redesign of the sweep and refund indexes. Not decided.
+  - **A3:** redesign of the sweep and refund indexes. **Expiry-sweep part
+    decided (not implemented)** in "Day 7: Inventory consumers, late-reservation
+    cleanup, expiry sweep and its index", point 7. The refund-index part is
+    still undecided.
   - **B1:** `ON CONFLICT DO NOTHING` for the refund insert. **Decided 2026-11-05
     (derived); implemented and tested on Day 6** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
   - **B2, B3:** the retried create (and the `409` it returns) and a request
@@ -5092,3 +5098,148 @@ redelivered webhook cannot insert a second refund row.
   loss.
 - Not verified: anything involving the real gateway (retry on `409`, signing
   scheme, payments and webhooks carrying our order id).
+
+
+## Decision: Day 7: Inventory consumers, late-reservation cleanup, expiry sweep and its index
+
+**Status:** **DECIDED, NOT IMPLEMENTED, NOT TESTED.** Every point below is on
+paper only. Every value that is a number or a timing is **provisional and
+unmeasured**. The Razorpay Clone does not exist, so nothing here that touches
+the gateway is verified.
+
+**Context / Problem:**
+Order already writes `OrderCancelled` and `PaymentConfirmed` outbox rows and the
+relay sends them to Kafka. Nobody reads them yet. Day 7 needs three things:
+Inventory must react to those events (give stock back, or confirm it); Order
+must clean up when a reservation lands after the order is already dead; and
+Order needs the expiry sweep that makes orders die at all. Each one races
+something: a duplicate message, a reservation that commits late, a payment that
+starts as the sweep picks the same order. The guards (`CHECK available_stock <=
+total_stock`, the CAS rule, `uk_` keys) already exist; what was undecided is how
+each consumer and the sweep use them.
+
+**Options Considered:**
+1. Release: (a) read the reservation in Java, then act; (b) add stock back
+   first, then update the status; (c) update the status first, then add stock
+   back from the rows that update returned.
+2. Confirm when the guard matches nothing: (a) force the row back to
+   `CONFIRMED`; (b) throw; (c) read the state, then stay quiet or log.
+3. Offset commit: (a) commit before the work; (b) commit after the DB
+   transaction; (c) Kafka transactions across broker and DB.
+4. Failing messages: (a) retry forever; (b) skip bad payloads, retry transient
+   errors; (c) add a dead-letter topic.
+5. Late reservation: (a) re-read status and republish `OrderCancelled`; (b) a
+   delayed second `OrderCancelled`; (c) Inventory asks Order on every reserve.
+6. Expiry sweep: (a) one big `UPDATE ... RETURNING`; (b) select due ids, then
+   one short transaction per order; (c) `FOR UPDATE SKIP LOCKED` on the select.
+7. A3 index: (a) keep `idx_orders_expiry_sweep (status, expires_at)`; (b) a
+   partial index on `(expires_at)` for live statuses only.
+
+**Chosen Approach (all decided, not implemented):**
+
+1. **Release (`OrderCancelled`).** Option (c), in one transaction:
+   `UPDATE stock_reservations SET status = 'RELEASED' WHERE order_id = ? AND
+   status = 'RESERVED' RETURNING id, flash_sale_item_id, quantity`. Then, for
+   each returned row, add its quantity back to `available_stock` with `version =
+   version + 1` (raw SQL does not bump `@Version` by itself). Rejected: (a) a
+   Java read-then-act has a gap where two consumers both see `RESERVED`; (b)
+   adding stock first can give stock back for a reservation that another
+   consumer already released.
+2. **Confirm (`PaymentConfirmed`).** Same guard: `RESERVED -> CONFIRMED`. If it
+   matches 0 rows, read the state. All rows `CONFIRMED`: a quiet duplicate, do
+   nothing. Any row `RELEASED`, or no rows at all: log ERROR with the order id
+   and change nothing. Rejected: (a) forcing the row back to `CONFIRMED` would
+   hide an oversell (stock was already given to someone else); (b) throwing
+   would block the consumer on one bad order.
+3. **Offset commit.** Auto-commit off. Acknowledge a message only after the DB
+   transaction commits. Group id `inventory-service`. Rejected: (a) commit
+   before the work, because a crash then loses a release and the stock stays
+   stuck; (c) Kafka transactions across broker and DB. A duplicate is harmless
+   by points 1 and 2. Kafka stays at-least-once; this never claims exactly-once.
+4. **Failing messages.** A bad payload (broken JSON, missing `order_id`) is
+   skipped at once, with an ERROR log holding the order id (if there is one) and
+   the raw message. A transient error (for example the DB is down) is retried
+   with growing backoff, and each failure is logged. **No dead-letter topic;
+   recorded as a known limitation.** Cost: a skipped message leaves that order's
+   stock `RESERVED` until someone fixes it by hand, because the stale-reservation
+   reconciler is designed, not built. Backoff values are provisional and
+   unmeasured.
+5. **Late reservation, two versions.**
+   - **Version A** (Order's loop gets `RESERVED`, but the order is already dead,
+     so `priceItem` returns 0 and the status is a failure state): re-read the
+     status and write a new `OrderCancelled` outbox row, only for
+     `RESERVATION_FAILED`, `PAYMENT_UNAVAILABLE`, `ORDER_EXPIRED`,
+     `PAYMENT_FAILED`. Never for `PAID` (the load-bearing rule). A duplicate
+     `OrderCancelled` is harmless by point 1.
+   - **Version B** (the Inventory call times out, Order cancels, Inventory
+     commits the reservation later): Order never sees `RESERVED`, so the
+     republish cannot see it either. **Accepted as a documented known gap, not
+     fixed.** How often it happens is **not measured**. An earlier note called
+     it "rare"; that was a guess. The repo's own 5,000-buyer run had p99 above 9
+     s on one laptop, so it may cluster at peak load. Plan: after the Day 9 load
+     test, count `RESERVED` rows in Inventory whose orders Order has cancelled
+     (two databases, compare order ids by hand).
+   - Rejected for now: (b) a delayed second `OrderCancelled`; (c) Inventory
+     asking Order on every reserve.
+   - A pointer ("Correction / see Day 7") was added under point 8 of "Order
+     creation: retries, conflicts, deadlines and Inventory failures"; its old
+     text is unchanged.
+6. **Expiry sweep.** Runs every 30 s (already decided in "Day 5: payment step,
+   resilience and derived deadlines"). It selects up to N due order ids with
+   their status, where N is a provisional config value; leftovers wait for the
+   next pass. Then **each order gets its own short transaction**: `expire(id,
+   status)`, and write the `OrderCancelled{ORDER_EXPIRED}` outbox row **only if
+   the CAS returned 1**. Rejected: (a) one big `UPDATE ... RETURNING`, because it
+   skips the `expire` CAS that is already tested and raced. **No `SKIP LOCKED`:**
+   if two instances pick the same order, one wins the CAS; the other gets 0 rows
+   and writes nothing. If a payment starts just as the sweep picks a `CREATED`
+   order, there is one row and one winner. If the sweep loses, it matches 0 rows.
+   If the sweep wins, the payment CAS gets 0 rows, the request answers `409
+   ORDER_EXPIRED`, and a later `SUCCESS` webhook becomes a `refunds` row.
+7. **A3 index (expiry-sweep part).** A new **V9** migration creates a partial
+   index on `(expires_at) WHERE status IN ('CREATED', 'PENDING_PAYMENT')`, then
+   drops `idx_orders_expiry_sweep (status, expires_at)`. The applied V2 is never
+   edited. The sweep `SELECT` must use those **literal** statuses, not a bind
+   parameter, or Postgres will not use the partial index; verify with `EXPLAIN`
+   when the query is written. `idx_orders_reconciliation_sweep` is untouched.
+   A3 (expiry-sweep part) is marked decided in the open-items list.
+
+**Why:**
+- Under READ COMMITTED, a conditional `UPDATE` that matches the status decides
+  the winner. A duplicate message matches 0 rows and adds 0 stock; a `CONFIRMED`
+  row is skipped without extra code. The existing `CHECK available_stock <=
+  total_stock` is the backstop if this reasoning is wrong.
+- Inventory never guesses (point 2): when state is surprising, it logs and
+  waits for a human.
+- Acknowledging after commit means a crash costs a duplicate, never a lost
+  release (point 3).
+- One transaction per order (point 6) means a failure in one order cannot roll
+  back the others, and every expiry goes through the one CAS that is already
+  proven.
+- The sweep only reads live orders and almost all rows are terminal, so a
+  partial index holds only what the sweep reads (point 7).
+
+**Trade-offs:**
+- Point 4: a skipped message strands stock until fixed by hand. No dead-letter
+  topic means the raw message exists only in the log.
+- Point 5, Version B stays open. Stock for a late-committed reservation can be
+  stuck `RESERVED` for a cancelled order until the reconciler exists.
+- Point 6: without `SKIP LOCKED`, two instances do some duplicate reading. The
+  CAS keeps it correct, but it is wasted work.
+- Point 7: the gain (a smaller index over time) is **unmeasured**. Either index
+  is fast at this size; this is a cheap change made now, not a measured fix.
+
+**Consequences:**
+- Inventory has no Kafka dependency and no consumer yet; `spring-kafka` must be
+  added.
+- Topics stay single-partition. Key = order id already keeps one order's events
+  in order; more partitions would only help scaling. Noted as a limitation.
+- Closes the expiry-sweep part of A3. The refund-index part and A2 stay open.
+- **Nothing here is implemented or tested.** Tests required when built: a
+  duplicate `OrderCancelled` adds no stock the second time; a `CONFIRMED`
+  reservation is not released; a duplicate `PaymentConfirmed` is quiet; confirm
+  on a `RELEASED` row logs ERROR and changes nothing; a bad payload is skipped
+  and a transient error is retried; the republish fires for the four failure
+  states and never for `PAID`; two sweep instances on one order write one outbox
+  row; the sweep racing a payment start gives one winner; `EXPLAIN` shows the
+  partial index in use.
