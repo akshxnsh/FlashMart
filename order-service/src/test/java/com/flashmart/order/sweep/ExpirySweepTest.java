@@ -159,10 +159,12 @@ class ExpirySweepTest {
     // The real plan of the sweep SELECT over thousands of terminal rows and a
     // few live ones, in a transaction that is rolled back (rows and ANALYZE
     // statistics included). Printed, not asserted: the planner may legitimately
-    // pick a seq scan on a small table. The second plan, with seq scans
-    // discouraged, proves only that the partial index CAN serve this query,
-    // i.e. that the literal WHERE matches the index predicate. No timing is
-    // measured here, so no speedup is claimed.
+    // pick a seq scan on a small table, and it has been seen to pick either the
+    // partial index or idx_orders_reconciliation_sweep, whose leading status
+    // column also matches. The second plan, with seq scans off and that other
+    // index dropped (DDL is transactional; the drop rolls back), proves only
+    // that the partial index CAN serve this query, i.e. that the literal WHERE
+    // implies its predicate. No timing is measured, so no speedup is claimed.
     @Test
     void explainTheSweepSelect() {
         tx.executeWithoutResult(s -> {
@@ -181,13 +183,16 @@ class ExpirySweepTest {
             Long total = jdbc.queryForObject("SELECT count(*) FROM orders", Long.class);
             String natural = plan(sql);
             jdbc.execute("SET LOCAL enable_seqscan = off");
+            jdbc.execute("DROP INDEX idx_orders_reconciliation_sweep"); // rolled back below
             String forced = plan(sql);
             System.out.println("EXPLAIN sweep SELECT, orders rows visible = " + total + "\n-- planner's choice:\n"
-                    + natural + "\n-- with enable_seqscan = off:\n" + forced);
+                    + natural + "\n-- with enable_seqscan = off and the reconciliation index dropped:\n" + forced);
             assertTrue(forced.contains("idx_orders_expiry_sweep_live"),
                     "the partial index cannot serve the sweep SELECT; the WHERE does not imply its predicate:\n" + forced);
             s.setRollbackOnly();
         });
+        assertEquals(1L, jdbc.queryForObject("SELECT count(*) FROM pg_indexes "
+                + "WHERE indexname = 'idx_orders_reconciliation_sweep'", Long.class), "the drop must have rolled back");
     }
 
     private String plan(String sql) {
