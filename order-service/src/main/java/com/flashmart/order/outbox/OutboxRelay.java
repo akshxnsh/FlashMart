@@ -97,7 +97,14 @@ public class OutboxRelay {
                 "unknown event_type '" + row.eventType() + "': no topic (V5 CHECK and OutboxTopics disagree)"));
         long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(settings.ackTimeoutMs());
         var ack = kafka.send(topic, Long.toString(row.aggregateId()), row.payload());
-        ack.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        try {
+            ack.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            // Future.get's TimeoutException has no message; last_error would read "null".
+            TimeoutException named = new TimeoutException("no broker ack within " + settings.ackTimeoutMs() + " ms");
+            named.initCause(e);
+            throw named;
+        }
     }
 
     /** Only after the ack. We hold the row lock, so anything but 1 row means something is badly wrong. */
