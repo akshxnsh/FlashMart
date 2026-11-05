@@ -122,7 +122,12 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
   -- CHECK (amount IS NULL OR amount >= 0)
   -- created_at: DB default. updated_at: DB trigger (CAS writes are raw SQL and
   --   skip Hibernate's @UpdateTimestamp)
-  -- index: (status, expires_at) expiry sweep; (status, payment_reconciled_at) reconciliation sweep
+  -- index: idx_orders_expiry_sweep_live ON (expires_at) WHERE status IN
+  --   ('CREATED','PENDING_PAYMENT') for the expiry sweep (V9, Day 7: replaced V2's
+  --   idx_orders_expiry_sweep (status, expires_at); implemented and tested; EXPLAIN showed
+  --   the planner CAN use it for the sweep SELECT, NO speedup was measured);
+  --   (status, payment_reconciled_at) reconciliation sweep, unchanged (A3's refund/
+  --   reconciliation part is still undecided)
   -- V7 (hardening, from an independent static review of V1-V6, Oct 29):
   --   CHECK (status NOT IN ('PENDING_PAYMENT','PAID') OR payment_ref IS NOT NULL)
   --   (ck_orders_payment_ref_present_when_payable: a status written without the
@@ -616,7 +621,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   column. Implemented and **run on 2026-11-03**; break-and-restore done: 5 of
   the 6 original guards were killed, `@DynamicUpdate` was the survivor and was
   removed, and each of the six set-once columns is killed by a named test.
-  **Test totals:** see "Tested" below (447 on 2026-11-06).
+  **Test totals:** see "Tested" below (490 on 2026-11-06, after Day 7).
   **Day-1 repositories:** `OrderRepository` has one native compare-and-set per
   transition (set amount, `CREATED` to `RESERVATION_FAILED` / `PAYMENT_UNAVAILABLE`,
   `CREATED` or `PENDING_PAYMENT` to `ORDER_EXPIRED` with no time condition,
@@ -710,8 +715,10 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     the relay and any consumer (Days 6 and 7, so stock release after
     `OrderCancelled` is not tested), any load. The late-reservation gap (a
     timed-out reserve that still commits in Inventory after the order failed) is
-    still covered only by Day 7 designs. (The relay has since been built on
-    Day 6, below; no consumer exists, so stock release is still not tested.)
+    still covered only by Day 7 designs. (The relay was built on Day 6, and the
+    sweep, Inventory's consumers and Version A of the republish on Day 7, below;
+    stock release after `OrderCancelled` is tested since Day 7. Version B of the
+    gap remains open, see §9.)
 - **Day 5, fee and deadline (merged from `feat/day5-fee-deadline`): IMPLEMENTED and
   TESTED** on real Postgres; all values **provisional**, unmeasured, recheck
   Day 9. Design: `decisions.md`, "Day 5: payment step, resilience and derived
@@ -770,7 +777,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     `Idempotency-Key`), the webhook (Day 6), the sweep (Day 7), the relay and
     consumers (so stock release after `OrderCancelled{PAYMENT_UNAVAILABLE}` is
     not tested), any load. (The webhook and the relay have since been built on
-    Day 6, below; the sweep and every consumer are still not built.)
+    Day 6, and the sweep and Inventory's consumers on Day 7, below.)
 - **Day 5 failure demo (`docs/testing.md`): VERIFIED UNDER FAILURE against the
   payment-stub only, on one laptop, one run per scenario (scenarios 3 to 5
   run twice), no load, no webhook.** Real inventory,
@@ -788,7 +795,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   and nothing pays it out (refund worker not built). Switching
   the stub to HEALTHY inside the 500 ms retry wait gave `201` with the payment
   attempt 1 created (2 of 2 runs, timing dependent).
-- **Day 5, still designed only:** sweep (Day 7), refund worker (stretch).
+- **Day 5, still designed only:** refund worker (stretch). (The sweep was built on Day 7, below.)
 - **Day 6 webhook handler (`POST /webhooks/payment`, order-service,
   `feat/day6-webhook`): IMPLEMENTED and TESTED on real Postgres; not
   load-tested; not run against a real gateway.** (When merged the payment-stub
@@ -914,18 +921,149 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   3 of 3 runs). **Money is a decimal string here; real gateways use integer
   minor units**, so this is not a model of one. It is not the Razorpay Clone and
   proves none of RZP-1 to RZP-9. Not built: refund, status lookup (webhooks since built, see the Day 6 items above).
+- **Day 7 Inventory consumers (`feat/day7-inventory-consumers`): IMPLEMENTED and
+  TESTED on real Postgres and an embedded broker (`@EmbeddedKafka`); also VERIFIED
+  UNDER FAILURE on real processes (the end-to-end item below); not load-tested.**
+  Derived from `decisions.md`, "Day 7", points 1 to 4. Delivery is
+  **at-least-once**; nothing here is exactly-once.
+  - Plain `spring-kafka`, wired by hand (`InventoryKafkaConfig`, as Order's
+    producer). Group `inventory-service`, String deserializers, **auto-commit off
+    and ack mode RECORD, so the offset moves only after the listener returns, i.e.
+    after the database transaction commits**. `auto.offset.reset=earliest` (chosen
+    while building, not in the decision entry: a new group reads whatever is still
+    on the topic). `kafka.consumers-enabled=false` in the test config so no test
+    context connects to a broker unless it asks to.
+  - `ReservationEventService`, plain `JdbcTemplate`. **Release** (`OrderCancelled`):
+    `UPDATE stock_reservations SET status = 'RELEASED' WHERE order_id = ? AND
+    status = 'RESERVED' RETURNING ...`, then add each returned quantity back to
+    `available_stock` with `version = version + 1`, in ascending item id, in ONE
+    transaction. The status guard decides the winner under READ COMMITTED: a
+    duplicate matches 0 rows and adds 0 stock; a `CONFIRMED` row is never matched.
+    The `available_stock <= total_stock` CHECK stays as the backstop. **Confirm**
+    (`PaymentConfirmed`): same guard to `CONFIRMED`; on 0 rows it reads the state:
+    all `CONFIRMED` is a quiet duplicate; any `RELEASED`, or no rows, logs ERROR
+    with the order id and changes nothing (never flipped back).
+  - Listeners need only `order_id`; all four `OrderCancelled` reasons release.
+    A malformed message (broken JSON, missing or non-integer `order_id`) is not
+    retried: skipped with an ERROR holding the raw message. Any other exception
+    is retried with exponential backoff (1 s, x2, cap 30 s, no limit on attempts),
+    one WARN per failure. **No dead-letter topic.** The three backoff numbers are
+    **provisional, unmeasured**.
+  - Tested (Inventory suite 81 -> 102): release gives the stock back, a
+    multi-item order releases every item, only this order's rows move, the same
+    release twice adds stock once (version unmoved the second time), two threads
+    releasing at once add stock once (50 rounds), a `CONFIRMED` row is never
+    released, confirm duplicate is quiet, confirm on `RELEASED` / mixed / missing
+    logs ERROR and changes nothing. On the embedded broker: all four reasons
+    release, `OrderCancelled` after `PaymentConfirmed` leaves `CONFIRMED`, a
+    duplicate message adds stock once, four malformed payloads are skipped (one
+    ERROR each, no retry WARN) and the valid message after them still runs, a
+    database error (trigger on the item row) is retried with WARNs while the
+    transaction rolls back, the offset stays put, and when the database recovers
+    the same message succeeds with stock up once, and a message that fails once is
+    redelivered with one add-back.
+  - Break-and-restore: removing `AND status = 'RESERVED'` from `release` failed 5
+    of the 21 new tests (the duplicate and concurrent ones among them; two of
+    those fired the `available_stock <= total_stock` CHECK instead of an
+    assertion). Restored.
+  - **Not exercised by these tests:** a real broker process, a rebalance, more
+    than one partition or instance, a JVM crash between the commit and the offset
+    commit (a database error that rolls back stands in for it), Order's real
+    producer, load.
+- **Day 7 Order: expiry sweep, drain loop, V9 index, late-reservation republish
+  (`feat/day7-order-sweep`, plus the drain loop on `test/day7-e2e`): IMPLEMENTED
+  and TESTED on real Postgres; EXPLAIN looked at; also VERIFIED UNDER FAILURE on
+  real processes (next item); not load-tested.** Derived from `decisions.md`,
+  "Day 7", points 5 to 7, and the Day 5 sweep interval.
+  - **V9** (never an edit of V2): `idx_orders_expiry_sweep_live ON orders
+    (expires_at) WHERE status IN ('CREATED', 'PENDING_PAYMENT')`; V2's
+    `idx_orders_expiry_sweep` is dropped; `idx_orders_reconciliation_sweep` is
+    untouched. Tested by reading `pg_indexes` and `pg_index`'s predicate. **EXPLAIN
+    (about 5,000 terminal rows plus 5 live, one laptop):** the planner's own
+    choice in the full suite was a bitmap scan on `idx_orders_reconciliation_sweep`
+    (its leading `status` column also matches); with seq scans off and that index
+    dropped inside a rolled-back transaction it used the partial index, so the
+    partial index CAN serve the query (the literal statuses match its predicate).
+    **No timing was taken; no speedup is claimed.**
+  - **Sweep** (`ExpirySweep`, `ExpiryTransaction`, `ExpirySweepScheduling`): every
+    30 s (`order.sweep.interval-ms`, fixed delay). One pass selects up to
+    `batch-size` (100) due ids with their status, statuses written as LITERALS,
+    `ORDER BY expires_at`, `clock_timestamp()`; then each order gets its own
+    short transaction through a proxy bean: the existing `expire` CAS, and
+    `OrderCancelled{ORDER_EXPIRED, buyer_id}` in the same transaction only if the
+    CAS returned 1. No `SKIP LOCKED`. One failing order is logged and the rest of
+    the batch still runs. **Drain loop:** a tick runs another pass at once while
+    the last one picked a full batch; it stops when a pass picks fewer than
+    `batch-size`, when a pass expired nothing, or after `max-passes-per-tick`
+    (10). `batch-size` and `max-passes-per-tick` are **provisional, unmeasured**.
+    The sweep is switched off in the test config.
+  - **Late-reservation republish, Version A only:** when the reserve loop gets
+    `RESERVED` but the order already left `CREATED`, one `INSERT ... SELECT`
+    writes a new `OrderCancelled` (reason = the status) only while the order is
+    `RESERVATION_FAILED`, `PAYMENT_UNAVAILABLE`, `ORDER_EXPIRED` or
+    `PAYMENT_FAILED`; never for `PAID` or `PENDING_PAYMENT`. Not on the
+    `RESERVATION_RELEASED` path or the Inventory-timeout path (Version B is a
+    documented gap; see §9).
+  - Tested (Order suite 268 -> 290): due `CREATED` and `PENDING_PAYMENT` expire with
+    exactly one `OrderCancelled` each; not-yet-due and terminal orders untouched;
+    batch limit, oldest first, leftovers next pass; one failing order does not
+    block the others and is retried; drain loop (backlog bigger than the batch
+    drains in one tick, a short batch stops it, the cap stops it, a pass that
+    expired nothing stops it); **raced on real Postgres** (real threads, the loser
+    seen blocked on the row lock, then 0 rows): the real sweep pass vs the webhook
+    (replaces the earlier simulation; both orderings forced, 100 free rounds),
+    sweep vs the payment start (both orderings forced, 100 free rounds; payment
+    won some rounds and the sweep others, always exactly one winner), and two
+    passes at once (20 rounds x 10 orders: one `OrderCancelled` per order); the
+    republish for each of the four states and none for `PAID` / `PENDING_PAYMENT`.
+  - Break-and-restore: writing the sweep's outbox row without checking `expire`'s
+    rows-affected failed 3 of the 4 sweep race tests (one order got 2
+    `OrderCancelled` rows); adding `PAID` to the republish list failed its test.
+    Both restored.
+  - **Not exercised by these tests:** the `@Scheduled` timer, two JVMs, Version B,
+    the `409 ORDER_EXPIRED` answer from inside a race, load.
+- **Day 7 VERIFIED UNDER FAILURE on real processes (`docs/testing.md`, "Day 7 end
+  to end"). One laptop, payment-stub gateway, one broker, one partition, one run
+  per scenario, no load.** Real inventory, order and payment-stub processes, local
+  Postgres, the docker-compose Kafka. Observed: a failed payment released the
+  stock (49 -> 50, 1.9 s from the webhook); a paid order's reservation was
+  `CONFIRMED` and stock stayed down; an unpaid order (20 s window) expired 29.4 s
+  after creation and the stock came back; 3 re-produced copies of one
+  `OrderCancelled` on the real broker changed neither stock nor version; with
+  Kafka paused the event stayed unpublished and the stock stayed down until the
+  unpause, then it was published and released within 0.6 s (the topic held 2
+  copies of the event, the Day 6 pause-duplicate again, and the stock rose by
+  exactly one); with Inventory stopped, 2 failed + 1 expired orders were
+  published and, after Inventory restarted, the stock rose by exactly 3 with one
+  release per order; a two-item order released both items. Also seen: on first
+  start Inventory consumed 15 old Day 6 `PaymentConfirmed` messages and logged 15
+  ERRORs (their orders did not exist in the freshly seeded database).
+  **Not covered:** a crash between the commit and the offset commit, several
+  instances or a rebalance, more than one partition, the drain loop on a real
+  backlog, a malformed message on a real broker, load, a real gateway or the
+  Razorpay Clone.
 - **Not built anywhere:** repositories beyond the Day-1 ones above (apart from
   the ones `reserve` added), service implementations other than Inventory's
-  `reserve`, Order's create path and payment step, the webhook handler and the
-  outbox relay, any controller other than Inventory's
-  reserve endpoint, Order's `POST /api/orders` and `POST /webhooks/payment` (and
-  the payment-stub's own), the API Gateway, the expiry sweep, the reconciliation
-  sweep, the refund worker, Inventory's stale-reservation reconciler, Order's
-  internal status endpoint, Identity's relay, Kafka consumers (Order's relay
-  publishes; nothing consumes), Redis, security. All four services
-  share one local Postgres credential pair but each owns a separate database.
+  `reserve`, Order's create path, payment step, webhook handler, outbox relay and
+  expiry sweep, and Inventory's two consumers; any controller other than
+  Inventory's reserve endpoint, Order's `POST /api/orders` and `POST
+  /webhooks/payment` (and the payment-stub's own); the API Gateway, the
+  reconciliation sweep, the refund worker, Inventory's stale-reservation
+  reconciler, Order's internal status endpoint, Identity's relay, Notification's
+  consumers (nothing consumes `BrandUpserted` / `UserUpserted`), Redis, security.
+  All four services share one local Postgres credential pair but each owns a
+  separate database.
 
-**Tested on `main` after Day 6: 447 tests, all passing, 0 failures, 0 errors,
+**Tested on `main` after Day 7: 490 tests, all passing, 0 failures, 0 errors,
+0 skipped** - all five suites run on 2026-11-06 (branch `docs/day7-status`, no code
+change against `main` `b3dc125`), no Docker needed (the relay and consumer tests
+use an embedded broker): Order 290, Inventory 102, Identity 47, Notification 29,
+payment-stub 22. Since Day 6: Order +22 (`ExpirySweepTest` 10, `ExpirySweepRaceTest`
+4, `LateReservationRepublishTest` 7, one V9 index case in
+`OrderSchemaHardeningTest`) and Inventory +21 (`ReservationEventServiceTest` 12,
+`InventoryConsumerKafkaTest` 9).
+
+**Day 6 figure (kept for history): 447 tests, all passing, 0 failures, 0 errors,
 0 skipped** — all five suites run on 2026-11-06 (branch `docs/audit-day6`, no
 code change against `main` `44c751b`), Order DB reset with `seed.sh` first, no
 Docker needed (the relay tests use an embedded broker): Order 268, Inventory
@@ -1197,8 +1335,8 @@ or "recorded, not decided" still need a design decision.
   order" plus scanning `PAID` orders is judged not worth it against that
   likelihood. This is the one place in the design that leans on prevention
   rather than independent correction.
-- **Day 5 decisions: written; the deadline, fee and payment step since
-  implemented and tested (below); the sweep and refund worker not built** (all
+- **Day 5 decisions: written; the deadline, fee, payment step and (Day 7) the sweep
+  since implemented and tested (below); the refund worker not built** (all
   **provisional**, unmeasured, recheck Day 9; see `decisions.md`, "Day 5: payment
   step, resilience and derived deadlines"): the `CREATED` deadline is re-derived
   (3 s per reserve call = connect 1 s + read 2 s; retry ceiling 6.5 s;
@@ -1206,7 +1344,9 @@ or "recorded, not decided" still need a design decision.
   margin); payment window 6 min; sweep interval 30 s; refund claim lease 2 h.
   **Implemented and tested for the fee and the deadline** (`maxLines` 17, 3 s per
   call; §8); the payment client and breaker are implemented and tested against a
-  stub only (§8); the sweep is not built. Pool size and DB timeout values stay open.
+  stub only (§8); the 30 s sweep interval is implemented and tested since Day 7
+  (§8); the refund claim lease is still unused (refund worker not built). Pool size
+  and DB timeout values stay open.
 - **Test isolation (noted, not fixed):** 4 Order entity tests
   (`OrderPersistenceTest`, `OrderSchemaHardeningTest`, two in
   `OutboxEventPersistenceTest`) count absolute rows in the shared dev database,
@@ -1275,7 +1415,7 @@ or "recorded, not decided" still need a design decision.
   `RESERVATION_RELEASED` mid-loop Order stops the loop, writes no CAS and no
   event, re-reads the real status and reports it; if still `CREATED`, it logs
   ERROR and answers `500 INCONSISTENT_STATE`, and does not guess. Repairing that
-  state is the Day 7 reconciler's case (the reconciler is designed, not built), not fixed here.
+  state is the stale-reservation reconciler's case (designed, not built; Day 7 did not build it), not fixed here.
 - **Decided; implemented and tested (Day 4):** all three reserve "no" outcomes
   (`OUT_OF_STOCK`, `SALE_NOT_LIVE`, `ITEM_NOT_IN_SALE`) end the order as
   `RESERVATION_FAILED`.
@@ -1297,7 +1437,7 @@ or "recorded, not decided" still need a design decision.
   with the existing order; else `409 CONFLICT_RETRY`. Never a `500`.
 - **A buyer cannot start a new order while an unpaid one is open**, until it
   pays or expires. The wait is bounded by the payment window (6 min,
-  provisional, Day 5; plus up to one sweep interval once the sweep exists).
+  provisional, Day 5; plus up to one sweep interval, now that the sweep exists).
   Accepted cost of the one-live-order rule.
 - **One person with two accounts is not covered** by the one-live-order rule:
   the rule is per `buyer_id`, and Identity does not link accounts. The cap of
@@ -1323,7 +1463,7 @@ or "recorded, not decided" still need a design decision.
   review of Order V1-V6 happened on 2026-10-29; the reviewer could not run the
   tests. What it found and V7 fixed is in §4 (V7). The items below were left
   alone on purpose, each waiting for a decision; each line says where it
-  stands now (A2 and A3 are still undecided):
+  stands now (A2 is still undecided, and so is A3's refund-index part):
   - **A1:** entity updatability and `@DynamicUpdate`. **Decided** (see
     `decisions.md`, "CAS-owned columns are insert-only in the entities"):
     implemented, **run on 2026-11-03**, break-and-restore done; later amended
@@ -1334,7 +1474,9 @@ or "recorded, not decided" still need a design decision.
     refund rows with `next_retry_at` NULL, so whoever builds the refund worker
     must decide whether NULL means "due now" before writing the claim query (a
     claim on `next_retry_at <= now()` alone would never pick these rows).
-  - **A3:** redesign of the sweep and refund indexes. Not decided.
+  - **A3:** redesign of the sweep and refund indexes. **Expiry-sweep part DECIDED
+    and implemented, tested (Day 7, V9; §8)**; the refund-index part is still not
+    decided.
   - **B1:** `ON CONFLICT DO NOTHING` for the refund insert. **Decided 2026-11-05
     (derived); implemented and tested (Day 6, §8; break-and-restore done)** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
   - **B2, B3:** the retried create (and the `409` it returns) and a request
@@ -1355,10 +1497,10 @@ or "recorded, not decided" still need a design decision.
 - **New, 2026-11-05 (Order creation: retries, conflicts, deadlines and Inventory failures), implemented
   and tested on Day 4 (see §8):** an Inventory timeout or refusal mid-loop ends
   the order as `RESERVATION_FAILED` + `OrderCancelled`, `503
-  INVENTORY_UNAVAILABLE`. **Known gap:** a timed-out call can commit after the
-  release and orphan a reservation; the late-reservation gap is still covered
-  only by Day 7 designs (the republish and the reconciler, designed, not
-  verified). The HTTP client is Spring Cloud OpenFeign 2025.1.2 on Boot 4.1.1:
+  INVENTORY_UNAVAILABLE`. **Known gap (Version B, documented, not fixed):** a timed-out call can commit after the
+  release and orphan a reservation. Day 7's republish (Version A) is implemented
+  and tested but cannot see this case; only the reconciler would, and it is
+  designed, not built. The HTTP client is Spring Cloud OpenFeign 2025.1.2 on Boot 4.1.1:
   it resolves and the context starts; its behaviour is tested against a stub,
   not against Inventory. Values: connect timeout 1 s, reserve (read) timeout 2 s, max-blocking policy 60 s, deadline margin 5 s, all **provisional**, taken from Inventory load runs on one laptop that were not repeated; recheck on Day 9. The deadline
   was re-derived on Day 5 with retry attempts: **implemented and tested** (3 s per
@@ -1373,14 +1515,42 @@ or "recorded, not decided" still need a design decision.
     batch x ack timeout (50 x 5 s). Not measured; recheck Day 9.
   - **Duplicate observed:** with Kafka paused, one order's `PaymentConfirmed`
     was on the topic twice in 2 of 2 clean end-to-end runs (§8,
-    `docs/testing.md`). Cause likely, not proven. Consumers (Day 7) must be
-    idempotent; this is the expected at-least-once case, not a bug.
+    `docs/testing.md`). Cause likely, not proven. Consumers must be
+    idempotent; this is the expected at-least-once case, not a bug. Inventory's
+    consumers (Day 7) are, by the status guard; the pause-duplicate was seen again
+    on `OrderCancelled` and added stock once (§8, `docs/testing.md`, "Day 7 end to end").
   - **Known edge, wrong amount then right amount:** a wrong-amount SUCCESS
     leaves the order `PENDING_PAYMENT` with a refund row for the held ref; if the
     same ref later arrived with the right amount, the order would be `PAID`
     while that refund row exists. Needs a gateway that reports two amounts for
     one payment. The future refund worker should check that the order is not
     `PAID` with that ref before paying out. Not built, not tested.
+- **New with Day 7 (see `decisions.md`, "Day 7"; implemented and tested, §8):**
+  - **Known gap, Version B:** an Inventory `reserve` that times out at Order but
+    still commits leaves a `RESERVED` row for an order Order has cancelled, and
+    Order never sees it. Documented, not fixed. **Frequency UNMEASURED** (an
+    earlier "rare" was a guess); count it after the Day 9 load test by comparing
+    the two databases' order ids.
+  - **No dead-letter topic.** A skipped malformed message leaves that order's
+    stock `RESERVED` until fixed by hand; the stale-reservation reconciler that
+    would catch it is designed only.
+  - **`expires_at < clock_timestamp()` is a filter, not an index condition**
+    (`clock_timestamp()` changes per call, so the planner cannot use it as a range
+    bound). The partial index gives the live-only set and the `expires_at`
+    order. Switching to `now()` is a decision, deferred.
+  - **One-partition topics.** Key = order id already keeps one order's events in
+    order; more partitions would only help scaling (not needed, not tested).
+  - **Inventory logs ERROR for a `PaymentConfirmed` whose reservations are
+    missing, so stale or reset dev data triggers it:** 15 such ERRORs on the first
+    start of the Day 7 run, from old Day 6 messages. They look the same as a real
+    lost reservation. Not changed.
+  - **PROVISIONAL, unmeasured (recheck Day 9):** sweep `batch-size` 100,
+    `max-passes-per-tick` 10, the consumer retry backoff (1 s, x2, cap 30 s). The
+    drain loop is built and unit-tested but was **not exercised on a real
+    backlog**.
+  - **Not tested:** a crash between the ack and the offset commit, several
+    instances or a rebalance, a malformed message on a real broker, load, a real
+    gateway.
 
 The PRD is `docs/Flashmart.prd` (Revision 4, markdown). The earlier
 `FlashMart_Project_Plan_v3.pdf` reference was stale — no such file exists or

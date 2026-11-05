@@ -4924,7 +4924,7 @@ is closed by a reconciliation sweep"), and, in
     decide what NULL means before writing the claim query (a claim on
     `next_retry_at <= now()` alone would never pick these rows).
   - **A3:** redesign of the sweep and refund indexes. **Expiry-sweep part
-    decided (not implemented)** in "Day 7: Inventory consumers, late-reservation
+    decided, implemented and tested (Day 7, V9)** in "Day 7: Inventory consumers, late-reservation
     cleanup, expiry sweep and its index", point 7. The refund-index part is
     still undecided.
   - **B1:** `ON CONFLICT DO NOTHING` for the refund insert. **Decided 2026-11-05
@@ -5196,6 +5196,13 @@ each consumer and the sweep use them.
    order, there is one row and one winner. If the sweep loses, it matches 0 rows.
    If the sweep wins, the payment CAS gets 0 rows, the request answers `409
    ORDER_EXPIRED`, and a later `SUCCESS` webhook becomes a `refunds` row.
+   **Amendment (2026-11-06, while building; the points above are unchanged):**
+   after a pass that picked a FULL batch, the tick runs another pass at once. It
+   stops when a pass picks fewer than `batch-size`, or expires nothing (all
+   failed or lost the CAS), and it is capped at `order.sweep.max-passes-per-tick`
+   (provisional, unmeasured). Why: otherwise a backlog drains at about
+   `batch-size` orders per interval, and stock would stay held well past
+   "window + interval". Implemented and tested; not exercised on a real backlog.
 7. **A3 index (expiry-sweep part).** A new **V9** migration creates a partial
    index on `(expires_at) WHERE status IN ('CREATED', 'PENDING_PAYMENT')`, then
    drops `idx_orders_expiry_sweep (status, expires_at)`. The applied V2 is never
