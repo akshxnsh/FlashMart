@@ -101,3 +101,20 @@ order:
 # (WebhookSignature). The payment stub must sign with the same value.
 payment-webhook:
   secret: ${PAYMENT_WEBHOOK_SECRET:}
+
+# Kafka (decisions.md, "Day 6", point 6). Locally the docker-compose broker.
+kafka:
+  bootstrap: ${KAFKA_BOOTSTRAP:localhost:9092}
+  # Create payment-confirmed and order-cancelled at startup (the compose broker
+  # has auto-creation off).
+  create-topics: true
+
+# Outbox relay. All three numbers PROVISIONAL, unmeasured, recheck Day 9. The
+# producer's request/delivery/max-block timeouts are derived from the ack
+# timeout (OutboxKafkaConfig), not set here.
+outbox:
+  relay:
+    enabled: true
+    poll-ms: 1000
+    batch-size: 50
+    ack-timeout-ms: 5000
