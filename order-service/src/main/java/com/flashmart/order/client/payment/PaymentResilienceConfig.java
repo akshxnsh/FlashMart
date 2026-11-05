@@ -1,0 +1,59 @@
+package com.flashmart.order.client.payment;
+
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+import java.time.Duration;
+
+/**
+ * The payment circuit breaker and retry, built with resilience4j's core
+ * libraries (no Boot starter). Every number comes from {@code payment.*}
+ * (decisions.md, Day 5, points 3 and 4; PROVISIONAL).
+ */
+@Configuration
+public class PaymentResilienceConfig {
+
+    /**
+     * COUNT_BASED over the last {@code window-size} calls, judged once at least
+     * {@code minimum-calls} are recorded. Timeouts, connect errors and 5xx are
+     * failures; a 4xx is ignored (it says nothing about the gateway's health).
+     * Open for {@code open-ms}, then {@code half-open-calls} trial calls decide.
+     */
+    @Bean
+    public CircuitBreaker paymentCircuitBreaker(@Value("${payment.breaker.window-size}") int windowSize,
+                                                @Value("${payment.breaker.minimum-calls}") int minimumCalls,
+                                                @Value("${payment.breaker.failure-rate-percent}") float failureRate,
+                                                @Value("${payment.breaker.open-ms}") long openMs,
+                                                @Value("${payment.breaker.half-open-calls}") int halfOpenCalls) {
+        return CircuitBreaker.of("payment-gateway", CircuitBreakerConfig.custom()
+                .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+                .slidingWindowSize(windowSize)
+                .minimumNumberOfCalls(minimumCalls)
+                .failureRateThreshold(failureRate)
+                .waitDurationInOpenState(Duration.ofMillis(openMs))
+                .permittedNumberOfCallsInHalfOpenState(halfOpenCalls)
+                .recordException(PaymentCalls::isTransient)
+                .ignoreException(PaymentCalls::isClientError)
+                .build());
+    }
+
+    /**
+     * {@code attempts} in total (not retries), a fixed wait between them. Only a
+     * transient failure is retried: never a 4xx, never CallNotPermittedException
+     * (an open breaker means "do not call", so retrying it would only wait).
+     */
+    @Bean
+    public Retry paymentRetry(@Value("${payment.attempts}") int attempts,
+                              @Value("${payment.wait-ms}") long waitMs) {
+        return Retry.of("payment-gateway", RetryConfig.custom()
+                .maxAttempts(attempts)
+                .waitDuration(Duration.ofMillis(waitMs))
+                .retryOnException(PaymentCalls::isTransient)
+                .build());
+    }
+}

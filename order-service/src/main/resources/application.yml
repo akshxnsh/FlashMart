@@ -39,6 +39,12 @@ spring:
             connect-timeout: ${inventory.connect-timeout-ms}
             read-timeout: ${inventory.reserve-timeout-ms}
             # No in-call retries: see InventoryClientConfig.
+          payment-gateway:
+            # From payment.* below: the same values the CREATED deadline's
+            # payment budget is derived from (CreateOrderSettings).
+            connect-timeout: ${payment.connect-timeout-ms}
+            read-timeout: ${payment.read-timeout-ms}
+            # No Feign-level retries: resilience4j does them (PaymentCalls).
 
 # All four values below are PROVISIONAL: picked from one-laptop Inventory load
 # runs that were not repeated (docs/decisions.md, "Order creation: retries,
@@ -50,19 +56,36 @@ inventory:
   # and of maxLines.
   reserve-timeout-ms: 2000
 
-# Payment call budget (decisions.md, "Day 5: payment step, resilience and derived
-# deadlines", point 3). PROVISIONAL, unmeasured, recheck Day 9. The payment
-# client is not built yet; these numbers only feed the CREATED deadline.
+# The payment gateway. Locally this is payment-stub/ on 8085, not a real gateway.
+payment-gateway:
+  base-url: http://localhost:8085
+
+# Payment call (decisions.md, "Day 5: payment step, resilience and derived
+# deadlines", points 3 and 4). PROVISIONAL, unmeasured, recheck Day 9. The
+# timeouts, attempts and wait also feed the CREATED deadline's payment budget.
 payment:
   connect-timeout-ms: 1000
   read-timeout-ms: 2000
+  # Retry (outside the breaker): only timeouts, connect errors and 5xx; never a
+  # 4xx, never a call the open breaker refused.
   attempts: 2
   wait-ms: 500
+  breaker:
+    # COUNT_BASED window. Timeouts, connect errors and 5xx count as failures;
+    # a 4xx is ignored (neither failure nor success).
+    window-size: 10
+    minimum-calls: 5
+    failure-rate-percent: 50
+    open-ms: 10000
+    half-open-calls: 3
 
 order:
   # Flat fee added to every order's amount (BigDecimal; a JSON string at every
   # boundary). Not stored: fee = amount - SUM(order_items.subtotal).
   fee: 49.00
+  # Payment window: how long a PENDING_PAYMENT order holds its stock. A policy,
+  # not derivable (decisions.md, Day 5, point 7). PROVISIONAL.
+  payment-window-ms: 360000
   create:
     # Policy: the longest a crashed order may block its buyer (one live order
     # per buyer and sale). CreateOrderSettings derives from it:
