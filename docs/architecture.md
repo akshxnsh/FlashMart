@@ -776,6 +776,46 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   the stub to HEALTHY inside the 500 ms retry wait gave `201` with the payment
   attempt 1 created (2 of 2 runs, timing dependent).
 - **Day 5, still designed only:** sweep (Day 7), refund worker (stretch).
+- **Day 6 webhook handler (`POST /webhooks/payment`, order-service,
+  `feat/day6-webhook`): IMPLEMENTED and TESTED on real Postgres; not run
+  against any gateway (the payment-stub does not send webhooks yet), not
+  load-tested.** Decisions: `decisions.md`, "Day 6: webhook, one-payment edge
+  cases, PaymentConfirmed, outbox relay", points 1 to 5 (point 6, the relay, is
+  not built).
+  - HMAC-SHA256 hex in `X-Signature` over the raw body bytes, checked before
+    parsing, constant-time on the decoded bytes; secret from
+    `PAYMENT_WEBHOOK_SECRET`, blank fails startup. `401` bad/missing/tampered
+    signature, `400` malformed, `404` unknown order (WARN), `409` still
+    `CREATED` (B4, nothing written), `200` after commit.
+  - `markPaid` CAS now also matches `payment_ref` and `amount` (numeric);
+    `markPaymentFailed` now matches `payment_ref`. SUCCESS winner writes
+    `PaymentConfirmed{order_id, buyer_id, items[], amount}` (money as strings,
+    no `brand_id`) in the same transaction; a loser re-reads, treats `PAID` with
+    the same ref as a redelivery, and otherwise inserts a `refunds` row with the
+    webhook's ref and amount, `ON CONFLICT (payment_ref) DO NOTHING` (B1); WARN
+    on every refund, naming an amount mismatch. FAILED winner writes
+    `OrderCancelled{PAYMENT_FAILED}`; a loser writes nothing.
+  - Tested: happy path (one `PaymentConfirmed`, payload checked); 401 for
+    missing, wrong, non-hex and tampered signatures with nothing written; 14
+    malformed bodies are 400; unknown order 404; early SUCCESS and FAILED 409
+    with nothing changed; redelivered SUCCESS is a no-op; a second ref on a
+    `PAID` order gives one refund row however often it arrives; wrong amount
+    leaves `PENDING_PAYMENT` and refunds the webhook amount; `499` pays a
+    `499.00` order; FAILED for another ref is ignored, for the held ref gives
+    `PAYMENT_FAILED` + `OrderCancelled`; SUCCESS on `ORDER_EXPIRED` and on
+    `PAYMENT_UNAVAILABLE` (no ref held) records a refund.
+  - **Raced** (real threads, real Postgres): webhook SUCCESS vs `expire` on one
+    `PENDING_PAYMENT` order. Both orderings forced (the loser seen blocked on
+    the row lock in `pg_stat_activity`, then 0 rows), plus 100 free-running
+    rounds (two runs: webhook won 27 and 22, sweep won 73 and 78), always exactly one winner
+    with only its side effects. The sweep is **simulated** (the `expire` CAS +
+    an `OrderCancelled` row); the real sweep is Day 7.
+  - Break-and-restore: `payment_ref` and `amount` in `markPaid`, `payment_ref`
+    in `markPaymentFailed`, and `ON CONFLICT` on the refund insert each failed
+    their tests when removed.
+  - **Not exercised:** a real or stub gateway sending webhooks or retrying a
+    `409`; the relay (outbox rows are written, never published); the refund
+    worker (rows are `PENDING`, nobody pays them out); the reconciliation sweep.
 - **Payment stub (`payment-stub/`, merged from `feat/day5-payment-stub`): BUILT
   and TESTED ALONE (its own suite); run against Order only in the failure demo
   above; NOT verified against a real gateway.** Listens on 127.0.0.1 only.
@@ -798,7 +838,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
 - **Not built anywhere:** repositories beyond the Day-1 ones above (apart from
   the ones `reserve` added), service implementations other than Inventory's
   `reserve` and Order's create path, any controller other than Inventory's
-  reserve endpoint and Order's `POST /api/orders`, the API
+  reserve endpoint, Order's `POST /api/orders` and `POST /webhooks/payment`, the API
   Gateway, Kafka, Redis, security. All four services
   share one local Postgres credential pair but each owns a separate database.
 
