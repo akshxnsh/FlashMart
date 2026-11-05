@@ -2163,6 +2163,12 @@ that, is what the column is left holding.
 
 ## Decision: Event payload shapes for `PaymentConfirmed`, `BrandUpserted`, `UserUpserted`; money crosses every boundary as a string; no envelope, no `event_id`
 
+> **Correction (2026-11-05, from "Day 6: webhook, one-payment edge cases,
+> PaymentConfirmed, outbox relay"):** `brand_id` is dropped from
+> `PaymentConfirmed` for now (`orders` has no brand column; only the stretch
+> Notification service would use it). The payload is now `{order_id, buyer_id,
+> items[], amount}`. Designed, not implemented. Old text below is unchanged.
+
 **Context / Problem:**
 Three of the four surviving events had never been given a concrete shape.
 `PaymentConfirmed`'s content was implied by two prior decisions (carries the
@@ -4879,11 +4885,12 @@ is closed by a reconciliation sweep"), and, in
   - **A2:** `refunds.next_retry_at` NULL handling and the refund claim query.
     Not decided.
   - **A3:** redesign of the sweep and refund indexes. Not decided.
-  - **B1:** `ON CONFLICT` for the refund insert. Not decided.
+  - **B1:** `ON CONFLICT DO NOTHING` for the refund insert. **Decided 2026-11-05
+    (derived); not implemented** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
   - **B2, B3:** the retried create (and the `409` it returns) and a request
     fingerprint. **Decided 2026-11-05; implemented, tested (races mock Inventory)** ("Order creation: retries, conflicts, deadlines and Inventory failures"; no fingerprint column).
-  - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`. Not
-    decided.
+  - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`.
+    **Decided 2026-11-05: answer `409`, change nothing; not implemented** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
   - **B5:** which clock function stamps `expires_at`. **Decided 2026-11-05:**
     `clock_timestamp()`, DB-stamped ("Order creation: retries, conflicts, deadlines and Inventory failures").
   - A `CHECK` on `payment_reconciled_at`, and a `CHECK` that `PROCESSING`
