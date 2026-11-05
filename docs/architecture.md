@@ -155,10 +155,10 @@ order_items(id, order_id, product_id, product_name, quantity, unit_price, subtot
   -- RECORDED, NOT BUILT: product_name/unit_price/subtotal are written once —
   --   the pricing UPDATE carries WHERE unit_price IS NULL, on top of the
   --   orders.status = 'CREATED' guard
-  -- RECORDED, NOT BUILT: recovery was abort (decisions.md, "saga_state is
-  --   dropped"); amended 2026-11-05: abort by expiry OR resume on a retried
-  --   create while CREATED ("Order creation: retries, conflicts, deadlines and
-  --   Inventory failures"). The resume runs only over rows WHERE unit_price IS NULL
+  -- RECORDED, NOT BUILT: recovery is abort (decisions.md, "saga_state is
+  --   dropped"). IF a resume path is ever added (e.g. a retried create while
+  --   the order is still CREATED), it runs only over rows WHERE unit_price IS NULL
+  -- Correction: amended by "Order creation: retries, conflicts, deadlines and Inventory failures" (2026-11-05)
 
 refunds(id, order_id, payment_ref, amount, status, attempts,
         next_retry_at, claimed_at, last_error, created_at, updated_at)
@@ -907,9 +907,10 @@ or "recorded, not decided" still need a design decision.
   That was the two-clocks problem the DB-clock rule exists to remove,
   reintroduced through the column type. Any new time column must be
   `TIMESTAMPTZ`; never compare a zone-less column against `now()`.
-- **Two database clock functions are in use for the same job (recorded; the
-  deadline case is decided 2026-11-05: deadlines use `clock_timestamp()`, audit
-  stamps may use `now()`, `reserved_at` stays `now()`).** `stock_reservations.reserved_at` defaults to `now()`
+- **DECIDED 2026-11-05 (see "Who stamps a time column depends on who compares
+  it" in `decisions.md`): deadlines use `clock_timestamp()`, audit and ordering
+  stamps may use `now()`, `reserved_at` stays `now()`. Original text kept
+  below.** **Two database clock functions are in use for the same job.** `stock_reservations.reserved_at` defaults to `now()`
   (`transaction_timestamp()` — when the transaction began); Identity's
   `updated_at` trigger and Order's DB-stamped columns use `clock_timestamp()`
   (when the statement runs). Neither is a bug: a strictly increasing
@@ -1011,6 +1012,9 @@ or "recorded, not decided" still need a design decision.
     id`). Not built.
   - A `CHECK` on `payment_reconciled_at`, and a `CHECK` that `PROCESSING`
     implies `claimed_at`. **Decided 2026-11-05; V8, not written yet.**
+    `payment_reconciled_at` is allowed only on `PAYMENT_FAILED`,
+    `PAYMENT_UNAVAILABLE`, `ORDER_EXPIRED` and `RESERVATION_FAILED` (any failure
+    state; no payment can exist for the last).
 - **New, 2026-11-05 ("Order creation: retries, conflicts, deadlines and
   Inventory failures"), all designed not built:** an Inventory timeout or
   refusal mid-loop ends the order as `RESERVATION_FAILED` + `OrderCancelled`,

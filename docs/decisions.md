@@ -2000,6 +2000,9 @@ cannot drift.
 `orders` 1—1 `saga_state` disappears from the relationship model. `CLAUDE.md`'s
 "Order Service schema: finalized" line needs `saga_state` removed.
 
+**Correction: amended by "Order creation: retries, conflicts, deadlines and Inventory failures"** (2026-11-05): recovery is now abort by expiry
+or resume on a retried create while `CREATED`.
+
 ---
 
 ## Decision: Inventory publishes nothing and owns no outbox
@@ -3599,6 +3602,17 @@ INSERT but leaves the UPDATE broken, since Postgres never bumps `updated_at` by
 itself. And with `@CreationTimestamp` the column must stay insertable, because
 Hibernate generates the value and has to write it.
 
+**Which database function (added 2026-11-05):** the table above fixes the
+*clock*; this fixes the *function*.
+- **Deadlines** (a time later compared to fire a timeout, such as
+  `orders.expires_at`) use `clock_timestamp()`. `now()` is fixed when the
+  transaction starts, so in a long transaction it gives a shorter window than
+  promised.
+- **Audit and ordering stamps** may use `now()`.
+- **`stock_reservations.reserved_at` stays `now()`**: Inventory's reconciler
+  compares hours-old rows, so the offset is noise.
+- Reasoning and the `expires_at` case: "Order creation: retries, conflicts, deadlines and Inventory failures".
+
 **Consequences:**
 A new time column is placed in this table before it is written. Changing a row's
 pattern is a real decision, not a tidy-up.
@@ -4445,10 +4459,9 @@ writing.
 10. **V8 migration (V7 is taken)** adds two CHECKs: `refunds`: `status =
     'PROCESSING'` implies `claimed_at IS NOT NULL`; `orders`:
     `payment_reconciled_at` may be set only when `status` is `PAYMENT_FAILED`,
-    `PAYMENT_UNAVAILABLE` or `ORDER_EXPIRED`. (The source note for this point
-    was cut off after "ORDER_EXP"; the exact predicate is confirmed when V8 is
-    written. `RESERVATION_FAILED` is absent from the list: no payment was ever
-    initiated for it.)
+    `PAYMENT_UNAVAILABLE`, `ORDER_EXPIRED` or `RESERVATION_FAILED`. No payment
+    can exist for `RESERVATION_FAILED`; it is included so the rule is "any
+    failure state" and a later scan needs no migration.
 
 **Why:**
 - The indexes decide races; code can only react. Catching any violation
@@ -4485,9 +4498,9 @@ writing.
 - **Refines** "Deadlines and leases are derived": the `CREATED` deadline is now
   *provisionally* derived (values above); the refund claim lease, sweep
   interval and payment window stay open.
-- Closes the open "two database clock functions" item for deadlines: the
-  `clock_timestamp()` rule above is the answer for B5 and for any later
-  deadline column.
+- Closes the open "two database clock functions" item (DECIDED 2026-11-05):
+  the rule is now written into "Who stamps a time column depends on who
+  compares it".
 - V8 is applied against existing rows: check them first (CLAUDE.md
   Verification 4). Each CHECK needs a test that rejects a bad row.
 - Tests required: the two-thread resume test (3); a retry after
@@ -4584,7 +4597,9 @@ is closed by a reconciliation sweep"), and, in
   republish an upsert event for every existing brand and user as a one-off
   deployment step. No schema change fixes it, and a synchronous fallback to
   Identity on a cache miss would undo the reason the cache exists. Kafka phase.
-- **Two database clock functions are in use for the same job (recorded, not
+- **DECIDED 2026-11-05: see "Who stamps a time column depends on who compares
+  it" and "Order creation: retries, conflicts, deadlines and Inventory failures". Original text kept below.**
+  **Two database clock functions are in use for the same job (recorded, not
   decided; the reserve part is DECIDED 2026-11-04 in "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction": `now()` decides
   liveness and `reserved_at` for reserve, `clock_timestamp()` stays for
   Identity's trigger and Order's DB-stamped columns. Still open for any other
