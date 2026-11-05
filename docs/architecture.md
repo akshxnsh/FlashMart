@@ -93,8 +93,10 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
        payment_ref, expires_at, failure_detail, payment_reconciled_at,
        created_at, updated_at)
   -- flash_sale_id: order-level — one order = exactly one brand's sale
-  -- amount: SUM(order_items.subtotal), DECIMAL, stored (the price the buyer
-  --   agreed to, frozen). NULL until the last item is priced; set once by a CAS
+  -- amount: SUM(order_items.subtotal) + fee, DECIMAL, stored (the price the buyer
+  --   agreed to, frozen). Fee = flat 49.00 per order, config, no column: fee =
+  --   amount - SUM(subtotal). DESIGNED, NOT IMPLEMENTED (Day 5 entry); today's
+  --   code still sets amount = SUM(subtotal). NULL until the last item is priced; set once by a CAS
   --   guarded on status = CREATED; a test checks it equals SUM(subtotal).
   --   Computed once from SUM(order_items.subtotal) after the last item is
   --   priced, never accumulated item by item (recorded, not built)
@@ -455,7 +457,7 @@ synchronous status check in §3.
 
 - `CREATED → PENDING_PAYMENT` — every item reserved, `amount` set, gateway returned 202. Saves `payment_ref`, resets `expires_at` to the payment window.
 - `CREATED → RESERVATION_FAILED` — an item came back `OUT_OF_STOCK`, `SALE_NOT_LIVE` or `ITEM_NOT_IN_SALE` (decided; no new state, no migration). A state exists only if something downstream reacts differently to it, and every reserve "no" gets the same reaction: release everything, send no email, tell the buyer in the reply. Which outcome it was goes in `failure_detail` (debug only) and in the buyer's reply. An Inventory timeout or refusal mid-loop also ends as `RESERVATION_FAILED` (`503 INVENTORY_UNAVAILABLE`, cause in `failure_detail`). On `RESERVATION_RELEASED` Order stops without a CAS or event and reports the real status. Both decided 2026-11-05, implemented, tested (races mock Inventory) (§9).
-- `CREATED → PAYMENT_UNAVAILABLE` — circuit breaker open on initiate.
+- `CREATED → PAYMENT_UNAVAILABLE` — circuit breaker open on initiate. Day 5 (designed, not implemented) widens this to retries exhausted as well, or a gateway 4xx, with `OrderCancelled{PAYMENT_UNAVAILABLE}` in the same transaction.
 - `CREATED → ORDER_EXPIRED` — didn't finish the loop + initiate before its deadline.
 - `PENDING_PAYMENT → PAID` — webhook success *for the payment this order holds*.
 - `PENDING_PAYMENT → PAYMENT_FAILED` — webhook failure.
@@ -696,6 +698,18 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     `OrderCancelled` is not tested), any load. The late-reservation gap (a
     timed-out reserve that still commits in Inventory after the order failed) is
     still covered only by Day 7 designs.
+- **Day 5 payment step (2026-11-05): DESIGNED, NOT IMPLEMENTED, NOT TESTED.**
+  Decisions are written in `decisions.md`, "Day 5: payment step, resilience and
+  derived deadlines"; no code has started. Provisional, unmeasured, recheck
+  Day 9 (the gateway stub has no real latency data). Summary of what the code
+  will have to change: flat 49.00 fee in `amount`; `initiate` with 2 attempts
+  (connect 1 s, read 2 s, 500 ms wait, 6.5 s ceiling) behind a Resilience4j
+  breaker; `PAYMENT_UNAVAILABLE` + `OrderCancelled` in one transaction;
+  `maxLines` 17 and the 3 s-per-call deadline. **Payment stub: a separate small
+  Spring Boot app on port 8085, its own process, not in-process**, so real
+  timeouts, retries and the breaker are exercised over real HTTP. Designed, not
+  built; it is not the Razorpay Clone and verifies none of its behaviours. **Until then the running code
+  still has `maxLines` 30 and 2 s per call.**
 - **Not built anywhere:** repositories beyond the Day-1 ones above (apart from
   the ones `reserve` added), service implementations other than Inventory's
   `reserve` and Order's create path, any controller other than Inventory's
@@ -923,7 +937,8 @@ refused), cause not found; the 5,000-concurrent target is not reached. Not
 verified under failure.
 
 **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
-`8084`; `8080` is reserved for the API Gateway.
+`8084`; `8080` is reserved for the API Gateway. `8085` is planned for the
+payment stub (below; not built).
 
 **Diagrams and ERDs: current, checked 2026-10-22.** All sequence diagrams
 (including reconciliation sweep and partial-item failure), both state diagrams
@@ -957,11 +972,15 @@ or "recorded, not decided" still need a design decision.
   order" plus scanning `PAID` orders is judged not worth it against that
   likelihood. This is the one place in the design that leans on prevention
   rather than independent correction.
-- The `CREATED` deadline is **provisionally derived** and now implemented
-  (`maxLines` 30; decisions.md, "Order creation: retries, conflicts, deadlines and Inventory failures"). Values: connect timeout 1 s, reserve (read) timeout 2 s, max-blocking policy 60 s, deadline margin 5 s, all **provisional**, taken from Inventory load runs on one laptop that were not repeated. The
-  deadline must be re-derived on Day 5 with retry attempts. Still open: the
-  refund claim lease, the Order sweep interval and the payment window — blocked
-  on real Feign/Resilience4j config by design.
+- **Day 5 decisions written, DESIGNED, NOT IMPLEMENTED, NOT TESTED** (all
+  **provisional**, unmeasured, recheck Day 9; see `decisions.md`, "Day 5: payment
+  step, resilience and derived deadlines"): the `CREATED` deadline is re-derived
+  (3 s per reserve call = connect 1 s + read 2 s; retry ceiling 6.5 s;
+  `maxLines` = floor((60 - 6.5) / 3) = 17; deadline = 3 s x lines + 6.5 s + 5 s
+  margin); payment window 6 min; sweep interval 30 s; refund claim lease 2 h.
+  **The code and config still say `maxLines` 30 and 2 s per call** (Day 4,
+  "Order creation: retries, conflicts, deadlines and Inventory failures") until
+  Day 5 code changes them. Pool size and DB timeout values stay open.
 - **Locking strategy and isolation level for `flash_sale_items`: decided**
   (implemented, tested single-threaded and raced in a contention test; first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
   Pool size and timeout values, and insert-first vs update-first, come from
@@ -1011,10 +1030,11 @@ or "recorded, not decided" still need a design decision.
   past. Put it on the create request only (on update it would hide the real
   "frozen" reason), with a fixed clock in tests. The authoritative rule stays
   the service-layer check against the DB clock.
-- **A zero-amount order is untested.** `sale_price` may be `0.00` (the
-  `>= 0` CHECK and the API's `@PositiveOrZero` agree), so an order can total
-  `0.00`, and a payment gateway may refuse a zero-amount payment. Decide in
-  the payment phase.
+- **Closed by decision (designed, not implemented): zero-amount order.**
+  `sale_price` may still be `0.00`, but a flat 49.00 fee on every order makes
+  the payable amount > 0 (`decisions.md`, "Day 5: payment step, resilience and
+  derived deadlines"). An `amount > 0` assertion before `initiate` is a bug
+  guard only. Untested until the fee is built.
 - **FR-B1 (buyer browse) has no endpoint.** It waits for security and
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
@@ -1099,7 +1119,8 @@ or "recorded, not decided" still need a design decision.
   verified). The HTTP client is Spring Cloud OpenFeign 2025.1.2 on Boot 4.1.1:
   it resolves and the context starts; its behaviour is tested against a stub,
   not against Inventory. Values: connect timeout 1 s, reserve (read) timeout 2 s, max-blocking policy 60 s, deadline margin 5 s, all **provisional**, taken from Inventory load runs on one laptop that were not repeated; recheck on Day 9. The deadline
-  must be re-derived on Day 5 with retry attempts.
+  must be re-derived on Day 5 with retry attempts: **done on paper** (3 s per
+  call, `maxLines` 17; designed, not implemented, see the Day 5 item above).
 
 The PRD is `docs/Flashmart.prd` (Revision 4, markdown). The earlier
 `FlashMart_Project_Plan_v3.pdf` reference was stale — no such file exists or
