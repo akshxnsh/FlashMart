@@ -2,9 +2,12 @@
 # (IDE or jar), not in containers, so every port below is published to the host.
 #
 # Each service can be started on its own by name:
+#   docker compose up -d kafka        (the only one in use; started in the Day 6 run)
 #   docker compose up -d postgres redis
-#   docker compose up -d kafka        (only from Day 6)
-# Credentials come from the environment (see .env.example); there are no defaults.
+#     never started or tested; postgres publishes 5432 and clashes with a
+#     local Postgres (see docs/development.md)
+# Credentials come from the environment or the repo-root .env (see
+# .env.example); there are no defaults.
 
 services:
   postgres:
@@ -39,7 +42,8 @@ services:
   #   HOST      localhost:${KAFKA_PORT:-9092}  for the services running on the host
   #   INTERNAL  kafka:29092                    for other containers on the compose network
   # CONTROLLER (9093) is the KRaft quorum and is not published.
-  # No topics are created here and auto-creation is off: Day 6 decides them.
+  # No topics are created here and auto-creation is off: Order creates its
+  # two topics (payment-confirmed, order-cancelled) at startup (Day 6).
   kafka:
     image: apache/kafka:4.3.1
     ports:
