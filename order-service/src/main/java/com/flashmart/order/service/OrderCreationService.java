@@ -90,9 +90,11 @@ public class OrderCreationService {
                         order.id(), order.flashSaleId(), line.productId(), line.quantity()));
             } catch (InventoryUnavailableException e) {
                 // Timeout, refused, or non-200. Not ORDER_EXPIRED: that is the
-                // sweep's label and emails the buyer. Known gap: a timed-out
-                // call can still commit in Inventory after this, leaving an
-                // orphan reservation (covered only by Day 7's designs).
+                // sweep's label and emails the buyer. Known gap (Version B,
+                // decisions.md, "Day 7", point 5): a timed-out call can still
+                // commit in Inventory after this, leaving an orphan reservation.
+                // No republish here: Order never sees that RESERVED. Accepted,
+                // unmeasured; only the reconciler (designed, not built) covers it.
                 return fail(order, "product " + line.productId() + ": " + e.getMessage(),
                         HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.INVENTORY_UNAVAILABLE, null);
             }
@@ -104,6 +106,13 @@ public class OrderCreationService {
                         // then stop calling Inventory for an order that is over.
                         OrderSnapshot now = transaction.read(order.id());
                         if (now.status() != OrderStatus.CREATED) {
+                            // Late reservation, Version A (decisions.md, "Day 7",
+                            // point 5): Inventory just reserved stock for an order
+                            // that is already dead, possibly AFTER Inventory handled
+                            // its OrderCancelled. A NEW OrderCancelled releases it.
+                            // The statement itself writes only for the four failure
+                            // states, never for PAID or PENDING_PAYMENT.
+                            transaction.republishCancelled(order.id());
                             return currentState(now);
                         }
                     }
@@ -207,8 +216,10 @@ public class OrderCreationService {
      * already decided the order's fate. Order never guesses: no CAS, no event.
      * If Order has a terminal state, report it. If Order still says CREATED,
      * the two services disagree and there is no truthful success answer: log
-     * and answer 500. Repairing that is the Day 7 reconciler's job (designed,
-     * not built), not this request's.
+     * and answer 500. Repairing that is the stale-reservation reconciler's job
+     * (designed, not built), not this request's. No republish on this path
+     * either: Version A of decisions.md, "Day 7", point 5 covers only a fresh
+     * RESERVED answer for a dead order.
      */
     private CreateOrderResult released(OrderSnapshot order, OrderLine line) {
         OrderSnapshot now = transaction.read(order.id());

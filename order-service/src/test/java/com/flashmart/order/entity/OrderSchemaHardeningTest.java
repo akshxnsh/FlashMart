@@ -266,6 +266,31 @@ class OrderSchemaHardeningTest {
         }
     }
 
+    // V9: the sweep's index covers live orders only, read from pg_index's own
+    // predicate (not just the indexdef text), and V2's index is gone.
+    @Test
+    void expirySweepIndexIsPartialOnTheTwoLiveStatusesAndTheOldOneIsGone() {
+        String def = indexDefinition("idx_orders_expiry_sweep_live");
+        assertFalse(def.contains("UNIQUE"), def);
+        assertTrue(def.contains("(expires_at)"), def);
+        for (String live : List.of("'CREATED'", "'PENDING_PAYMENT'")) {
+            assertTrue(def.contains(live), def);
+        }
+        for (String outside : List.of("PAID", "PAYMENT_FAILED", "ORDER_EXPIRED", "PAYMENT_UNAVAILABLE",
+                "RESERVATION_FAILED")) {
+            assertFalse(def.replace("PENDING_PAYMENT", "").contains(outside), def);
+        }
+        Object predicate = scalar("select pg_get_expr(i.indpred, i.indrelid) from pg_index i "
+                + "join pg_class c on c.oid = i.indexrelid where c.relname = 'idx_orders_expiry_sweep_live'");
+        assertNotNull(predicate, "the index has no predicate, so it is not partial");
+
+        assertEquals(0L, ((Number) scalar(
+                "select count(*) from pg_indexes where indexname = 'idx_orders_expiry_sweep'")).longValue(),
+                "V2's (status, expires_at) index must be dropped");
+        assertNotNull(scalar("select indexdef from pg_indexes where indexname = 'idx_orders_reconciliation_sweep'"),
+                "the reconciliation index is untouched");
+    }
+
     @Test
     void outboxUnpublishedIndexIsPartialOnPublishedAtNull() {
         String def = indexDefinition("idx_outbox_unpublished");
