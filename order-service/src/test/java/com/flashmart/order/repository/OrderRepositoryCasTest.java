@@ -276,11 +276,13 @@ class OrderRepositoryCasTest {
 
     // ---- markPaid ----
 
+    private static final BigDecimal PRICE = new BigDecimal("100.00");
+
     @Test
-    void markPaidWinsForTheReferenceTheOrderHolds() {
+    void markPaidWinsForTheReferenceAndAmountTheOrderHolds() {
         Long id = orderIn(OrderStatus.PENDING_PAYMENT);
 
-        assertEquals(1, orders.markPaid(id, paymentRefOf(id)));
+        assertEquals(1, orders.markPaid(id, paymentRefOf(id), PRICE));
 
         assertEquals("PAID", statusOf(id));
     }
@@ -289,16 +291,36 @@ class OrderRepositoryCasTest {
     void markPaidLosesForADifferentPaymentRef() {
         Long id = orderIn(OrderStatus.PENDING_PAYMENT);
 
-        assertEquals(0, orders.markPaid(id, "pay_some_other_payment"));
+        assertEquals(0, orders.markPaid(id, "pay_some_other_payment", PRICE));
 
         assertEquals("PENDING_PAYMENT", statusOf(id));
+    }
+
+    /** decisions.md, Day 6, point 3: the held ref with the wrong amount must not pay the order. */
+    @Test
+    void markPaidLosesForTheRightRefWithADifferentAmount() {
+        Long id = orderIn(OrderStatus.PENDING_PAYMENT);
+
+        assertEquals(0, orders.markPaid(id, paymentRefOf(id), new BigDecimal("99.99")));
+
+        assertEquals("PENDING_PAYMENT", statusOf(id));
+    }
+
+    /** Numeric, not textual: 100 and 100.000 are the stored 100.00. */
+    @Test
+    void markPaidComparesTheAmountAsANumber() {
+        Long id = orderIn(OrderStatus.PENDING_PAYMENT);
+
+        assertEquals(1, orders.markPaid(id, paymentRefOf(id), new BigDecimal("100")));
+        Long other = orderIn(OrderStatus.PENDING_PAYMENT);
+        assertEquals(1, orders.markPaid(other, paymentRefOf(other), new BigDecimal("100.000")));
     }
 
     @Test
     void markPaidLosesWhenTheOrderIsNotPendingPayment() {
         Long id = orderIn(OrderStatus.ORDER_EXPIRED);
 
-        assertEquals(0, orders.markPaid(id, "pay_anything"));
+        assertEquals(0, orders.markPaid(id, "pay_anything", PRICE));
 
         assertEquals("ORDER_EXPIRED", statusOf(id));
     }
@@ -306,12 +328,22 @@ class OrderRepositoryCasTest {
     // ---- markPaymentFailed ----
 
     @Test
-    void markPaymentFailedWinsFromPendingPayment() {
+    void markPaymentFailedWinsFromPendingPaymentForTheHeldRef() {
         Long id = orderIn(OrderStatus.PENDING_PAYMENT);
 
-        assertEquals(1, orders.markPaymentFailed(id));
+        assertEquals(1, orders.markPaymentFailed(id, paymentRefOf(id)));
 
         assertEquals("PAYMENT_FAILED", statusOf(id));
+    }
+
+    /** decisions.md, Day 6, point 2: a FAILED for payment Y must not fail an order holding X. */
+    @Test
+    void markPaymentFailedLosesForADifferentPaymentRef() {
+        Long id = orderIn(OrderStatus.PENDING_PAYMENT);
+
+        assertEquals(0, orders.markPaymentFailed(id, "pay_some_other_payment"));
+
+        assertEquals("PENDING_PAYMENT", statusOf(id));
     }
 
     /** A late FAILED webhook after the order was paid must change nothing. */
@@ -319,7 +351,7 @@ class OrderRepositoryCasTest {
     void markPaymentFailedLosesOnAPaidOrder() {
         Long id = orderIn(OrderStatus.PAID);
 
-        assertEquals(0, orders.markPaymentFailed(id));
+        assertEquals(0, orders.markPaymentFailed(id, paymentRefOf(id)));
 
         assertEquals("PAID", statusOf(id));
     }

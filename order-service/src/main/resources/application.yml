@@ -95,3 +95,9 @@ order:
     #   expires_at     = clock_timestamp() + perReserveCall * lines + paymentBudget + margin
     max-blocking-time-ms: 60000
     deadline-margin-ms: 5000
+
+# HMAC-SHA256 secret the gateway signs webhooks with (decisions.md, "Day 6",
+# point 4). From the environment only, never committed. Blank fails startup
+# (WebhookSignature). The payment stub must sign with the same value.
+payment-webhook:
+  secret: ${PAYMENT_WEBHOOK_SECRET:}

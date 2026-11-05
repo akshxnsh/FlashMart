@@ -20,6 +20,7 @@ public final class TestRows {
         List<Long> ids = jdbc.queryForList(
                 "select id from orders where buyer_id between ? and ?", Long.class, fromBuyer, toBuyer);
         for (Long id : ids) {
+            jdbc.update("delete from refunds where order_id = ?", id);
             jdbc.update("delete from outbox where aggregate_id = ?", id);
             jdbc.update("delete from order_items where order_id = ?", id);
             jdbc.update("delete from orders where id = ?", id);
