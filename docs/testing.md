@@ -87,9 +87,9 @@ Inventory reserve call and Order's database writes.
    minimum of 5 and the 50% rate. From then on requests failed in 37 to 68 ms
    with **no call reaching the stub** (0 access-log lines), and stayed refused
    even after the stub was healthy again (3d). After the 11 s wait the next
-   calls went through and succeeded. The breaker's state itself is not
-   visible (no actuator binding, no state log); "half-open, then closed" is
-   inferred from the config and from the stub receiving and answering each call.
+   calls went through and succeeded. In this first run the breaker's state was
+   not visible, so "half-open, then closed" was inferred; **part 2 below
+   OBSERVED it** in Order's log.
 4. **The lost-reply gap is real.** With SLOW_AFTER 3000 both attempts timed out
    at Order (2 s read timeout; 4.57 s total), Order answered `503` and cancelled
    the order, **but the stub created the payment on attempt 1** and returned
@@ -106,17 +106,14 @@ Inventory reserve call and Order's database writes.
    +2.342 s. **Fragile**: a slower machine or a later switch would move it
    outside that 500 ms window. It worked once; it was not repeated.
 
-### Observed but not explained
+### Observed but not explained: RESOLVED in part 2
 
-After scenario 5 I expected the breaker to be open. Counting since it closed:
-one success (12188), two timeouts (scenario 4), one timeout and one success
-(scenario 5) = 3 of 5 failed, 60%. The next order (buyer 113, order 12191) was
-still accepted (`201` in 0.047 s, one stub call). Either the count since the
-breaker closed is not what I assumed (for example, which calls the half-open
-trials were), or something else is recorded differently. Not investigated:
-the breaker's state is not observable without code (an actuator binding or a
-log on state transitions would show it). **Open item: make breaker transitions
-visible before trusting a count like this.**
+After scenario 5 I expected the breaker to be open (by my count 3 of 5 calls
+failed, 60%), but the next order, sent by hand, was still accepted (order
+12191, `201`). **Resolved by part 2 below:** the breaker did open at exactly
+that count; the hand-sent order most likely arrived after the 10 s open time
+and was let through as the first half-open trial. Original text of this
+section replaced; the run's numbers above are unchanged.
 
 ### Left behind after the run (relevant for Day 6 and 7)
 
@@ -234,4 +231,190 @@ sleep 1.5   # the first (abandoned) attempt is still sleeping in the stub
 r=$(cat "$BODY.code"); report 112 "$r"; id5=$(order_id_of 112)
 echo "  stub holds ref (same-body probe): $(probe_ref "$id5")"
 echo "  stub holds (different-body probe): $(probe_held "$id5")"
+```
+
+## Day 5 failure demo, part 2: the breaker's transitions, observed (2026-11-05)
+
+**Label: verified under failure against the payment-stub, on one laptop, one
+run, no load, no webhook.** Same label as part 1. Written after adding the
+breaker's WARN log (`feat(order): log every payment breaker state transition at
+WARN`), to answer the open item in part 1.
+
+### What changed and how it was run
+
+- Code change: only a WARN log line per breaker state transition
+  (`PaymentResilienceConfig`, through the breaker's event publisher); no
+  threshold or behaviour change. A unit test drives the real breaker bean
+  through CLOSED -> OPEN -> HALF_OPEN -> CLOSED and checks the lines.
+- Run: `seed.sh` first (empties the Order DB), then inventory, order and the
+  payment-stub started fresh, and **Order never restarted between scenarios**.
+  Scenarios 3, 4, 5 back to back (`demo2.sh`, below), fresh buyers 201+. The
+  stub's Tomcat access log counts calls, as in part 1.
+
+### The transitions Order logged (all of them, in order)
+
+| Time | Line | Caused by |
+|---|---|---|
+| 16:49:31.406 | `CLOSED -> OPEN` (failure rate 100.0%, 5 calls in window, 5 failed) | the 3rd failing order's first attempt: orders 1 and 2 gave 4 failed calls, this was the 5th (the minimum) |
+| 16:49:44.911 | `OPEN -> HALF_OPEN` | the first order sent after the 11 s wait (order 12197), 13.5 s after opening |
+| 16:49:46.082 | `HALF_OPEN -> CLOSED` | the third half-open trial (order 12199) |
+| 16:49:58.905 | `CLOSED -> OPEN` (failure rate **60.0%**, 5 calls in window, 3 failed) | 1 ms after the scenario-5 order's second attempt succeeded at the stub (stub log 16:49:58.904) |
+
+**Half-open is now OBSERVED, not inferred**: it is in Order's own log, and the
+orders at both ends of it reached the stub and got `201`.
+
+### Per step (HTTP, time, order, stub)
+
+- Failing orders 1 and 2: `503`, 1.616 s (first request after start-up) and
+  0.555 s, 2 stub calls each (two `500`s). Order 3: `503`, 0.575 s, 1 stub call
+  then "payment circuit breaker is open" (its second attempt was refused).
+- Two orders while open (stub already HEALTHY): `503` in **0.054 s and 0.044 s**,
+  0 stub calls each.
+- After the wait: four orders, all `201` in 0.047 to 0.077 s, 1 stub call each.
+  The first of them was the `OPEN -> HALF_OPEN` call.
+- Scenario 4 (SLOW_AFTER 3000): `503` in 4.556 s, order `PAYMENT_UNAVAILABLE`,
+  no ref. The stub log shows **two** calls of 3005 ms each, so the payment was
+  created on attempt 1; a same-body probe afterwards returned
+  `pay_84b155dc...` (the stub holds it). Again unrefunded and unhandled: no
+  webhook, no sweep. (The script printed "stub calls: 1" right after the
+  response because the stub writes its access-log line when a request
+  *finishes*, 3 s after it starts; the second line was not there yet. Counted
+  again after the wait: 2, plus the probe's own line.)
+- Scenario 5: `201` in 2.571 s, order `PENDING_PAYMENT` with `pay_946efc78...`,
+  2 stub calls (a 2 ms `202` and a 3004 ms `202` for the abandoned attempt).
+  The timing worked again with the switch at about +2.2 s. That makes 2 of 2
+  runs, still timing dependent (a 500 ms window). The same-ref probe was not
+  repeated in this run (it was in part 1); that there is one payment for the key
+  follows from the stub's design and its own tests.
+- Two orders after scenario 5 (stub HEALTHY): `503` in 0.038 s and 0.047 s,
+  "payment circuit breaker is open", 0 stub calls.
+
+### Answer to part 1's open item
+
+**The breaker did open after scenario 5's failures**, at exactly the count I
+had predicted: after it closed, the window held 1 success (order 12200), 2
+timeouts (scenario 4), then scenario 5's timeout and success = 5 calls, 3
+failed, 60% >= 50%. The call that tipped it over was the scenario-5 order's
+own successful second attempt, so that order still got its `201`; the *next*
+requests were refused.
+
+So part 1's "still accepted" order was not an anomaly. Most likely (consistent
+with this run, not directly observed in part 1): that order was sent by hand
+minutes after scenario 5, long past the 10 s open time. resilience4j leaves
+OPEN only when a call arrives (`OPEN -> HALF_OPEN` at 16:49:44.911 above is
+13.5 s after opening, with no call in between), and that first call is let
+through as a half-open trial. The unit test pins this lazy behaviour. I did not
+change any threshold.
+
+### Things to know about the log line
+
+- The failure rate and call counts are read *after* the transition, from the
+  new state's window. For `OPEN -> HALF_OPEN` and `HALF_OPEN -> CLOSED` that
+  window is empty, so those lines print `failure rate -1.0%, 0 calls` (-1.0
+  means "not enough calls to compute"). Only the `-> OPEN` lines carry the rate
+  the decision was made on. Not changed here (the task was no other change).
+- The unit test also pins two behaviours worth knowing: half-open is judged on
+  its 3 trial calls at the same 50% threshold (1 failed trial of 3 closes the
+  breaker, 2 of 3 reopen it), and time alone never moves OPEN to HALF_OPEN.
+
+### Practical note: the demo dirties the Order tests
+
+The entity tests assume empty Order tables. After the demo, the first full
+Order run had 4 failures that were all row counts (orders with no
+`payment_ref`, unpublished `outbox` rows left by the demo). After
+`bash scripts/seed/seed.sh` (which empties those tables) the suite passed:
+217 tests, 0 failures. Reset before running the suite.
+
+### The script (part 2)
+
+Runs scenarios 3, 4, 5 on already-running processes. Needs `DB_USERNAME`,
+`DB_PASSWORD`, `STUB_ACCESS_LOG` (the stub's access log, flags above) and
+`ORDER_LOG` (Order's console log redirected to a file).
+
+```bash
+#!/usr/bin/env bash
+# Day 5 failure demo, part 2: scenarios 3 -> 4 -> 5 back to back on ONE running
+# Order process (never restarted between them), with the breaker's WARN
+# transition lines pulled from Order's log after every step.
+# Needs DB_USERNAME, DB_PASSWORD, STUB_ACCESS_LOG and ORDER_LOG in the environment.
+set -uo pipefail
+
+ORDER=http://localhost:8083
+STUB=http://127.0.0.1:8085
+SALE=1
+PRODUCT=2            # 799.00 + 49.00 fee = 848.00
+AMOUNT=848.00
+export PGPASSWORD="$DB_PASSWORD"
+q() { psql -w -h localhost -U "$DB_USERNAME" -d "$1" -Atc "$2"; }
+BODY=$(mktemp)
+
+mode() { curl -s -X POST "$STUB/admin/mode" -H 'Content-Type: application/json' \
+           -d "{\"mode\":\"$1\",\"delayMs\":${2:-0}}" > /dev/null; echo "  [stub mode -> $1 ${2:-0} ms]"; }
+order() { # order <buyer> <key> -> "<http> <seconds>"
+  curl -s -o "$BODY" -w '%{http_code} %{time_total}' -X POST "$ORDER/api/orders" \
+    -H 'Content-Type: application/json' -H "X-Buyer-Id: $1" -H "Idempotency-Key: $2" \
+    -d "{\"flashSaleId\":$SALE,\"items\":[{\"productId\":$PRODUCT,\"quantity\":1}]}"
+}
+order_id_of() { q order-service "select id from orders where buyer_id = $1 order by id desc limit 1"; }
+detail() { q order-service "select status || ' | ' || coalesce(payment_ref,'-') || ' | ' || left(coalesce(failure_detail,'-'), 70) from orders where id = $1"; }
+stub_calls() { grep -c "key=order-$1\$" "$STUB_ACCESS_LOG"; }
+
+LOGPOS=0
+breaker_lines() { # new breaker transition lines in Order's log since the last call
+  local total; total=$(wc -l < "$ORDER_LOG")
+  tail -n +"$((LOGPOS + 1))" "$ORDER_LOG" | grep 'payment circuit breaker' | sed 's/^/    ORDER LOG: /' \
+    | sed -E 's/ INFO| WARN//; s/ --- \[order-service\] \[[^]]*\]//; s/c\.f\.o\.c\.p\.PaymentResilienceConfig +://'
+  LOGPOS=$total
+}
+
+step() { # step <label> <buyer> <key>
+  local r id; r=$(order "$2" "$3"); id=$(order_id_of "$2")
+  printf '  %-34s %s s  HTTP %s  order %s [%s]  stub calls: %s\n' "$1" "$(echo "$r" | cut -d' ' -f2)" \
+    "$(echo "$r" | cut -d' ' -f1)" "$id" "$(detail "$id")" "$(stub_calls "$id")"
+  breaker_lines
+}
+
+echo "== start: $(date +%H:%M:%S.%N | cut -c1-12), Order log lines so far: $(wc -l < "$ORDER_LOG")"
+breaker_lines
+
+echo "== 3) ERROR_5XX until the breaker opens, then instant refusals"
+mode ERROR_5XX
+b=201
+for i in 1 2 3; do step "failing order #$i" $b "s3-$b"; b=$((b+1)); done
+mode HEALTHY
+echo "  -- stub HEALTHY, breaker still inside its 10 s"
+step "order while open" $b "s3-$b"; b=$((b+1))
+step "order while open" $b "s3-$b"; b=$((b+1))
+echo "  -- waiting 11 s (open-ms is 10 s); NO call is made during the wait"
+sleep 11
+breaker_lines
+echo "  -- first call after the wait should flip OPEN -> HALF_OPEN"
+for i in 1 2 3 4; do step "post-wait order #$i" $b "s3-$b"; b=$((b+1)); done
+
+echo "== 4) SLOW_AFTER 3000: both attempts time out"
+mode SLOW_AFTER 3000
+step "slow-after order" $b "s4"; id4=$(order_id_of $b); b=$((b+1))
+sleep 3.5   # let the stub finish its abandoned replies
+mode HEALTHY
+echo "  stub holds a payment for order-$id4 (same-body probe):"
+echo "    $(curl -s -X POST "$STUB/api/payments/initiate" -H 'Content-Type: application/json' -H "Idempotency-Key: order-$id4" -d "{\"orderId\":$id4,\"amount\":\"$AMOUNT\",\"currency\":\"INR\"}")"
+breaker_lines
+
+echo "== 5) SLOW_AFTER 3000, switched to HEALTHY inside the 500 ms wait"
+mode SLOW_AFTER 3000
+( order $b "s5" > "$BODY.code" ) &
+cpid=$!
+sleep 2.2
+mode HEALTHY
+wait $cpid
+sleep 1.5
+r=$(cat "$BODY.code"); id5=$(order_id_of $b)
+printf '  %-34s %s s  HTTP %s  order %s [%s]  stub calls: %s\n' "scenario-5 order" "$(echo "$r" | cut -d' ' -f2)" \
+  "$(echo "$r" | cut -d' ' -f1)" "$id5" "$(detail "$id5")" "$(stub_calls "$id5")"
+b=$((b+1))
+breaker_lines
+
+echo "== after 5: did the breaker open? probe with orders while the stub is HEALTHY"
+for i in 1 2; do step "probe order #$i" $b "probe-$b"; b=$((b+1)); done
+echo "== end"
 ```
