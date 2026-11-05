@@ -4528,9 +4528,13 @@ writing.
 
 ## Decision: Day 5: payment step, resilience and derived deadlines
 
-**Status: DESIGNED, NOT IMPLEMENTED, NOT TESTED.** Every number below is
-**PROVISIONAL and unmeasured**; recheck on Day 9. The Razorpay Clone does not
-exist, so the stub gives no real latency data. Nothing here may be read as
+**Status:** points 1 and 6 **implemented and tested** (`feat/day5-fee-deadline`,
+merged); points 2 to 5 and the payment window (7) **implemented and tested
+against a JDK HttpServer stub and mocks only** (`feat/day5-payment-step`): not
+against the real payment-stub, not against a real gateway, not load-tested.
+Points 8 and 9 are not built (sweep Day 7, refund worker stretch). Every number
+below is **PROVISIONAL and unmeasured**; recheck on Day 9. The Razorpay Clone
+does not exist, so no stub gives real latency data. Nothing here may be read as
 verified (CLAUDE.md, Working style 7).
 
 **Context / Problem:**
@@ -4641,8 +4645,8 @@ Feign client's real ceiling per call is connect 1 s + read 2 s = 3 s.
   window, sweep interval and refund lease are now **decided** (provisional).
   Pool size and DB timeout values stay open.
 - **Closes** the zero-amount-order item and the replay-status-code item.
-- **Config today still says `maxLines` 30 and 2 s per call** until the code
-  changes. The docs describe the target; the code is unchanged.
+- `maxLines` 17 and the 3 s-per-call deadline are in the code since
+  `feat/day5-fee-deadline` (the old "config still says 30" note is obsolete).
 - Tests required when built: retry only on timeout/5xx; no retry on 4xx; breaker
   opens at the configured rate; CAS to `PAYMENT_UNAVAILABLE` and its outbox row
   in one transaction; the `PENDING_PAYMENT` CAS losing to the sweep; a replay in
@@ -4653,6 +4657,31 @@ Feign client's real ceiling per call is connect 1 s + read 2 s = 3 s.
 - Not verified: anything involving the real gateway (RZP-1 and the other
   Razorpay Clone behaviours). The stub only exercises our side's timeouts,
   retries and breaker.
+- **Loser and replay rules (added 2026-11-05 with the payment step; they
+  refine point 5):**
+  - **201 means "this request won the PENDING_PAYMENT CAS"**, also for a
+    resumed retry. Every other success is `200`.
+  - The idempotency key sent to the gateway is `"order-" + orderId`, derived and
+    never regenerated: the same on every attempt, every retried request and
+    every resume after a crash.
+  - **A payment-step CAS loses** (`PENDING_PAYMENT` or `PAYMENT_UNAVAILABLE`):
+    re-read the order. `ORDER_EXPIRED` → `409 ORDER_EXPIRED`, message "Something
+    went wrong. If any money was deducted, it will be refunded." (the refund is
+    the Day 6 webhook's job; it is recorded, and paid out only if the stretch
+    refund worker exists). `PENDING_PAYMENT` (a same-key request won) → `200`
+    with the winner's body. Anything else → the existing mapping of the stored
+    state. The loser writes nothing.
+  - **Replays** (same key, after the same-request check): `PENDING_PAYMENT` →
+    `200` with `paymentRef` and `expiresAt` read from the row; no gateway call.
+    `PAYMENT_UNAVAILABLE` → the `503` again, with no reason, whatever the
+    original cause was (a 4xx too: the status does not record which). `CREATED`
+    before its deadline → resume: replay the reserves, the amount CAS is a
+    no-op, initiate again with the same key, then the CAS.
+  - `expiresAt` appears in the body only while `PENDING_PAYMENT` (it is the end
+    of the payment window); `paymentRef` whenever it is set.
+  - The breaker **ignores** a 4xx (neither failure nor success). A 2xx without
+    a `paymentRef` is treated as `PAYMENT_UNAVAILABLE`, not retried
+    (implementation choice, not in the original decision).
 
 ---
 

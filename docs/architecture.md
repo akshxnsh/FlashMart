@@ -457,7 +457,7 @@ synchronous status check in §3.
 
 - `CREATED → PENDING_PAYMENT` — every item reserved, `amount` set, gateway returned 202. Saves `payment_ref`, resets `expires_at` to the payment window.
 - `CREATED → RESERVATION_FAILED` — an item came back `OUT_OF_STOCK`, `SALE_NOT_LIVE` or `ITEM_NOT_IN_SALE` (decided; no new state, no migration). A state exists only if something downstream reacts differently to it, and every reserve "no" gets the same reaction: release everything, send no email, tell the buyer in the reply. Which outcome it was goes in `failure_detail` (debug only) and in the buyer's reply. An Inventory timeout or refusal mid-loop also ends as `RESERVATION_FAILED` (`503 INVENTORY_UNAVAILABLE`, cause in `failure_detail`). On `RESERVATION_RELEASED` Order stops without a CAS or event and reports the real status. Both decided 2026-11-05, implemented, tested (races mock Inventory) (§9).
-- `CREATED → PAYMENT_UNAVAILABLE` — circuit breaker open on initiate. Day 5 (designed, not implemented) widens this to retries exhausted as well, or a gateway 4xx, with `OrderCancelled{PAYMENT_UNAVAILABLE}` in the same transaction.
+- `CREATED → PAYMENT_UNAVAILABLE` — circuit breaker open on initiate. Day 5 (implemented, tested against a stub only) widens this to retries exhausted as well, or a gateway 4xx, with `OrderCancelled{PAYMENT_UNAVAILABLE}` in the same transaction.
 - `CREATED → ORDER_EXPIRED` — didn't finish the loop + initiate before its deadline.
 - `PENDING_PAYMENT → PAID` — webhook success *for the payment this order holds*.
 - `PENDING_PAYMENT → PAYMENT_FAILED` — webhook failure.
@@ -648,8 +648,8 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     clock_timestamp() + 3 s x lines + 6.5 s + 5 s`, and the unpriced items, in one
     transaction (tested: the gap is the deadline length on the database clock;
     3 lines = 20.5 s, 17 lines = 62.5 s, from config). The 6.5 s is the payment
-    call's budget (2 attempts x (1 s + 2 s) + 500 ms); the payment client does
-    not exist, only its budget is in the deadline.
+    call's budget (2 attempts x (1 s + 2 s) + 500 ms), from the same `payment.*`
+    values the payment client uses (Day 5 payment step, below).
   - Unique-violation losers: any SQLState `23505`, re-queried in a new
     transaction, constraint name never read: (a) same key: `409
     IDEMPOTENCY_KEY_REUSED` if the stored sale or merged items differ (checked
@@ -713,12 +713,48 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   `status = 'CREATED'` from `setAmount` had left the old test green (it used an
   order that already had an amount); a new test with a NULL-amount, non-CREATED
   order fails without the guard. Not exercised: any payment call.
-- **Day 5, rest of the payment step: DESIGNED, NOT IMPLEMENTED, NOT TESTED.**
-  Decisions are written; no payment client, Resilience4j, sweep or stub exists.
-  What the code will still have to add: `initiate` with 2 attempts
-  (connect 1 s, read 2 s, 500 ms wait, 6.5 s ceiling) behind a Resilience4j
-  breaker; `PAYMENT_UNAVAILABLE` + `OrderCancelled` in one transaction;
-  the buyer outcomes. **Payment stub: a separate small
+- **Day 5 payment step (branch `feat/day5-payment-step`): IMPLEMENTED and
+  TESTED against a JDK HttpServer stub and mocks only: not against the real
+  payment-stub, not against a real gateway, not load-tested.** Design and the
+  loser/replay rules: `decisions.md`, "Day 5: payment step, resilience and
+  derived deadlines". Values provisional.
+  - Flow after the reserve loop and amount: `requirePayable` → `initiate` (no
+    transaction or pooled connection held; tested) → PENDING_PAYMENT CAS →
+    answer. `PaymentGatewayClient` (Feign, `payment-gateway.base-url`,
+    timeouts from `payment.*`, no Feign retry), `Idempotency-Key = order-<id>`,
+    amount as a JSON string.
+  - `PaymentCalls`: resilience4j core 2.3.0 (no Boot starter; the context
+    starts), retry OUTSIDE the breaker: 2 attempts, fixed wait, only timeouts,
+    connect errors and 5xx. Breaker COUNT_BASED 10 / min 5 / 50% / open 10 s /
+    3 half-open; 4xx ignored.
+  - CAS: `markPendingPayment` sets status, `payment_ref` and `expires_at`
+    (payment window 6 min, DB clock) in one statement; `failPaymentUnavailable`
+    = CAS with `failure_detail` + `OrderCancelled{PAYMENT_UNAVAILABLE}` in one
+    transaction, the row only if the CAS won. Both `status = 'CREATED'`.
+  - Outcomes: 201 `{orderId, status, amount, paymentRef, expiresAt}` for the
+    CAS winner; 503 PAYMENT_UNAVAILABLE (retries exhausted, breaker open); 500
+    PAYMENT_REJECTED + ERROR log on a 4xx, order still PAYMENT_UNAVAILABLE; CAS
+    lost to the sweep → 409 ORDER_EXPIRED; lost to a same-key request → 200 with
+    the winner's body. Replays: PENDING_PAYMENT → 200 same body;
+    PAYMENT_UNAVAILABLE → 503, no new call; CREATED → resume with the same key.
+  - Tested (real Postgres): every attempt carries `order-<id>`; a timeout then
+    success gives one order and one ref; 5xx retried once; 4xx not retried and
+    not counted by the breaker; the breaker opens on the 5th failed call,
+    refuses without calling, and closes after 3 half-open successes; CAS losers
+    get 0 rows (vs the sweep, vs a second request); the PENDING_PAYMENT CAS sets
+    all three columns; the PAYMENT_UNAVAILABLE CAS and its outbox row roll back
+    together and the row exists only for the winner; two same-key requests
+    raced (real threads, 50 rounds, gateway mocked) give one PENDING_PAYMENT
+    and the same ref in both answers; two resumed retries raced (50 rounds) give
+    one CAS win; crash with the amount set, then retry, ends PENDING_PAYMENT.
+    Break-and-restore: the `status = 'CREATED'` guard of each CAS and the
+    4xx-not-retried rule each failed their tests when broken.
+  - **Not exercised:** the real payment-stub, a real gateway (RZP-1 is
+    assumed by the stubs, which return `pay_` + key), the webhook (Day 6), the
+    sweep (Day 7), the relay and consumers (so stock release after
+    `OrderCancelled{PAYMENT_UNAVAILABLE}` is not tested), any load.
+- **Day 5, still designed only:** sweep (Day 7), refund worker (stretch).
+  **Payment stub: a separate small
   Spring Boot app on port 8085, its own process, not in-process**, so real
   timeouts, retries and the breaker are exercised over real HTTP. Designed, not
   built; it is not the Razorpay Clone and verifies none of its behaviours.
@@ -991,7 +1027,8 @@ or "recorded, not decided" still need a design decision.
   `maxLines` = floor((60 - 6.5) / 3) = 17; deadline = 3 s x lines + 6.5 s + 5 s
   margin); payment window 6 min; sweep interval 30 s; refund claim lease 2 h.
   **Implemented and tested for the fee and the deadline** (`maxLines` 17, 3 s per
-  call; §8); the payment client, breaker, sweep and stub are not built. Pool size and DB timeout values stay open.
+  call; §8); the payment client and breaker are implemented and tested against a
+  stub only (§8); the sweep is not built. Pool size and DB timeout values stay open.
 - **Locking strategy and isolation level for `flash_sale_items`: decided**
   (implemented, tested single-threaded and raced in a contention test; first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
   Pool size and timeout values, and insert-first vs update-first, come from
