@@ -589,14 +589,16 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   `bump_updated_at` is recreated in Order's own database and attached to
   `orders` and `refunds`. V6 adds the partial unique index
   `uk_orders_buyer_sale_live_or_paid` (one `CREATED`/`PENDING_PAYMENT`/`PAID`
-  order per buyer per sale); the database rule exists and is tested, but nothing
-  yet maps its violation to a `409` (§9). V7 (hardening from an independent
+  order per buyer per sale); the database rule exists and is tested, and since
+  Day 4 the create endpoint maps its violation to `409 ORDER_ALREADY_OPEN` (below). V7 (hardening from an independent
   static review) adds `ck_orders_payment_ref_present_when_payable`, three
   non-blank guards (`orders.idempotency_key`, `orders.payment_ref`,
   `refunds.payment_ref`) and widens `orders.amount`, `order_items.subtotal` and
-  `refunds.amount` to `NUMERIC(14,2)`; implemented and tested. **No services or controllers** (the only repository is
-  the Day-1 `OrderRepository`, below), so nothing in the running application yet
-  writes a CAS. **A1:** the CAS-owned columns of `Order`
+  `refunds.amount` to `NUMERIC(14,2)`; implemented and tested. V8 adds
+  `ck_refunds_processing_has_claimed_at` and `ck_orders_reconciled_only_when_failed`
+  (the four failure states); implemented, tested with native SQL that rejects a bad
+  row for each (routine CHECKs, no break-and-restore). The create endpoint (Day 4,
+  below) is the first code in the running application that writes a CAS. **A1:** the CAS-owned columns of `Order`
   (`status`, `amount`, `payment_ref`, `expires_at`, `payment_reconciled_at`) and
   `Refund` (`status`, `attempts`, `next_retry_at`, `claimed_at`, `last_error`) are
   `updatable = false`, as are the set-once columns `Order.buyer_id`,
@@ -606,9 +608,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   column. Implemented and **run on 2026-11-03**; break-and-restore done: 5 of
   the 6 original guards were killed, `@DynamicUpdate` was the survivor and was
   removed, and each of the six set-once columns is killed by a named test.
-  **Test totals:** 260 passing before this change (Order 121, Inventory 63,
-  Identity 47, Notification 29, measured on 2026-11-03); Order is now 127, so
-  266 in total (the other three services were not re-run after the change).
+  **Test totals:** see "Tested" below (334 on 2026-11-05).
   **Day-1 repositories:** `OrderRepository` has one native compare-and-set per
   transition (set amount, `CREATED` to `RESERVATION_FAILED` / `PAYMENT_UNAVAILABLE`,
   `CREATED` or `PENDING_PAYMENT` to `ORDER_EXPIRED` with no time condition,
@@ -617,9 +617,9 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   **run on 2026-11-03** (part of the 260-test pass above). Break-and-restore on
   three of the CAS guards (`markPaid`'s `payment_ref` condition,
   `markReservationFailed`'s `CREATED` condition, `expire`'s status guard) was
-  killed by a test each. **Deliberately not built, blocked on B5 and the derived
-  deadlines:** `CREATED` to `PENDING_PAYMENT` (it stamps `expires_at` from a
-  database clock). Inventory's Day-1 repositories (`FlashSale`,
+  killed by a test each. Since Day 4, `markReservationFailed` also writes
+  `failure_detail` in the same statement. **Not built yet (payment phase):**
+  `CREATED` to `PENDING_PAYMENT`. Inventory's Day-1 repositories (`FlashSale`,
   `FlashSaleItem`, `StockReservation`) were finders only, written with finder
   tests, **run on 2026-11-03** (part of the 260-test pass above). `reserve`
   has since added the one native stock `UPDATE` (see above); no `@Lock` and no
@@ -632,15 +632,73 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   **`docker-compose.yml`** (Postgres 16, Redis 7, Kafka KRaft; see
   `docs/development.md`): written, `docker compose config` validated, NOT
   started, NOT tested.
+- **Order create path (Day 4, branch `feat/day4-order-create`, 2026-11-05):
+  implemented, tested, raced; not run against a real Inventory, not load-tested.**
+  Design: `decisions.md`, "Order creation: retries, conflicts, deadlines and Inventory failures".
+  - `POST /api/orders` (gateway not built): `Idempotency-Key` (non-blank, max 255)
+    and a temporary, forgeable `X-Buyer-Id` header (TODO Day 8: gateway-signed
+    identity). Bean Validation added to Order. Quantity 1..5 per line and on the
+    merged total of a duplicated product; at most `maxLines` = floor(60 s / 2 s) =
+    30 distinct products. A bad request is a `400` and Inventory is never called
+    (tested).
+  - The insert is a native `INSERT ... RETURNING id` with `expires_at =
+    clock_timestamp() + 2 s x lines + 5 s`, and the unpriced items, in one
+    transaction (tested: the gap is the deadline length on the database clock).
+  - Unique-violation losers: any SQLState `23505`, re-queried in a new
+    transaction, constraint name never read: (a) same key: `409
+    IDEMPOTENCY_KEY_REUSED` if the stored sale or merged items differ (checked
+    first), else replay (`RESERVATION_FAILED` replays as `409` with no reason and
+    no Inventory call; `CREATED` before the deadline resumes the loop; otherwise
+    `200` with the current state); (b) `409 ORDER_ALREADY_OPEN` with the existing
+    order; (c) `409 CONFLICT_RETRY` (reached in a test only by forcing (b) to find
+    nothing).
+  - Reserve loop over the unpriced items, sequential, no transaction open across
+    a Feign call: write-once pricing guarded on `status = 'CREATED'` (a subquery,
+    not a lock); a reserve "no" or an Inventory failure CASes to
+    `RESERVATION_FAILED` with `failure_detail` and writes `OrderCancelled` only if
+    the CAS won (`409 RESERVATION_FAILED` with the reason, or `503
+    INVENTORY_UNAVAILABLE`); `RESERVATION_RELEASED` writes nothing and, if Order
+    still says `CREATED`, logs ERROR and answers `500 INCONSISTENT_STATE` (the Day 7
+    reconciler's case, not fixed here); all priced sets the amount through the
+    existing `setAmount` CAS. The order stays `CREATED`.
+  - Feign: Spring Cloud 2025.1.2 (OpenFeign 5.0.2, feign-core 13.6.1) on Boot
+    4.1.1; the application context starts with the client (context test passes).
+    The client is **tested against a JDK `HttpServer` stub**, not verified against
+    Inventory: decoding with the price as a string, a slow stub hitting the read
+    timeout, a refused connection, a `400`. No in-call retries. Values: connect timeout 1 s, reserve (read) timeout 2 s, max-blocking policy 60 s, deadline margin 5 s, all **provisional**, taken from Inventory load runs on one laptop that were not repeated.
+    The deadline must be re-derived on Day 5 with retry attempts.
+  - Races, real threads on real Postgres, Inventory mocked at the Feign interface
+    or at `InventoryCalls` (no real Inventory process), 50 rounds each, all passed:
+    (i) same buyer, sale and key twice at once: one order, one `201` and one `200`
+    replay of the same id, and after the loop the order is `CREATED`, every item
+    priced once, amount = `SUM(subtotal)`, no outbox row; (ii) same buyer and
+    sale, two keys: one order, the other `409 ORDER_ALREADY_OPEN` naming it; (iii)
+    two retries resuming one `CREATED` order: each item priced by exactly one loop
+    and the amount set by one CAS; with item 2 out of stock and both threads held
+    by a barrier right before the fail CAS, exactly one `RESERVATION_FAILED` and
+    one `OrderCancelled`.
+  - Break-and-restore (each test failed, then the code was restored): skipping the
+    live-or-paid lookup broke race (ii) in 50 of 50 rounds; skipping the same-key
+    lookup broke race (i) in 50 of 50; dropping the `rows == 1` check before the
+    outbox insert gave 2 outbox rows in 50 of 50 rounds of race (iii).
+  - **Not exercised:** a real Inventory over HTTP, the expiry sweep (not built),
+    the relay and any consumer (Days 6 and 7, so stock release after
+    `OrderCancelled` is not tested), any load. The late-reservation gap (a
+    timed-out reserve that still commits in Inventory after the order failed) is
+    still covered only by Day 7 designs.
 - **Not built anywhere:** repositories beyond the Day-1 ones above (apart from
   the ones `reserve` added), service implementations other than Inventory's
-  `reserve`, any controller other than Inventory's reserve endpoint, the API
+  `reserve` and Order's create path, any controller other than Inventory's
+  reserve endpoint and Order's `POST /api/orders`, the API
   Gateway, Kafka, Redis, security. All four services
   share one local Postgres credential pair but each owns a separate database.
 
-**Tested: 266 tests, all passing, 0 failures, 0 errors, 0 skipped** — all four
-services run together on `main` on 2026-11-04: Order 127, Inventory 63,
-Identity 47, Notification 29. Order's 127 are the 99 from V7 (the earlier 69
+**Tested: 334 tests, all passing, 0 failures, 0 errors, 0 skipped** — all four
+services run on branch `feat/day4-order-create` on 2026-11-05: Order 177,
+Inventory 81, Identity 47, Notification 29 (the previous four-service figure was
+284: Order 127 plus 81, 47, 29). Order's 50 new tests are V8 (11), the Feign stub
+test (5), the insert (3), the endpoint (8), conflict handling (10), the reserve
+loop (9) and the races (i)/(ii) and (iii) (2 each). Order's earlier 127 are the 99 from V7 (the earlier 69
 plus 30 new for V7 and the review's gaps) plus 28 added since for the
 repositories and the entity-updatability tests (the V7 constraint
 that fires is now asserted by name; native-SQL `NOT NULL` tests; index
@@ -651,8 +709,8 @@ key and FK is verified to reject bad rows, not merely to exist.
 
 **Inventory after `reserve`: 73 tests, all passing, 0 failures, 0 errors, 0
 skipped** (inventory suite only, run on branch `feat/reserve-service` on
-2026-11-04; the other three services were not re-run for this count). That is
-the 63 above plus 10 in `ReservationServiceTest`. It covers, single-threaded:
+2026-11-04; the other three services were not re-run for this count). That was
+the 63 Inventory had then plus 10 in `ReservationServiceTest`. It covers, single-threaded:
 first call, replay, quantity mismatch, `RELEASED`, `ITEM_NOT_IN_SALE` with its
 WARN, `OUT_OF_STOCK` leaving no row, upcoming and ended sales, replay after the
 sale ended, and stock equal to quantity. (That count and its "not
@@ -888,11 +946,11 @@ or "recorded, not decided" still need a design decision.
   order" plus scanning `PAID` orders is judged not worth it against that
   likelihood. This is the one place in the design that leans on prevention
   rather than independent correction.
-- The `CREATED` deadline is **provisionally derived** (60 s policy, 2 s per-call
-  timeout, 5 s margin, `maxLines` 30; decisions.md, "Order creation: retries,
-  conflicts, deadlines and Inventory failures"). Still open: the refund claim
-  lease, the Order sweep interval and the payment window, plus the retry
-  multiplier (Day 5) — blocked on real Feign/Resilience4j config by design.
+- The `CREATED` deadline is **provisionally derived** and now implemented
+  (`maxLines` 30; decisions.md, "Order creation: retries, conflicts, deadlines and Inventory failures"). Values: connect timeout 1 s, reserve (read) timeout 2 s, max-blocking policy 60 s, deadline margin 5 s, all **provisional**, taken from Inventory load runs on one laptop that were not repeated. The
+  deadline must be re-derived on Day 5 with retry attempts. Still open: the
+  refund claim lease, the Order sweep interval and the payment window — blocked
+  on real Feign/Resilience4j config by design.
 - **Locking strategy and isolation level for `flash_sale_items`: decided**
   (implemented, tested single-threaded and raced in a contention test; first laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction".
   Pool size and timeout values, and insert-first vs update-first, come from
@@ -949,22 +1007,27 @@ or "recorded, not decided" still need a design decision.
 - **FR-B1 (buyer browse) has no endpoint.** It waits for security and
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
-- **Decided 2026-11-05, designed not built:** on `RESERVATION_RELEASED`
-  mid-loop Order stops the loop, writes no CAS and no event, re-reads the real
-  status and reports it; if still `CREATED`, it alerts and does not guess.
-- **Decided, not built:** all three reserve "no" outcomes (`OUT_OF_STOCK`,
-  `SALE_NOT_LIVE`, `ITEM_NOT_IN_SALE`) end the order as `RESERVATION_FAILED`.
+- **Decided 2026-11-05; implemented and tested (Day 4):** on
+  `RESERVATION_RELEASED` mid-loop Order stops the loop, writes no CAS and no
+  event, re-reads the real status and reports it; if still `CREATED`, it logs
+  ERROR and answers `500 INCONSISTENT_STATE`, and does not guess. Repairing that
+  state is the Day 7 reconciler's case (designed, not built), not fixed here.
+- **Decided; implemented and tested (Day 4):** all three reserve "no" outcomes
+  (`OUT_OF_STOCK`, `SALE_NOT_LIVE`, `ITEM_NOT_IN_SALE`) end the order as
+  `RESERVATION_FAILED`.
   No new state, no migration (§6).
-- **Decided 2026-11-05, designed not built:** a retried create on a
+- **Decided 2026-11-05; implemented and tested (Day 4):** a retried create on a
   `RESERVATION_FAILED` order replays the failure with no reason and never
   calls Inventory; a new attempt needs a new key. `failure_detail` stays
   debug only.
-- **Bean Validation exists in Inventory only.** Identity, Order and
-  Notification add `spring-boot-starter-validation` in their own API phase.
-- **Order's create-order request must reject `quantity > 5`** before any
-  `reserve` call, so a buyer's mistake gets a `400` from Order instead of
-  firing an Inventory alert. Not built.
-- **Decided 2026-11-05, not built:** any unique violation on order insert is
+- **Bean Validation exists in Inventory and Order** (Order added it on Day 4).
+  Identity and Notification add `spring-boot-starter-validation` in their own
+  API phase.
+- **Done (Day 4), tested:** Order's create request rejects `quantity > 5` (per
+  line and on a merged duplicate) with a `400` before any `reserve` call;
+  the test checks Inventory is never called.
+- **Decided 2026-11-05; implemented, tested and raced (Day 4, see §8):** any
+  unique violation on order insert is
   caught and re-queried in a new transaction (never parsing constraint names):
   same `(buyer_id, idempotency_key)` is a replay; else `409 ORDER_ALREADY_OPEN`
   with the existing order; else `409 CONFLICT_RETRY`. Never a `500`.
@@ -974,10 +1037,11 @@ or "recorded, not decided" still need a design decision.
 - **One person with two accounts is not covered** by the one-live-order rule:
   the rule is per `buyer_id`, and Identity does not link accounts. The cap of
   5 is also still per item per order.
-- **Decided 2026-11-05, not built:** a retried create while `CREATED` re-runs
-  the reserve loop (abort by expiry **or** resume on retry), safe only if every
-  write is CAS/write-once and the outbox row is written only when the CAS wins.
-  A **hypothesis** until a two-thread test proves it. Also: same key with a
+- **Decided 2026-11-05; implemented (Day 4):** a retried create while `CREATED`
+  re-runs the reserve loop (abort by expiry **or** resume on retry), safe only if
+  every write is CAS/write-once and the outbox row is written only when the CAS
+  wins. Backed by two-thread races on real Postgres (§8, races (i) and (iii)),
+  with Inventory mocked; not exercised against a real Inventory or the sweep. Also: same key with a
   different request is `409 IDEMPOTENCY_KEY_REUSED`, checked before replay.
   See the conditional rule on `order_items` (§4).
 - Identity, for the API phase: a lost signup race must surface as "email
@@ -1003,27 +1067,28 @@ or "recorded, not decided" still need a design decision.
   - **A3:** redesign of the sweep and refund indexes. Not decided.
   - **B1:** `ON CONFLICT` for the refund insert. Not decided.
   - **B2, B3:** the retried create (and the `409` it returns) and a request
-    fingerprint. **Decided 2026-11-05, designed not built** (no fingerprint
-    column; compare against stored `flash_sale_id` and `order_items`).
+    fingerprint. **Decided 2026-11-05; implemented and tested (Day 4)** (no
+    fingerprint column; compare against stored `flash_sale_id` and `order_items`).
   - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`. Not
     decided.
   - **B5:** which clock function stamps `expires_at`. **Decided 2026-11-05:**
     `clock_timestamp()`, stamped by the database (native `INSERT ... RETURNING
-    id`). Not built.
+    id`). Implemented and tested (Day 4).
   - A `CHECK` on `payment_reconciled_at`, and a `CHECK` that `PROCESSING`
-    implies `claimed_at`. **Decided 2026-11-05; V8, not written yet.**
+    implies `claimed_at`. **Decided 2026-11-05; V8 implemented and tested.**
     `payment_reconciled_at` is allowed only on `PAYMENT_FAILED`,
     `PAYMENT_UNAVAILABLE`, `ORDER_EXPIRED` and `RESERVATION_FAILED` (any failure
     state; no payment can exist for the last).
-- **New, 2026-11-05 ("Order creation: retries, conflicts, deadlines and
-  Inventory failures"), all designed not built:** an Inventory timeout or
-  refusal mid-loop ends the order as `RESERVATION_FAILED` + `OrderCancelled`,
-  `503 INVENTORY_UNAVAILABLE`. **Known gap:** a timed-out call can commit after
-  the release and orphan a reservation; covered only by the Day 7 republish and
-  the reconciler (designed, not verified). The HTTP client is Spring Cloud
-  OpenFeign (2025.1.x train); its compatibility with Boot 4.1.1 is unverified
-  until it resolves and starts. The 2 s per-call timeout and 5 s margin are
-  provisional; recheck on Day 9.
+- **New, 2026-11-05 (Order creation: retries, conflicts, deadlines and Inventory failures), implemented
+  and tested on Day 4 (see §8):** an Inventory timeout or refusal mid-loop ends
+  the order as `RESERVATION_FAILED` + `OrderCancelled`, `503
+  INVENTORY_UNAVAILABLE`. **Known gap:** a timed-out call can commit after the
+  release and orphan a reservation; the late-reservation gap is still covered
+  only by Day 7 designs (the republish and the reconciler, designed, not
+  verified). The HTTP client is Spring Cloud OpenFeign 2025.1.2 on Boot 4.1.1:
+  it resolves and the context starts; its behaviour is tested against a stub,
+  not against Inventory. Values: connect timeout 1 s, reserve (read) timeout 2 s, max-blocking policy 60 s, deadline margin 5 s, all **provisional**, taken from Inventory load runs on one laptop that were not repeated; recheck on Day 9. The deadline
+  must be re-derived on Day 5 with retry attempts.
 
 The PRD is `docs/Flashmart.prd` (Revision 4, markdown). The earlier
 `FlashMart_Project_Plan_v3.pdf` reference was stale — no such file exists or
