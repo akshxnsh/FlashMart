@@ -4439,6 +4439,10 @@ writing.
    provisional**. Day 5 multiplies by the retry attempts. Rejected: a capped
    deadline alone (it silently expires a big healthy order mid-loop) and no cap
    (the worst case is unbounded).
+   - **Correction (2026-11-05): see "Day 5: payment step, resilience and derived
+     deadlines".** The 2 s per call used here is the read timeout only; the
+     client ceiling is connect 1 s + read 2 s = **3 s**. The Day 5 entry
+     re-derives `maxLines` and the deadline. Text above kept as written.
    - Evidence for 2 s, from the Inventory load runs (one laptop, load tool
      co-located; runs (b) and (c) not repeated): 1,000 ramped buyers OK, p99
      13 / 89 ms; 5,000 buyers p99 9.4 to 11.6 s with refusals. Recheck on Day 9.
@@ -4522,6 +4526,136 @@ writing.
 
 ---
 
+## Decision: Day 5: payment step, resilience and derived deadlines
+
+**Status: DESIGNED, NOT IMPLEMENTED, NOT TESTED.** Every number below is
+**PROVISIONAL and unmeasured**; recheck on Day 9. The Razorpay Clone does not
+exist, so the stub gives no real latency data. Nothing here may be read as
+verified (CLAUDE.md, Working style 7).
+
+**Context / Problem:**
+After the reserve loop, Order must start the payment (`initiate`), move the
+order to `PENDING_PAYMENT`, and answer the buyer, all while the gateway can be
+slow, down or wrong. Five things were open: what the buyer pays (and the
+zero-amount case), what happens when `initiate` times out, the retry and
+breaker numbers, the `CREATED` deadline once retries exist, and the three
+leftover leases and windows (payment window, sweep interval, refund claim
+lease). Day 4 derived the `CREATED` deadline with 2 s per reserve call, but the
+Feign client's real ceiling per call is connect 1 s + read 2 s = 3 s.
+
+**Options Considered:**
+1. Fee: (a) none, so a free item gives a zero-amount payment; (b) flat fee on
+   every order; (c) a `fee` column.
+2. `initiate` times out: (a) retry with the same key, then fail the order;
+   (b) a new "unknown outcome" state; (c) fail at once, no retry.
+3. `CREATED` deadline: (a) keep 2 s per call; (b) 3 s per call and derive
+   `maxLines`; (c) raise the 60 s policy to 90 s.
+4. Payment window, sweep interval, refund lease: derive them, or decide them
+   as policy.
+
+**Chosen Approach (all PROVISIONAL):**
+
+1. **Fee.** A flat **₹49.00 per order**, on every order, held in config as
+   `BigDecimal`, crossing every boundary as a JSON string. `amount =
+   SUM(subtotal) + fee`, written once in the existing status-guarded
+   `setAmount` CAS. **No fee column, no migration:** fee = `amount −
+   SUM(order_items.subtotal)`. Because the fee makes the payable amount > 0, the
+   zero-amount item case is **closed** as a product rule. Free items stay allowed
+   (`@PositiveOrZero` unchanged). An `amount > 0` assertion before `initiate` is
+   added as a **bug guard only**, not a business rule.
+2. **Timed-out `initiate`.** Retry with the same order-id-derived key (RZP-1).
+   Retries exhausted or breaker open: CAS `CREATED → PAYMENT_UNAVAILABLE` and an
+   `OrderCancelled{PAYMENT_UNAVAILABLE}` outbox row, **same transaction**. No new
+   "unknown outcome" state. A payment that did exist is caught by the Day 6
+   webhook handler (refund taken from the webhook's ref). The reconciliation
+   sweep stays **designed only**.
+3. **Retry.** 2 attempts, connect 1 s, read 2 s, fixed 500 ms wait. Worst case
+   = 2 × (1 + 2) + 0.5 = **6.5 s**. Retry only timeouts and 5xx, **never 4xx**.
+   No transaction is open across the call.
+4. **Breaker (Resilience4j).** Count-based window 10, minimum 5 calls, 50%
+   failure rate, open for 10 s, 3 half-open calls. Timeouts and 5xx count; 4xx do
+   not. **No retry while open**; open means an instant failure.
+5. **Buyer outcomes.**
+   - Payment started and the CAS to `PENDING_PAYMENT` won: `201
+     {orderId, status, amount, paymentRef, expiresAt}`.
+   - Retries exhausted or breaker open: `503 PAYMENT_UNAVAILABLE` (retryable).
+   - Gateway 4xx: `500 PAYMENT_REJECTED`, not retryable, ERROR log. The order
+     still ends `PAYMENT_UNAVAILABLE` so the stock is released.
+   - The `PENDING_PAYMENT` CAS loses: report the real state (e.g.
+     `ORDER_EXPIRED`); the Day 6 webhook refunds any payment that exists.
+   - Same key replayed while `PENDING_PAYMENT`: `200` with the same body. This
+     **closes the open "replay status code" item**.
+   - Same key while `PAYMENT_UNAVAILABLE`: replay the `503`. A new attempt needs
+     a new key.
+6. **`CREATED` deadline (option A).** `perReserveCall = connect + read = 3 s`.
+   `maxLines = floor((60 − 6.5) / 3) = 17`. `expires_at = clock_timestamp() +
+   3 s × lines + 6.5 s + 5 s margin`: 3 lines = **20.5 s**, 17 lines =
+   **62.5 s**. `maxLines` and the deadline are **computed in code from config**
+   (connect, read, attempts, wait, policy, margin), not typed in twice.
+   Rejected: keep 2 s (repeats the gap), raise the policy to 90 s. The 62.5 s
+   is above the 60 s policy only by the margin; the policy bounds the work, the
+   margin is slack.
+7. **Payment window: 6 min.** This is a **policy, not derivable**. Too short
+   expires people who are still paying (a refund race with the webhook). Too
+   long holds stock and blocks the buyer's one live order.
+8. **Sweep interval: 30 s** (lag about 8% of the window). Real hold = window +
+   interval. The sweep is built Day 7.
+9. **Refund claim lease: 2 h**, set by business tolerance (refunds are not
+   urgent). Code gives only a **lower bound**: lease ≫ (connect + read) ×
+   attempts + waits. The finishing write is already fenced on `claimed_at`. Used
+   only when the refund worker (stretch) exists.
+10. **Payment stub: a separate small Spring Boot app on port 8085, its own
+    process; not in-process.** It stands in for the Razorpay Clone until that
+    exists. Being a real process over real HTTP means the connect and read
+    timeouts, the retries and the breaker are actually exercised (an in-process
+    fake would skip the network and never time out). It can be made slow or
+    failing on purpose. Designed, not built; it is not the Razorpay Clone and
+    proves none of RZP-1 to RZP-9 until it implements them.
+
+**Why:**
+- A flat fee closes the zero-amount case without a column, a migration or a
+  gateway-specific rule; the amount stays derivable from rows that already exist.
+- Reusing the order-id-derived key makes a retried `initiate` safe **if** the
+  gateway honours RZP-1, which is designed, not verified. The webhook handler is
+  the backstop when it does not.
+- A deadline built from 3 s per call matches the client ceiling; the Day 4 value
+  of 2 s ignored the connect timeout.
+- Window and lease are business policy; pretending to derive them would be
+  picking by feel with extra steps.
+
+**Trade-offs:**
+- All numbers are provisional, from a stub with no real latency.
+- A buyer whose `initiate` timed out but succeeded at the gateway sees `503`,
+  not a clean "unknown" state. The Day 6 webhook handler only **records** the
+  refund (a `refunds` row). The money is paid back only if the stretch refund
+  worker is built; until then it is recorded, not paid out.
+- `maxLines` drops from 30 to 17 (the cap on distinct products per order).
+- Real hold on stock = 6 min + 30 s; the buyer is blocked for that long.
+- The fee is always derivable per order as `amount − SUM(order_items.subtotal)`,
+  whatever the config says later. The only loss is a standalone fee-revenue
+  query, which needs that subtraction instead of a column to sum.
+
+**Consequences:**
+- **Refines** "Deadlines and leases are derived": the `CREATED` deadline is
+  re-derived (Day 4 point 7 is corrected, see the Correction there); payment
+  window, sweep interval and refund lease are now **decided** (provisional).
+  Pool size and DB timeout values stay open.
+- **Closes** the zero-amount-order item and the replay-status-code item.
+- **Config today still says `maxLines` 30 and 2 s per call** until the code
+  changes. The docs describe the target; the code is unchanged.
+- Tests required when built: retry only on timeout/5xx; no retry on 4xx; breaker
+  opens at the configured rate; CAS to `PAYMENT_UNAVAILABLE` and its outbox row
+  in one transaction; the `PENDING_PAYMENT` CAS losing to the sweep; a replay in
+  each state; `amount = SUM(subtotal) + fee` equals the stored amount; the
+  deadline computed from config.
+- **New port 8085** for the payment stub (planned; CLAUDE.md and architecture
+  §8 ports lines updated). A new module to build; not started.
+- Not verified: anything involving the real gateway (RZP-1 and the other
+  Razorpay Clone behaviours). The stub only exercises our side's timeouts,
+  retries and breaker.
+
+---
+
 ## Open Items (not yet decided or not yet built)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -4557,7 +4691,7 @@ is closed by a reconciliation sweep"), and, in
   which Notion renders natively. On 2026-10-22 they were updated for the
   implementation-phase reserve changes (item-in-sale check, replay quantity
   check, the quantity cap, `ITEM_NOT_IN_SALE` → `RESERVATION_FAILED`).
-- **The `CREATED` deadline is now provisionally derived** (60 s policy, 2 s per call, 5 s margin; see "Order creation: retries, conflicts, deadlines and Inventory failures"). Still open: the refund stale-claim lease, sweep interval and payment window. Original text: **The two derived deadlines** — the short `CREATED` deadline and the refund
+- **UPDATED (designed, not implemented): see "Day 5: payment step, resilience and derived deadlines".** The `CREATED` deadline is re-derived (3 s per call, 17 lines, 6.5 s retry ceiling); payment window (6 min), sweep interval (30 s) and refund lease (2 h) are decided, all provisional. Earlier text: The `CREATED` deadline was provisionally derived (60 s policy, 2 s per call, 5 s margin; see "Order creation: retries, conflicts, deadlines and Inventory failures"). Original text: **The two derived deadlines** — the short `CREATED` deadline and the refund
   stale-claim lease — plus the Order sweep interval and the payment window.
   Blocked on the Feign/Resilience4j timeout configuration by design, not by
   oversight.

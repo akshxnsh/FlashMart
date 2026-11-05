@@ -71,7 +71,7 @@ The `karpathy-guidelines` skill governs general coding behaviour: think first, s
 - **Cross-service references** are a plain ID or an event, never a foreign key. Database-per-service; no service reads another's DB. Internal endpoints are never routed through the Gateway.
 - **Out-of-order `BrandUpserted`/`UserUpserted`** is handled by the timestamp-conditional upsert (strict `<`), which is correct only because Identity's `bump_updated_at` trigger makes `updated_at` strictly increasing.
 - **Outbox relay rules:** claim rows with `FOR UPDATE SKIP LOCKED`; delivery is at-least-once; ordering is not guaranteed.
-- **Deadlines and leases are derived, never picked.** The `CREATED` deadline, payment window, sweep interval and refund claim lease must come from the timeouts they race (per-call timeout × attempts × item count; the HTTP client's total ceiling). All are open pending the Feign/Resilience4j config.
+- **Deadlines and leases are derived, never picked.** The `CREATED` deadline must come from the timeouts it races (per-call timeout, connect + read, × attempts × item count; the HTTP client's total ceiling). Payment window, sweep interval and refund lease are policy, decided in `decisions.md`, "Day 5: payment step, resilience and derived deadlines" (provisional, unmeasured, designed not implemented). Recheck on Day 9.
 
 ## Implementation conventions
 
@@ -99,16 +99,16 @@ Reasoning is in `decisions.md` ("Entity and migration conventions", "Database CH
 
 Follow the phase plan: setup → architecture/requirements → schema → JPA entities → APIs/DTOs → reservation/payment → state machine → security → Redis caching → rate limiting → idempotency → transactions/locking → outbox → Kafka → webhooks → microservices/gateway → load testing. Don't jump ahead unless he asks.
 
-**Current position:** entities and migrations are done in all four services; Inventory's `reserve` is implemented, tested, raced and load-run on one laptop (p99 target met at 100 buyers/s, not met at 500 buyers/s; the 5,000-concurrent target is not reached); Day 4 (`POST /api/orders`: insert, unique-violation handling, reserve loop) is implemented, tested and raced with Inventory mocked (not run against a real Inventory, not load-tested); nothing else is built beyond the Day-1 repositories. `docker-compose.yml` is written and config-validated, not started. Details in `architecture.md` §8 (which wins over this line).
+**Current position:** entities and migrations are done in all four services; Inventory's `reserve` is implemented, tested, raced and load-run on one laptop (p99 target met at 100 buyers/s, not met at 500 buyers/s; the 5,000-concurrent target is not reached); Day 4 (`POST /api/orders`: insert, unique-violation handling, reserve loop) is implemented, tested and raced with Inventory mocked (not run against a real Inventory, not load-tested); Day 5 decisions (payment step, resilience, deadlines) are written, code not started; nothing else is built beyond the Day-1 repositories. `docker-compose.yml` is written and config-validated, not started. Details in `architecture.md` §8 (which wins over this line).
 
-**Ports:** gateway `8080` (reserved), identity `8081`, inventory `8082`, order `8083`, notification `8084`. One shared `DB_USERNAME`/`DB_PASSWORD` pair, one separate database per service.
+**Ports:** gateway `8080` (reserved), identity `8081`, inventory `8082`, order `8083`, notification `8084`, payment stub `8085` (planned, not built). One shared `DB_USERNAME`/`DB_PASSWORD` pair, one separate database per service.
 
 ## Open decisions (stop and decide together)
 
 1. **Locking strategy for `flash_sale_items`: decided** (implemented, tested, raced; load-measured on one laptop only; see `architecture.md` §8). See `decisions.md`, "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction". Build no retry/backoff around `@Version`.
 2. **Isolation level** on the same write path: **decided** (READ COMMITTED), same entry as (1).
 3. **The `reserve` write path: decided**, same entry as (1). Do not re-open it by default; the `WHERE version = ?` form is rejected as the reserve path.
-4. **Derived deadlines and leases** (see design rules), blocked on Feign/Resilience4j config. Pool size and the `lock_timeout` / `statement_timeout` / connection-wait values are open too and come from the load test.
+4. **Derived deadlines and leases:** decided on paper, provisional (`decisions.md`, "Day 5: payment step, resilience and derived deadlines"); code not started, so config still has the Day 4 values until it changes. Pool size and the `lock_timeout` / `statement_timeout` / connection-wait values are still open and come from the load test.
 5. **Accepted permanent residual risk:** a second captured payment can escape correction only if initiate-idempotency fails, a webhook is lost, and the order reaches `PAID`. Not building "list every payment for this order." Do not treat it as an oversight.
 6. **Razorpay Clone is not built.** The design leans on four behaviours from it: idempotency on initiate, idempotency on refund, a payment-status lookup by *our* idempotency key, and payments and webhooks that carry **our order id**. Until it exists these are **designed, not verified**; write no code or docs that assume otherwise.
 
