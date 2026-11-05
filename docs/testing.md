@@ -97,7 +97,11 @@ Inventory reserve call and Order's database writes.
    stub for an order that is `PAYMENT_UNAVAILABLE` with no `payment_ref`. Nothing
    refunds it: the webhook handler (Day 6) and the reconciliation sweep do not
    exist. **Unrefunded and unhandled today.** This is the case the Day 6
-   handler must catch by order id.
+   handler must catch by order id. *(Update 2026-11-06: the Day 6 handler now
+   records a `refunds` row when a SUCCESS webhook arrives for a
+   `PAYMENT_UNAVAILABLE` order, which is tested in the Order suite. This exact
+   scenario was not re-run, and nothing pays the refund out because the refund
+   worker is not built.)*
 5. **The same key gave the same payment across the retry** (one run, timing
    dependent). Attempt 1 created `pay_5b04c322...` and its reply was abandoned;
    attempt 2, after the switch to HEALTHY, got the same ref back in 2 ms, Order
