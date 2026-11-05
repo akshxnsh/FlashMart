@@ -66,7 +66,7 @@ proceeding.
 
 **Asynchronous — Kafka** (each publisher owns an `outbox`, same local
 transaction as the business change):
-- **Order** publishes `PaymentConfirmed { order_id, buyer_id, brand_id, items: [{product_id, product_name, quantity, unit_price, subtotal}], amount }` — consumed by **Inventory** (needs only `order_id`, to confirm reservations) and **Notification** (needs the rest, for the receipt).
+- **Order** publishes `PaymentConfirmed { order_id, buyer_id, items: [{product_id, product_name, quantity, unit_price, subtotal}], amount }` — consumed by **Inventory** (needs only `order_id`, to confirm reservations) and **Notification** (needs the rest, for the receipt).
 - **Order** publishes `OrderCancelled { order_id, reason, buyer_id }`, `reason ∈ {RESERVATION_FAILED, PAYMENT_FAILED, PAYMENT_UNAVAILABLE, ORDER_EXPIRED}` — consumed by **Inventory** (releases every reservation for the order, any reason) and **Notification** (buyer only, and only for `PAYMENT_FAILED`/`ORDER_EXPIRED` — the two reasons determined after the buyer's request has closed; the other two are answered synchronously, and emailing them would give a deliberately cold service a bursty hot-path load).
 - **Identity** publishes `BrandUpserted { brand_id, email, updated_at }` / `UserUpserted { user_id, email, updated_at }` on creation and email change. `updated_at` is the **source-side** timestamp — required for Notification's out-of-order-safe upsert (§4).
 - **Inventory** and **Notification** publish nothing. Inventory consumes events and answers Feign calls; its only outbound call is the status check above.
@@ -485,8 +485,9 @@ partial-`UNIQUE` only as a safety net): CAS to `PAID` only if
 `status='PENDING_PAYMENT' AND payment_ref=X`; if that fails and the order is
 already `PAID` with `payment_ref=X`, it's a redelivery (no-op); otherwise
 refund `X` (from the webhook, not `orders.payment_ref`, which may be `NULL`
-if Order crashed before saving it). A late `FAILED` webhook needs no such
-care — its CAS simply matches zero rows, and nothing was captured. Refunds
+if Order crashed before saving it). A late `FAILED` webhook needs no refund
+(nothing was captured), but its CAS is guarded by `payment_ref` too, so a `FAILED`
+for another payment cannot fail an order that holds `X` (decided 2026-11-05, not implemented). Refunds
 are never issued inline: the handler writes a `refunds` row in the same
 transaction as its failed CAS, and a worker drains it.
 
@@ -1193,12 +1194,13 @@ or "recorded, not decided" still need a design decision.
   - **A2:** `refunds.next_retry_at` NULL handling and the refund claim query.
     Not decided.
   - **A3:** redesign of the sweep and refund indexes. Not decided.
-  - **B1:** `ON CONFLICT` for the refund insert. Not decided.
+  - **B1:** `ON CONFLICT DO NOTHING` for the refund insert. **Decided 2026-11-05
+    (derived); not implemented** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
   - **B2, B3:** the retried create (and the `409` it returns) and a request
     fingerprint. **Decided 2026-11-05; implemented and tested (Day 4)** (no
     fingerprint column; compare against stored `flash_sale_id` and `order_items`).
-  - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`. Not
-    decided.
+  - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`.
+    **Decided 2026-11-05: answer `409`, change nothing; not implemented** ("Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay").
   - **B5:** which clock function stamps `expires_at`. **Decided 2026-11-05:**
     `clock_timestamp()`, stamped by the database (native `INSERT ... RETURNING
     id`). Implemented and tested (Day 4).
