@@ -28,7 +28,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.clearInvocations;
-import static org.mockito.Mockito.mockingDetails;
 
 /**
  * Two real threads creating orders at once, on real Postgres, {@value #ROUNDS}
@@ -156,7 +155,7 @@ class OrderCreationRaceTest {
                 if (orderRows(buyer) != 1) {
                     problems.add(orderRows(buyer) + " order rows (want 1)");
                 }
-                problems.addAll(finalStateProblems(buyer));
+                problems.addAll(finalStateProblems(buyer, outcomes));
                 if (!problems.isEmpty()) {
                     broken.add("round " + round + ": " + String.join("; ", problems));
                 }
@@ -167,15 +166,38 @@ class OrderCreationRaceTest {
         assertNoBrokenRounds("sameKeyTwiceAtOnce", broken);
     }
 
-    /** Before the reserve loop exists: the order stays as inserted and Inventory is never called. */
-    private List<String> finalStateProblems(long buyer) {
+    /**
+     * With the reserve loop (Inventory mocked as RESERVED, 10.00 per unit): the
+     * order is CREATED, every item priced exactly once with consistent values,
+     * amount = SUM(subtotal) = 30.00 (1 x 10.00 + 2 x 10.00), and no outbox row.
+     * Each response's amount is null or that sum.
+     */
+    private List<String> finalStateProblems(long buyer, List<Outcome> outcomes) {
         List<String> problems = new ArrayList<>();
-        String status = jdbc.queryForObject("select status from orders where buyer_id = ?", String.class, buyer);
-        if (!"CREATED".equals(status)) {
-            problems.add("status " + status);
+        java.util.Map<String, Object> order = jdbc.queryForMap(
+                "select id, status, amount from orders where buyer_id = ?", buyer);
+        if (!"CREATED".equals(order.get("status"))) {
+            problems.add("status " + order.get("status"));
         }
-        if (!mockingDetails(inventory).getInvocations().isEmpty()) {
-            problems.add("Inventory was called");
+        long unpriced = jdbc.queryForObject("select count(*) from order_items where order_id = ? "
+                + "and (unit_price is null or subtotal <> unit_price * quantity)", Long.class, order.get("id"));
+        if (unpriced != 0) {
+            problems.add(unpriced + " items unpriced or inconsistent");
+        }
+        BigDecimal amount = (BigDecimal) order.get("amount");
+        if (amount == null || amount.compareTo(new BigDecimal("30.00")) != 0) {
+            problems.add("amount " + amount + " (want 30.00)");
+        }
+        long outbox = jdbc.queryForObject("select count(*) from outbox where aggregate_id = ?",
+                Long.class, order.get("id"));
+        if (outbox != 0) {
+            problems.add(outbox + " outbox rows (want 0)");
+        }
+        for (Outcome o : outcomes) {
+            if (o.result() != null && o.result().body().amount() != null
+                    && o.result().body().amount().compareTo(new BigDecimal("30.00")) != 0) {
+                problems.add("a response says amount " + o.result().body().amount());
+            }
         }
         return problems;
     }

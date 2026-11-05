@@ -1,12 +1,14 @@
 package com.flashmart.order.service;
 
 import com.flashmart.order.entity.OrderStatus;
+import com.flashmart.order.repository.OrderRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -35,6 +37,7 @@ public class OrderCreationTransaction {
             rs.getBoolean("before_deadline"));
 
     private final JdbcTemplate jdbc;
+    private final OrderRepository orders;
     private final CreateOrderSettings settings;
 
     /**
@@ -89,6 +92,76 @@ public class OrderCreationTransaction {
     @Transactional(readOnly = true)
     public OrderSnapshot read(long orderId) {
         return jdbc.queryForObject(SNAPSHOT + "WHERE id = ?", SNAPSHOT_ROW, orderId);
+    }
+
+    /**
+     * The items the loop still has to reserve, by product id. On a resume this
+     * is exactly the set left unpriced, so items already priced are never sent
+     * to Inventory again.
+     */
+    @Transactional(readOnly = true)
+    public List<OrderLine> unpricedItems(long orderId) {
+        return jdbc.query("SELECT product_id, quantity FROM order_items "
+                        + "WHERE order_id = ? AND unit_price IS NULL ORDER BY product_id",
+                (rs, n) -> new OrderLine(rs.getLong("product_id"), rs.getInt("quantity")), orderId);
+    }
+
+    /**
+     * Write-once pricing of one item from a RESERVED answer. Returns the rows
+     * changed; {@code 0} is not an error: another loop on the same order priced
+     * it first, or the order is no longer {@code CREATED}.
+     *
+     * <ul>
+     *   <li>{@code unit_price IS NULL}: a second loop can never overwrite the
+     *       first loop's price.</li>
+     *   <li>the {@code orders.status = 'CREATED'} guard (architecture.md section 4):
+     *       a failed or expired order is not priced. It is a plain subquery, not
+     *       a lock: a CAS committing at the same instant can still let one item
+     *       be priced on a just-failed order. Harmless, since that order is
+     *       terminal and its amount CAS is status-guarded.</li>
+     * </ul>
+     * V3's CHECKs back this up: all-or-none pricing, subtotal = price x quantity.
+     */
+    @Transactional
+    public int priceItem(long orderId, long productId, String productName, BigDecimal unitPrice) {
+        return jdbc.update("UPDATE order_items SET product_name = ?, unit_price = ?, subtotal = ? * quantity "
+                        + "WHERE order_id = ? AND product_id = ? AND unit_price IS NULL "
+                        + "AND EXISTS (SELECT 1 FROM orders WHERE id = ? AND status = 'CREATED')",
+                productName, unitPrice, unitPrice, orderId, productId, orderId);
+    }
+
+    /**
+     * {@code CREATED -> RESERVATION_FAILED} and its {@code OrderCancelled}, in
+     * one transaction. The outbox row is written ONLY if this caller's CAS won:
+     * two loops failing the same order (a retry racing the first request) must
+     * produce one event, not two. Returns whether this caller won.
+     *
+     * <p>Payload is flat and bare, as every FlashMart event: no envelope, no
+     * event id. Inventory releases every reservation of the order when it
+     * consumes it (relay and consumer are not built yet).
+     */
+    @Transactional
+    public boolean fail(long orderId, long buyerId, String failureDetail) {
+        int won = orders.markReservationFailed(orderId, failureDetail);
+        if (won == 1) {
+            jdbc.update("INSERT INTO outbox (aggregate_id, event_type, payload_json) VALUES (?, ?, ?::jsonb)",
+                    orderId, "OrderCancelled",
+                    "{\"order_id\":" + orderId + ",\"reason\":\"RESERVATION_FAILED\",\"buyer_id\":" + buyerId + "}");
+        }
+        return won == 1;
+    }
+
+    /**
+     * Sets {@code amount = SUM(subtotal)} through the existing write-once CAS,
+     * only once no item is left unpriced. Returns the rows changed; {@code 0}
+     * means another loop set it, the order is no longer {@code CREATED}, or an
+     * item is still unpriced. The caller re-reads either way.
+     */
+    @Transactional
+    public int setAmountFromItems(long orderId) {
+        BigDecimal sum = jdbc.queryForObject("SELECT CASE WHEN count(*) FILTER (WHERE unit_price IS NULL) = 0 "
+                + "THEN sum(subtotal) END FROM order_items WHERE order_id = ?", BigDecimal.class, orderId);
+        return sum == null ? 0 : orders.setAmount(orderId, sum);
     }
 
     /** {@code product_id -> quantity}, the stored half of the key-reuse comparison. */

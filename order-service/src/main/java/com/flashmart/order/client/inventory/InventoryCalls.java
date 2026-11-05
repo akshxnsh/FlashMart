@@ -29,6 +29,12 @@ public class InventoryCalls {
             if (response == null || response.outcome() == null) {
                 throw new InventoryUnavailableException("reserve returned no outcome", null);
             }
+            if (response.outcome() == ReserveOutcome.RESERVED
+                    && (response.salePrice() == null || response.productName() == null)) {
+                // Inventory's contract always sends both with RESERVED. Without
+                // them the item cannot be priced, so this is not a usable answer.
+                throw new InventoryUnavailableException("RESERVED without salePrice or productName", null);
+            }
             return response;
         } catch (RetryableException e) {
             throw new InventoryUnavailableException("inventory unreachable: " + e.getMessage(), e);

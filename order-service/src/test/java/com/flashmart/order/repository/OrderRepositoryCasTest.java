@@ -55,6 +55,11 @@ class OrderRepositoryCasTest {
                 .setParameter("id", id).getSingleResult();
     }
 
+    private String failureDetailOf(Long id) {
+        return (String) entityManager.createNativeQuery("select failure_detail from orders where id = :id")
+                .setParameter("id", id).getSingleResult();
+    }
+
     private BigDecimal amountOf(Long id) {
         return (BigDecimal) entityManager.createNativeQuery("select amount from orders where id = :id")
                 .setParameter("id", id).getSingleResult();
@@ -103,18 +108,20 @@ class OrderRepositoryCasTest {
     void markReservationFailedWinsFromCreated() {
         Long id = orderIn(OrderStatus.CREATED);
 
-        assertEquals(1, orders.markReservationFailed(id));
+        assertEquals(1, orders.markReservationFailed(id, "OUT_OF_STOCK on product 11"));
 
         assertEquals("RESERVATION_FAILED", statusOf(id));
+        assertEquals("OUT_OF_STOCK on product 11", failureDetailOf(id));
     }
 
     @Test
     void markReservationFailedLosesFromAnyOtherStatus() {
         Long id = orderIn(OrderStatus.PENDING_PAYMENT);
 
-        assertEquals(0, orders.markReservationFailed(id));
+        assertEquals(0, orders.markReservationFailed(id, "OUT_OF_STOCK on product 11"));
 
         assertEquals("PENDING_PAYMENT", statusOf(id));
+        assertEquals(null, failureDetailOf(id)); // the loser writes nothing
     }
 
     // ---- CREATED -> PAYMENT_UNAVAILABLE ----
