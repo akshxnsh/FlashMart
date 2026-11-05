@@ -714,14 +714,29 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   order that already had an amount); a new test with a NULL-amount, non-CREATED
   order fails without the guard. Not exercised: any payment call.
 - **Day 5, rest of the payment step: DESIGNED, NOT IMPLEMENTED, NOT TESTED.**
-  Decisions are written; no payment client, Resilience4j, sweep or stub exists.
+  Decisions are written; no payment client, Resilience4j or sweep exists.
   What the code will still have to add: `initiate` with 2 attempts
   (connect 1 s, read 2 s, 500 ms wait, 6.5 s ceiling) behind a Resilience4j
   breaker; `PAYMENT_UNAVAILABLE` + `OrderCancelled` in one transaction;
-  the buyer outcomes. **Payment stub: a separate small
-  Spring Boot app on port 8085, its own process, not in-process**, so real
-  timeouts, retries and the breaker are exercised over real HTTP. Designed, not
-  built; it is not the Razorpay Clone and verifies none of its behaviours.
+  the buyer outcomes.
+- **Payment stub (`payment-stub/`, branch `feat/day5-payment-stub`): BUILT and
+  TESTED ALONE; not run against Order; NOT verified against a real gateway.**
+  A separate small Spring Boot app on port 8085, its own process (so Order's real
+  timeouts, retries and breaker will be exercised over real HTTP), no DB,
+  in-memory `ConcurrentHashMap` keyed by `Idempotency-Key`.
+  `POST /api/payments/initiate`: same key and body replays the same
+  `paymentRef` (`202`); same key with a different body is `400
+  IDEMPOTENCY_KEY_REUSED`; the lookup and create are one atomic step per key;
+  bad amount or currency is `400 INVALID_REQUEST`. `POST /admin/mode` switches
+  HEALTHY, SLOW_BEFORE, SLOW_AFTER, ERROR_5XX, REJECT_4XX (local use only).
+  Tested over real HTTP with real threads: replay, different-body, 8 threads x 50
+  rounds on one key giving one `paymentRef`, invalid inputs, a SLOW_AFTER
+  client timeout followed by a same-key retry returning the same `paymentRef`,
+  and 5xx/4xx modes creating nothing. Break-and-restore done on the same-key
+  lookup (4 tests failed) and on the per-key atomicity (the race test failed in
+  3 of 3 runs). **Money is a decimal string here; real gateways use integer
+  minor units**, so this is not a model of one. It is not the Razorpay Clone and
+  proves none of RZP-1 to RZP-9. Not built: webhooks, refund, status lookup.
 - **Not built anywhere:** repositories beyond the Day-1 ones above (apart from
   the ones `reserve` added), service implementations other than Inventory's
   `reserve` and Order's create path, any controller other than Inventory's
@@ -949,8 +964,8 @@ refused), cause not found; the 5,000-concurrent target is not reached. Not
 verified under failure.
 
 **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
-`8084`; `8080` is reserved for the API Gateway. `8085` is planned for the
-payment stub (below; not built).
+`8084`; `8080` is reserved for the API Gateway. `8085` is the payment
+stub (built and tested alone, not run against Order; see §8).
 
 **Diagrams and ERDs: current, checked 2026-10-22.** All sequence diagrams
 (including reconciliation sweep and partial-item failure), both state diagrams
