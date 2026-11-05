@@ -1,6 +1,8 @@
 package com.flashmart.order.service;
 
+import com.flashmart.order.TestPayments;
 import com.flashmart.order.TestRows;
+import com.flashmart.order.client.payment.PaymentGatewayClient;
 import com.flashmart.order.client.inventory.InventoryCalls;
 import com.flashmart.order.client.inventory.InventoryUnavailableException;
 import com.flashmart.order.client.inventory.ReserveOutcome;
@@ -68,6 +70,15 @@ class OrderReserveLoopTest {
     @MockitoBean
     private InventoryCalls inventory;
 
+    /** Accepts every initiate; the payment step's own behaviour is tested in OrderPaymentStepTest. */
+    @MockitoBean
+    private PaymentGatewayClient gateway;
+
+    @org.junit.jupiter.api.BeforeEach
+    void gatewayAcceptsEverything() {
+        TestPayments.acceptEverything(gateway);
+    }
+
     private long nextBuyer = FROM;
 
     @AfterEach
@@ -124,9 +135,10 @@ class OrderReserveLoopTest {
                         new CreateOrderRequest.Item(12L, 1))));
 
         assertTrue(result.created());
-        assertEquals("CREATED", result.body().status());
+        assertEquals("PENDING_PAYMENT", result.body().status()); // the loop goes on to the payment step
         assertEquals(new BigDecimal("274.50"), result.body().amount()); // 2 x 100.00 + 25.50 + 49.00 fee
         long id = result.body().orderId();
+        assertEquals("pay_order-" + id, result.body().paymentRef());
         assertEquals(2, pricedItems(id));
         assertEquals(0, new BigDecimal("274.50").compareTo((BigDecimal) order(id).get("amount")));
         assertTrue(outbox(id).isEmpty());
@@ -244,7 +256,8 @@ class OrderReserveLoopTest {
 
         CreateOrderResult retry = service.create(buyer, "k1", request(11, 12, 13));
 
-        assertFalse(retry.created());
+        assertTrue(retry.created()); // the resumed request won the PENDING_PAYMENT CAS: 201
+        assertEquals("PENDING_PAYMENT", retry.body().status());
         assertEquals(id, retry.body().orderId());
         assertEquals(new BigDecimal("79.00"), retry.body().amount());
         verify(inventory, never()).reserve(new ReserveRequest(id, SALE, 11L, 1));

@@ -1,6 +1,8 @@
 package com.flashmart.order.service;
 
+import com.flashmart.order.TestPayments;
 import com.flashmart.order.TestRows;
+import com.flashmart.order.client.payment.PaymentGatewayClient;
 import com.flashmart.order.client.inventory.InventoryCalls;
 import com.flashmart.order.client.inventory.ReserveOutcome;
 import com.flashmart.order.client.inventory.ReserveRequest;
@@ -73,6 +75,10 @@ class OrderResumeRaceTest {
     @MockitoBean
     private InventoryCalls inventory;
 
+    /** Real retry and breaker in front; the mock returns "pay_" + key. */
+    @MockitoBean
+    private PaymentGatewayClient gateway;
+
     @MockitoSpyBean
     private OrderCreationTransaction transaction;
 
@@ -80,11 +86,18 @@ class OrderResumeRaceTest {
     private final AtomicReference<CyclicBarrier> beforeFailCas = new AtomicReference<>();
     private final AtomicInteger pricingWins = new AtomicInteger();
     private final AtomicInteger amountWins = new AtomicInteger();
+    private final AtomicInteger pendingWins = new AtomicInteger();
 
     private long nextBuyer = FROM;
 
     @BeforeEach
     void instrument() {
+        TestPayments.acceptEverything(gateway);
+        doAnswer(inv -> {
+            int rows = (int) inv.callRealMethod();
+            pendingWins.addAndGet(rows);
+            return rows;
+        }).when(transaction).markPendingPayment(anyLong(), anyString(), anyLong());
         doAnswer(inv -> {
             CyclicBarrier barrier = beforeFailCas.get();
             if (barrier != null) {
@@ -154,7 +167,11 @@ class OrderResumeRaceTest {
     /**
      * Both loops get RESERVED for both items. Each item must be priced by
      * exactly one loop (the other's write-once UPDATE matches 0 rows), the
-     * amount set by exactly one CAS, and no event written.
+     * amount set by exactly one CAS, and no event written. Both then initiate
+     * with the same key and race on the PENDING_PAYMENT CAS: exactly one wins
+     * (201), the loser answers 200 with the same paymentRef, and the order ends
+     * PENDING_PAYMENT holding that ref. This is also the crash-resume case: the
+     * order was CREATED with nothing priced when both retries arrived.
      */
     @Test
     void twoResumedLoopsAllReservedPriceEachItemOnceAndSetTheAmountOnce() throws Exception {
@@ -165,6 +182,7 @@ class OrderResumeRaceTest {
             long buyer = nextBuyer++;
             pricingWins.set(0);
             amountWins.set(0);
+            pendingWins.set(0);
             try {
                 long id = crashedOrder(buyer);
                 List<Outcome> outcomes = race(() -> service.create(buyer, "k1", REQUEST));
@@ -177,11 +195,23 @@ class OrderResumeRaceTest {
                 if (amountWins.get() != 1) {
                     problems.add(amountWins.get() + " amount CAS wins (want 1)");
                 }
-                Map<String, Object> row = jdbc.queryForMap("select status, amount from orders where id = ?", id);
-                if (!"CREATED".equals(row.get("status"))
-                        || ((BigDecimal) row.get("amount")).compareTo(new BigDecimal("79.00")) != 0) {
-                    problems.add("order " + row + " (want CREATED, 79.00)");
+                if (pendingWins.get() != 1) {
+                    problems.add(pendingWins.get() + " PENDING_PAYMENT CAS wins (want 1)");
                 }
+                String ref = "pay_order-" + id;
+                Map<String, Object> row = jdbc.queryForMap(
+                        "select status, amount, payment_ref from orders where id = ?", id);
+                if (!"PENDING_PAYMENT".equals(row.get("status"))
+                        || ((BigDecimal) row.get("amount")).compareTo(new BigDecimal("79.00")) != 0
+                        || !ref.equals(row.get("payment_ref"))) {
+                    problems.add("order " + row + " (want PENDING_PAYMENT, 79.00, " + ref + ")");
+                }
+                List<Outcome> answered = outcomes.stream().filter(o -> o.result() != null).toList();
+                if (answered.stream().filter(o -> o.result().created()).count() != 1) {
+                    problems.add("want exactly one 201 (the CAS winner)");
+                }
+                answered.stream().filter(o -> !ref.equals(o.result().body().paymentRef()))
+                        .forEach(o -> problems.add("an answer carries paymentRef " + o.result().body().paymentRef()));
                 if (outboxRows(id) != 0) {
                     problems.add(outboxRows(id) + " outbox rows (want 0)");
                 }

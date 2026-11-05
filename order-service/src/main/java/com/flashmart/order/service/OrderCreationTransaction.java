@@ -31,12 +31,13 @@ import java.util.TreeMap;
 public class OrderCreationTransaction {
 
     private static final String SNAPSHOT = "SELECT id, buyer_id, flash_sale_id, status, amount, "
-            + "clock_timestamp() < expires_at AS before_deadline FROM orders ";
+            + "clock_timestamp() < expires_at AS before_deadline, payment_ref, expires_at FROM orders ";
 
     private static final RowMapper<OrderSnapshot> SNAPSHOT_ROW = (rs, n) -> new OrderSnapshot(
             rs.getLong("id"), rs.getLong("buyer_id"), rs.getLong("flash_sale_id"),
             OrderStatus.valueOf(rs.getString("status")), rs.getBigDecimal("amount"),
-            rs.getBoolean("before_deadline"));
+            rs.getBoolean("before_deadline"), rs.getString("payment_ref"),
+            rs.getObject("expires_at", java.time.OffsetDateTime.class).toInstant());
 
     private final JdbcTemplate jdbc;
     private final OrderRepository orders;

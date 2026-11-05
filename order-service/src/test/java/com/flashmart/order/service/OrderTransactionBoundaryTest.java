@@ -2,6 +2,8 @@ package com.flashmart.order.service;
 
 import com.flashmart.order.TestRows;
 import com.flashmart.order.client.inventory.InventoryCalls;
+import com.flashmart.order.client.payment.InitiatePaymentResponse;
+import com.flashmart.order.client.payment.PaymentCalls;
 import com.flashmart.order.client.inventory.ReserveOutcome;
 import com.flashmart.order.client.inventory.ReserveResponse;
 import com.flashmart.order.dto.CreateOrderRequest;
@@ -29,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.BDDMockito.given;
 
 /**
  * Two transaction-boundary claims of the create path, proved rather than
@@ -37,7 +40,9 @@ import static org.mockito.Mockito.doAnswer;
  *   <li>the fail CAS and its outbox row share ONE transaction: if the
  *       surrounding transaction rolls back, neither survives;</li>
  *   <li>no transaction and no pooled connection is held while Inventory is
- *       being called.</li>
+ *       being called, or while the payment is being initiated;</li>
+ *   <li>the PAYMENT_UNAVAILABLE CAS and its outbox row share one transaction,
+ *       and the row exists only if the CAS won.</li>
  * </ol>
  * Test 2 calls the service directly, not through an HTTP request, so it cannot
  * see anything open-in-view would hold for the length of a web request.
@@ -68,6 +73,9 @@ class OrderTransactionBoundaryTest {
 
     @MockitoBean
     private InventoryCalls inventory;
+
+    @MockitoBean
+    private PaymentCalls payments;
 
     @AfterEach
     void cleanUp() {
@@ -144,6 +152,36 @@ class OrderTransactionBoundaryTest {
 
         assertEquals(0L, outboxRows(id));
         assertEquals("ORDER_EXPIRED", jdbc.queryForObject("select status from orders where id = ?", String.class, id));
+    }
+
+    @org.junit.jupiter.api.BeforeEach
+    void paymentsAreAccepted() {
+        org.mockito.BDDMockito.given(payments.initiate(org.mockito.ArgumentMatchers.anyLong(), any()))
+                .willAnswer(inv -> new InitiatePaymentResponse("pay_order-" + inv.getArgument(0),
+                        inv.getArgument(0), inv.getArgument(1), "PENDING"));
+    }
+
+    @Test
+    void noTransactionAndNoConnectionIsHeldWhileThePaymentIsInitiated() {
+        given(inventory.reserve(any())).willReturn(
+                new ReserveResponse(ReserveOutcome.RESERVED, 1L, new BigDecimal("10.00"), 3L, "Product"));
+        List<Boolean> transactionActive = new CopyOnWriteArrayList<>();
+        List<Integer> activeConnections = new CopyOnWriteArrayList<>();
+        HikariDataSource hikari = (HikariDataSource) dataSource;
+        doAnswer(inv -> {
+            transactionActive.add(TransactionSynchronizationManager.isActualTransactionActive());
+            activeConnections.add(hikari.getHikariPoolMXBean().getActiveConnections());
+            return new InitiatePaymentResponse("pay_order-" + inv.getArgument(0), inv.getArgument(0),
+                    inv.getArgument(1), "PENDING");
+        }).when(payments).initiate(org.mockito.ArgumentMatchers.anyLong(), any());
+
+        CreateOrderResult result = service.create(FROM + 5, "k1", new CreateOrderRequest(SALE, List.of(
+                new CreateOrderRequest.Item(11L, 1))));
+
+        assertEquals("PENDING_PAYMENT", result.body().status()); // the CAS after the call did run
+        assertEquals(1, transactionActive.size());
+        assertFalse(transactionActive.getFirst(), "a transaction was open during initiate");
+        assertEquals(0, activeConnections.getFirst(), "a pooled connection was held during initiate");
     }
 
     @Test

@@ -4,6 +4,10 @@ import com.flashmart.order.client.inventory.InventoryCalls;
 import com.flashmart.order.client.inventory.InventoryUnavailableException;
 import com.flashmart.order.client.inventory.ReserveRequest;
 import com.flashmart.order.client.inventory.ReserveResponse;
+import com.flashmart.order.client.payment.InitiatePaymentResponse;
+import com.flashmart.order.client.payment.PaymentCalls;
+import com.flashmart.order.client.payment.PaymentRejectedException;
+import com.flashmart.order.client.payment.PaymentUnavailableException;
 import com.flashmart.order.dto.CreateOrderRequest;
 import com.flashmart.order.dto.CreateOrderResponse;
 import com.flashmart.order.dto.ErrorCode;
@@ -28,7 +32,12 @@ import java.util.TreeMap;
  * unique violation can be answered after its transaction has rolled back.
  *
  * <p>Design: decisions.md, "Order creation: retries, conflicts, deadlines and
- * Inventory failures".
+ * Inventory failures" (insert, conflicts, reserve loop) and "Day 5: payment
+ * step, resilience and derived deadlines" (amount, initiate, PENDING_PAYMENT).
+ *
+ * <p>Flow: insert, reserve loop, amount, {@code requirePayable}, initiate,
+ * PENDING_PAYMENT CAS, answer. No database transaction is open across either
+ * remote call (Inventory or the payment gateway).
  */
 @Slf4j
 @Service
@@ -41,6 +50,11 @@ public class OrderCreationService {
     private final OrderCreationTransaction transaction;
     private final CreateOrderSettings settings;
     private final InventoryCalls inventory;
+    private final PaymentCalls payments;
+    private final PaymentSettings paymentSettings;
+
+    /** Shown when the order expired while its payment was being started (Day 6 refunds any payment). */
+    static final String EXPIRED_MESSAGE = "Something went wrong. If any money was deducted, it will be refunded.";
 
     public CreateOrderResult create(long buyerId, String idempotencyKey, CreateOrderRequest request) {
         List<OrderLine> lines = merge(request.items());
@@ -53,8 +67,8 @@ public class OrderCreationService {
             }
             return onUniqueViolation(buyerId, idempotencyKey, request.flashSaleId(), lines);
         }
-        return reserveAll(new OrderSnapshot(id, buyerId, request.flashSaleId(), OrderStatus.CREATED, null, true),
-                true);
+        return reserveAll(new OrderSnapshot(id, buyerId, request.flashSaleId(), OrderStatus.CREATED, null, true,
+                null, null));
     }
 
     /**
@@ -68,7 +82,7 @@ public class OrderCreationService {
      * is write-once, and losing is never an error: the loser re-reads and
      * reports what is really there.
      */
-    private CreateOrderResult reserveAll(OrderSnapshot order, boolean created) {
+    private CreateOrderResult reserveAll(OrderSnapshot order) {
         for (OrderLine line : transaction.unpricedItems(order.id())) {
             ReserveResponse answer;
             try {
@@ -106,7 +120,67 @@ public class OrderCreationService {
         transaction.setAmountFromItems(order.id());
         OrderSnapshot now = transaction.read(order.id());
         if (now.status() == OrderStatus.CREATED && now.amount() != null) {
-            return new CreateOrderResult(created, new CreateOrderResponse(now.id(), now.status().name(), now.amount()));
+            return pay(now);
+        }
+        return currentState(now);
+    }
+
+    /**
+     * Starts the payment for a priced CREATED order and moves it to
+     * PENDING_PAYMENT. The gateway call runs with no transaction open; each
+     * write after it is its own short CAS transaction.
+     *
+     * <p>The key is {@code "order-" + id} on every attempt and every retried or
+     * resumed request, so a second initiate for the same order returns the same
+     * payment (if the gateway honours it; RZP-1, designed, not verified). Only
+     * the request whose CAS wins answers 201; any loser re-reads and reports
+     * what is really there.
+     */
+    private CreateOrderResult pay(OrderSnapshot order) {
+        transaction.requirePayable(order.id(), order.amount());
+        InitiatePaymentResponse payment;
+        try {
+            payment = payments.initiate(order.id(), order.amount());
+        } catch (PaymentUnavailableException e) {
+            // Retries exhausted or breaker open. A timed-out call may still have
+            // created a payment; the Day 6 webhook handler refunds it.
+            return paymentUnavailable(order, e.getMessage(), HttpStatus.SERVICE_UNAVAILABLE,
+                    ErrorCode.PAYMENT_UNAVAILABLE, "payment is unavailable; the order was cancelled");
+        } catch (PaymentRejectedException e) {
+            // A 4xx is almost always our bug. Still cancel, so the stock is released.
+            log.error("payment gateway rejected initiate for order {}: {}", order.id(), e.getMessage());
+            return paymentUnavailable(order, e.getMessage(), HttpStatus.INTERNAL_SERVER_ERROR,
+                    ErrorCode.PAYMENT_REJECTED, "the payment could not be started; the order was cancelled");
+        }
+        if (transaction.markPendingPayment(order.id(), payment.paymentRef(), paymentSettings.paymentWindowMs()) == 1) {
+            return new CreateOrderResult(true, body(transaction.read(order.id())));
+        }
+        return lost(transaction.read(order.id()));
+    }
+
+    /**
+     * {@code CREATED -> PAYMENT_UNAVAILABLE} with its {@code OrderCancelled}.
+     * Only the CAS winner answers with the failure; a loser reports the real state.
+     */
+    private CreateOrderResult paymentUnavailable(OrderSnapshot order, String detail, HttpStatus status,
+                                                 ErrorCode code, String message) {
+        if (transaction.failPaymentUnavailable(order.id(), order.buyerId(), detail)) {
+            throw new OrderRejectedException(status, new OrderErrorResponse(code, message,
+                    order.id(), OrderStatus.PAYMENT_UNAVAILABLE.name(), null, null));
+        }
+        return lost(transaction.read(order.id()));
+    }
+
+    /**
+     * A payment-step CAS lost. The sweep expired the order: 409 ORDER_EXPIRED
+     * (any payment is refunded by the Day 6 webhook handler). A same-key request
+     * moved it to PENDING_PAYMENT: 200 with the winner's body. Anything else:
+     * the usual mapping of the stored state.
+     */
+    private CreateOrderResult lost(OrderSnapshot now) {
+        if (now.status() == OrderStatus.ORDER_EXPIRED) {
+            throw new OrderRejectedException(HttpStatus.CONFLICT, new OrderErrorResponse(ErrorCode.ORDER_EXPIRED,
+                    EXPIRED_MESSAGE, now.id(), now.status().name(), now.amount(), null));
         }
         return currentState(now);
     }
@@ -184,14 +258,17 @@ public class OrderCreationService {
                     "this Idempotency-Key was already used for a different order request"));
         }
         if (order.status() == OrderStatus.CREATED && order.beforeDeadline()) {
-            return reserveAll(order, false);
+            return reserveAll(order);
         }
         return currentState(order);
     }
 
     /**
-     * The state as stored, as an answer. A failed order replays with no reason:
-     * the reason was given once, and {@code failure_detail} is debug-only.
+     * The state as stored, as an answer (never 201). A failed order replays with
+     * no reason: the reason was given once, and {@code failure_detail} is
+     * debug-only. PENDING_PAYMENT replays the same body the winner got, read
+     * from the row. PAYMENT_UNAVAILABLE replays the 503; a new attempt needs a
+     * new key.
      */
     CreateOrderResult currentState(OrderSnapshot order) {
         if (order.status() == OrderStatus.RESERVATION_FAILED) {
@@ -199,8 +276,18 @@ public class OrderCreationService {
                     ErrorCode.RESERVATION_FAILED, "this order could not be reserved",
                     order.id(), order.status().name(), null, null));
         }
-        return new CreateOrderResult(false,
-                new CreateOrderResponse(order.id(), order.status().name(), order.amount()));
+        if (order.status() == OrderStatus.PAYMENT_UNAVAILABLE) {
+            throw new OrderRejectedException(HttpStatus.SERVICE_UNAVAILABLE, new OrderErrorResponse(
+                    ErrorCode.PAYMENT_UNAVAILABLE, "payment was unavailable; this order was cancelled",
+                    order.id(), order.status().name(), null, null));
+        }
+        return new CreateOrderResult(false, body(order));
+    }
+
+    /** {@code expiresAt} is the payment window's end, so it is shown only while PENDING_PAYMENT. */
+    private static CreateOrderResponse body(OrderSnapshot order) {
+        return new CreateOrderResponse(order.id(), order.status().name(), order.amount(), order.paymentRef(),
+                order.status() == OrderStatus.PENDING_PAYMENT ? order.expiresAt() : null);
     }
 
     private static OrderRejectedException alreadyOpen(OrderSnapshot open) {
