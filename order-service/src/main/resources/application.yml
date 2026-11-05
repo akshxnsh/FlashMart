@@ -20,3 +20,33 @@ spring:
       # never generates or mutates DDL. See docs/decisions.md.
       ddl-auto: validate
     show-sql: true
+
+  cloud:
+    openfeign:
+      client:
+        config:
+          inventory:
+            # Explicit, never Feign's defaults (10 s connect / 60 s read).
+            # Both come from inventory.* below, so the values the CREATED
+            # deadline is derived from are the values the client really uses.
+            connect-timeout: ${inventory.connect-timeout-ms}
+            read-timeout: ${inventory.reserve-timeout-ms}
+            # No in-call retries: see InventoryClientConfig.
+
+# All four values below are PROVISIONAL: picked from one-laptop Inventory load
+# runs that were not repeated (docs/decisions.md, "Order creation: retries,
+# conflicts, deadlines and Inventory failures", point 7). Recheck on Day 9.
+inventory:
+  base-url: http://localhost:8082
+  connect-timeout-ms: 1000
+  # The per-call timeout of reserve. Also one factor of the CREATED deadline
+  # and of maxLines.
+  reserve-timeout-ms: 2000
+
+order:
+  create:
+    # Policy: the longest a crashed order may block its buyer (one live order
+    # per buyer and sale). maxLines = floor(max-blocking-time / reserve-timeout).
+    max-blocking-time-ms: 60000
+    # expires_at = clock_timestamp() + reserve-timeout * lines + margin.
+    deadline-margin-ms: 5000
