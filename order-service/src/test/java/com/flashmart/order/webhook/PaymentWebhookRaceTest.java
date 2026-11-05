@@ -2,7 +2,7 @@ package com.flashmart.order.webhook;
 
 import com.flashmart.order.TestRows;
 import com.flashmart.order.entity.OrderStatus;
-import com.flashmart.order.repository.OrderRepository;
+import com.flashmart.order.sweep.ExpirySweep;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -40,14 +40,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * exactly one can win; under READ COMMITTED the blocked one re-checks its
  * {@code WHERE} against the winner's committed row and matches 0 rows.
  *
- * <p>The sweep is NOT built (Day 7). Its side is simulated as what it will be:
- * the existing {@code expire} CAS plus an {@code OrderCancelled{ORDER_EXPIRED}}
- * outbox row in the same transaction, written only if it won.
+ * <p>The sweep side is the REAL pass, {@link ExpirySweep#runOnce()} (Day 7,
+ * point 6): its SELECT, then {@code expire} plus {@code OrderCancelled{ORDER_EXPIRED}}
+ * in one transaction, written only if it won. Each order here is made due (its
+ * deadline a minute past) so the pass picks it. The sweep is global, so the
+ * class refuses to run while the database holds anyone else's due live orders.
  *
  * <p>Two orderings are forced (the winner holds its row lock uncommitted until
  * the loser is observed waiting on it in {@code pg_stat_activity}), then many
  * free-running rounds. The webhook side is called at the service, not over
- * HTTP, except in the commit-before-200 test.
+ * HTTP, except in the commit-before-200 test. What this cannot see: the
+ * scheduler, two processes, the real gateway, Kafka.
  *
  * <p>NOT {@code @Transactional}: everything commits. Buyers 10100..10999; rows
  * deleted after each test.
@@ -63,7 +66,7 @@ class PaymentWebhookRaceTest {
     private PaymentWebhookService webhooks;
 
     @Autowired
-    private OrderRepository orders;
+    private ExpirySweep sweep;
 
     @Autowired
     private JdbcTemplate jdbc;
@@ -84,6 +87,11 @@ class PaymentWebhookRaceTest {
     @BeforeEach
     void setUp() {
         rows = new WebhookRows(jdbc);
+        Long foreign = jdbc.queryForObject("SELECT count(*) FROM orders WHERE status IN ('CREATED', 'PENDING_PAYMENT') "
+                + "AND expires_at < clock_timestamp() + interval '10 minutes' AND buyer_id NOT BETWEEN ? AND ?",
+                Long.class, FROM, TO);
+        assertEquals(0L, foreign, "the dev database holds live orders this test did not write; the real sweep "
+                + "pass would expire them. Reset it (scripts/seed) before running this class.");
         pool = Executors.newFixedThreadPool(2);
     }
 
@@ -93,18 +101,16 @@ class PaymentWebhookRaceTest {
         TestRows.deleteOrdersOfBuyers(jdbc, FROM, TO);
     }
 
-    /** The sweep's future transaction: expire, and OrderCancelled only if it won. */
-    private int sweepExpire(long id, long buyer) {
-        return tx.execute(s -> sweepExpireInCurrentTx(id, buyer));
+    /** A PENDING_PAYMENT order whose payment window ended a minute ago, so the sweep picks it. */
+    private long dueOrder(long buyer) {
+        long id = rows.order(buyer, OrderStatus.PENDING_PAYMENT);
+        jdbc.update("UPDATE orders SET expires_at = clock_timestamp() - interval '1 minute' WHERE id = ?", id);
+        return id;
     }
 
-    private int sweepExpireInCurrentTx(long id, long buyer) {
-        int won = orders.expire(id, OrderStatus.PENDING_PAYMENT.name());
-        if (won == 1) {
-            jdbc.update("INSERT INTO outbox (aggregate_id, event_type, payload_json) VALUES (?, 'OrderCancelled', "
-                    + "?::jsonb)", id, "{\"order_id\":" + id + ",\"reason\":\"ORDER_EXPIRED\",\"buyer_id\":" + buyer + "}");
-        }
-        return won;
+    /** One real sweep pass; how many orders it expired (only ever this test's one due order). */
+    private int sweepExpire() {
+        return sweep.runOnce().expired();
     }
 
     private PaymentWebhook success(long id, long buyer) {
@@ -145,12 +151,14 @@ class PaymentWebhookRaceTest {
     @Test
     void sweepHoldsTheRowWebhookBlocksThenLosesAndRefunds() throws Exception {
         long buyer = nextBuyer++;
-        long id = rows.order(buyer, OrderStatus.PENDING_PAYMENT);
+        long id = dueOrder(buyer);
         CountDownLatch sweepUpdated = new CountDownLatch(1);
         CountDownLatch releaseSweep = new CountDownLatch(1);
 
+        // An outer transaction around the pass: the per-order transaction
+        // joins it, so the ORDER_EXPIRED row stays locked until released.
         Future<Integer> sweep = pool.submit(() -> tx.execute(s -> {
-            int won = sweepExpireInCurrentTx(id, buyer);
+            int won = sweepExpire();
             sweepUpdated.countDown();
             await(releaseSweep);
             return won;
@@ -170,7 +178,7 @@ class PaymentWebhookRaceTest {
     @Test
     void webhookHoldsTheRowSweepBlocksThenLosesWithZeroRows() throws Exception {
         long buyer = nextBuyer++;
-        long id = rows.order(buyer, OrderStatus.PENDING_PAYMENT);
+        long id = dueOrder(buyer);
         CountDownLatch webhookApplied = new CountDownLatch(1);
         CountDownLatch releaseWebhook = new CountDownLatch(1);
 
@@ -183,7 +191,9 @@ class PaymentWebhookRaceTest {
             return outcome;
         }));
         assertTrue(webhookApplied.await(10, TimeUnit.SECONDS));
-        Future<Integer> sweep = pool.submit(() -> sweepExpire(id, buyer));
+        // The pass's SELECT still sees the committed PENDING_PAYMENT row, picks
+        // it, and blocks in expire().
+        Future<Integer> sweep = pool.submit(this::sweepExpire);
         awaitLockWait();
         assertFalse(sweep.isDone(), "the sweep must be waiting on the webhook's row lock");
         releaseWebhook.countDown();
@@ -200,7 +210,7 @@ class PaymentWebhookRaceTest {
         List<String> broken = new ArrayList<>();
         for (int round = 1; round <= ROUNDS; round++) {
             long buyer = nextBuyer++;
-            long id = rows.order(buyer, OrderStatus.PENDING_PAYMENT);
+            long id = dueOrder(buyer);
             CountDownLatch go = new CountDownLatch(1);
             Future<WebhookOutcome> webhook = pool.submit(() -> {
                 go.await();
@@ -208,7 +218,7 @@ class PaymentWebhookRaceTest {
             });
             Future<Integer> sweep = pool.submit(() -> {
                 go.await();
-                return sweepExpire(id, buyer);
+                return sweepExpire();
             });
             go.countDown();
             WebhookOutcome outcome = webhook.get(10, TimeUnit.SECONDS);

@@ -13,6 +13,13 @@ outbox:
   relay:
     enabled: false
 
+# No scheduled expiry sweep in tests: it would expire other tests' rows (and
+# any due row in the shared dev database) behind their backs. The sweep tests
+# call ExpirySweep.runOnce() by hand.
+order:
+  sweep:
+    enabled: false
+
 # Test-only, NOT the production pool size (still open, from the load test).
 # Spring caches one context per distinct test configuration and each keeps
 # its Hikari pool open, so 10+ contexts x the default 10 exceeded local

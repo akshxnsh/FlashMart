@@ -95,6 +95,13 @@ order:
     #   expires_at     = clock_timestamp() + perReserveCall * lines + paymentBudget + margin
     max-blocking-time-ms: 60000
     deadline-margin-ms: 5000
+  # Expiry sweep (decisions.md, "Day 7", point 6). The interval is a policy
+  # from "Day 5" (30 s). batch-size is PROVISIONAL and unmeasured (recheck Day
+  # 9): at most this many due orders per pass; leftovers wait for the next one.
+  sweep:
+    enabled: true
+    interval-ms: 30000
+    batch-size: 100
 
 # HMAC-SHA256 secret the gateway signs webhooks with (decisions.md, "Day 6",
 # point 4). From the environment only, never committed. Blank fails startup
