@@ -111,7 +111,7 @@ orders(id, buyer_id, flash_sale_id, amount, status, idempotency_key,
   --   One column, because an order has exactly one live deadline. The move is
   --   ONE statement (status + payment_ref + expires_at), so no gap lets the
   --   sweep expire a healthy order. V2 says "written as now() + interval"; superseded
-  --   (designed, not built): clock_timestamp() + duration, DB-stamped by a native
+  --   (implemented, tested): clock_timestamp() + duration, DB-stamped by a native
   --   INSERT ... RETURNING id (decisions.md, "Order creation: retries, conflicts,
   --   deadlines and Inventory failures")
   -- failure_detail: nullable, debug only — never drives state
@@ -454,7 +454,7 @@ synchronous status check in §3.
 `PAYMENT_FAILED`, `ORDER_EXPIRED`, `PAYMENT_UNAVAILABLE`, `RESERVATION_FAILED`.
 
 - `CREATED → PENDING_PAYMENT` — every item reserved, `amount` set, gateway returned 202. Saves `payment_ref`, resets `expires_at` to the payment window.
-- `CREATED → RESERVATION_FAILED` — an item came back `OUT_OF_STOCK`, `SALE_NOT_LIVE` or `ITEM_NOT_IN_SALE` (decided; no new state, no migration). A state exists only if something downstream reacts differently to it, and every reserve "no" gets the same reaction: release everything, send no email, tell the buyer in the reply. Which outcome it was goes in `failure_detail` (debug only) and in the buyer's reply. An Inventory timeout or refusal mid-loop also ends as `RESERVATION_FAILED` (`503 INVENTORY_UNAVAILABLE`, cause in `failure_detail`). On `RESERVATION_RELEASED` Order stops without a CAS or event and reports the real status. Both decided 2026-11-05, designed not built (§9).
+- `CREATED → RESERVATION_FAILED` — an item came back `OUT_OF_STOCK`, `SALE_NOT_LIVE` or `ITEM_NOT_IN_SALE` (decided; no new state, no migration). A state exists only if something downstream reacts differently to it, and every reserve "no" gets the same reaction: release everything, send no email, tell the buyer in the reply. Which outcome it was goes in `failure_detail` (debug only) and in the buyer's reply. An Inventory timeout or refusal mid-loop also ends as `RESERVATION_FAILED` (`503 INVENTORY_UNAVAILABLE`, cause in `failure_detail`). On `RESERVATION_RELEASED` Order stops without a CAS or event and reports the real status. Both decided 2026-11-05, implemented, tested (races mock Inventory) (§9).
 - `CREATED → PAYMENT_UNAVAILABLE` — circuit breaker open on initiate.
 - `CREATED → ORDER_EXPIRED` — didn't finish the loop + initiate before its deadline.
 - `PENDING_PAYMENT → PAID` — webhook success *for the payment this order holds*.
@@ -608,7 +608,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   column. Implemented and **run on 2026-11-03**; break-and-restore done: 5 of
   the 6 original guards were killed, `@DynamicUpdate` was the survivor and was
   removed, and each of the six set-once columns is killed by a named test.
-  **Test totals:** see "Tested" below (334 on 2026-11-05).
+  **Test totals:** see "Tested" below (336 on 2026-11-05).
   **Day-1 repositories:** `OrderRepository` has one native compare-and-set per
   transition (set amount, `CREATED` to `RESERVATION_FAILED` / `PAYMENT_UNAVAILABLE`,
   `CREATED` or `PENDING_PAYMENT` to `ORDER_EXPIRED` with no time condition,
@@ -677,6 +677,16 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     and the amount set by one CAS; with item 2 out of stock and both threads held
     by a barrier right before the fail CAS, exactly one `RESERVATION_FAILED` and
     one `OrderCancelled`.
+  - **Transaction boundaries (2 tests, commit `40cc776`):** the fail CAS and its
+    outbox row share one transaction (rolled back together by a surrounding
+    transaction that throws); no transaction and no pooled connection is held
+    across a Feign call (inside the mocked reserve, `isActualTransactionActive()`
+    is false and Hikari reports 0 active connections). Called directly, not over
+    HTTP. Each was shown to fail when broken (`fail()` as `REQUIRES_NEW`;
+    `@Transactional` on `create()`), then restored. **`open-in-view` is enabled
+    (the Spring default; Spring logs its warning at startup) and NOT verified
+    over a real request; check it first if the Day 9 load test shows pool
+    pressure.**
   - Break-and-restore (each test failed, then the code was restored): skipping the
     live-or-paid lookup broke race (ii) in 50 of 50 rounds; skipping the same-key
     lookup broke race (i) in 50 of 50; dropping the `rows == 1` check before the
@@ -693,12 +703,13 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   Gateway, Kafka, Redis, security. All four services
   share one local Postgres credential pair but each owns a separate database.
 
-**Tested: 334 tests, all passing, 0 failures, 0 errors, 0 skipped** — all four
-services run on branch `feat/day4-order-create` on 2026-11-05: Order 177,
-Inventory 81, Identity 47, Notification 29 (the previous four-service figure was
-284: Order 127 plus 81, 47, 29). Order's 50 new tests are V8 (11), the Feign stub
-test (5), the insert (3), the endpoint (8), conflict handling (10), the reserve
-loop (9) and the races (i)/(ii) and (iii) (2 each). Order's earlier 127 are the 99 from V7 (the earlier 69
+**Tested: 336 tests, all passing, 0 failures, 0 errors, 0 skipped** — all four
+services run on branch `feat/day4-order-create` on 2026-11-05: Order 179,
+Inventory 81, Identity 47, Notification 29 (the previous four-service figure
+was 284: Order 127 plus 81, 47, 29). Order's 52 new tests are V8 (11), the
+Feign stub test (5), the insert (3), the endpoint (8), conflict handling (10),
+the reserve loop (9), the races (i)/(ii) and (iii) (2 each) and the two
+transaction-boundary tests (2). Order's earlier 127 are the 99 from V7 (the earlier 69
 plus 30 new for V7 and the review's gaps) plus 28 added since for the
 repositories and the entity-updatability tests (the V7 constraint
 that fires is now asserted by name; native-SQL `NOT NULL` tests; index
@@ -1011,7 +1022,7 @@ or "recorded, not decided" still need a design decision.
   `RESERVATION_RELEASED` mid-loop Order stops the loop, writes no CAS and no
   event, re-reads the real status and reports it; if still `CREATED`, it logs
   ERROR and answers `500 INCONSISTENT_STATE`, and does not guess. Repairing that
-  state is the Day 7 reconciler's case (designed, not built), not fixed here.
+  state is the Day 7 reconciler's case (the reconciler is designed, not built), not fixed here.
 - **Decided; implemented and tested (Day 4):** all three reserve "no" outcomes
   (`OUT_OF_STOCK`, `SALE_NOT_LIVE`, `ITEM_NOT_IN_SALE`) end the order as
   `RESERVATION_FAILED`.

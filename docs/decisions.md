@@ -4507,8 +4507,18 @@ writing.
   `RESERVATION_FAILED` that never reaches Inventory; the key-reuse check running
   before replay (5); a unique-violation loser re-querying in a new transaction
   (1); `expires_at` stamped by the DB (6).
-- Status: all ten points are **designed**. Nothing here is implemented, tested
-  or load-tested. The 2 s timeout is provisional.
+- Status: all ten points are **implemented, tested (races mock Inventory)** (Day 4, `feat/day4-order-create`;
+  Inventory is mocked in every race, and a JDK stub stands in for it in the
+  Feign client test). Nothing here is load-tested or verified under failure
+  against a real Inventory. The 2 s timeout is provisional.
+- **Amendments (2026-11-05, found while implementing):**
+  - A `RESERVED` answer without `salePrice` or `productName` is treated as
+    Inventory unavailable (point 8): the order is cancelled, not guessed at.
+  - `RESERVATION_RELEASED` while Order still says `CREATED` is `500
+    INCONSISTENT_STATE` with no CAS and no outbox row (point 4); the Day 7
+    reconciler owns repairing it.
+  - Item `subtotal` is computed in SQL (`unit_price * quantity`), not in Java;
+    V3's `CHECK` backstops it.
 
 ---
 
@@ -4656,10 +4666,10 @@ is closed by a reconciliation sweep"), and, in
 - **FR-B1 (buyer browse) has no endpoint.** It waits for security and
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
-- **DECIDED 2026-11-05 (designed, not built): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **Order's handling of `RESERVATION_RELEASED`** mid-loop: stop, no CAS, no event, re-read the real status.
+- **DECIDED 2026-11-05 (implemented, tested (races mock Inventory)): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **Order's handling of `RESERVATION_RELEASED`** mid-loop: stop, no CAS, no event, re-read the real status.
 - **Decided, not built:** all three reserve "no" outcomes end the order as
   `RESERVATION_FAILED`. See "Reserve contract revised".
-- **DECIDED 2026-11-05 (designed, not built): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **For Order's API piece: what a retried create with the same idempotency key
+- **DECIDED 2026-11-05 (implemented, tested (races mock Inventory)): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **For Order's API piece: what a retried create with the same idempotency key
   returns when the order is already `RESERVATION_FAILED`.** `failure_detail` is
   debug only, so the retry cannot read the original outcome from it. Not
   decided.
@@ -4669,7 +4679,7 @@ is closed by a reconciliation sweep"), and, in
 - **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` instead of firing an
   Inventory alert. See "Per-item quantity cap of 5".
-- **DECIDED 2026-11-05 (designed, not built): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **For Order's API piece: a unique violation on order insert must map to
+- **DECIDED 2026-11-05 (implemented, tested (races mock Inventory)): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **For Order's API piece: a unique violation on order insert must map to
   `409`** and return the existing live-or-paid order, so the buyer can finish
   paying it. Never a `500`. See "One live-or-paid order per buyer per sale".
 - **A buyer cannot start a new order while an unpaid one is open**, until it
@@ -4677,7 +4687,7 @@ is closed by a reconciliation sweep"), and, in
   open).
 - **One person with two accounts is not covered** by the one-live-order rule.
   The cap of 5 is also still per item per order.
-- **DECIDED 2026-11-05 (designed, not built): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **A retried create while the order is still `CREATED`** now re-runs the reserve loop (amends "abort").
+- **DECIDED 2026-11-05 (implemented, tested (races mock Inventory)): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **A retried create while the order is still `CREATED`** now re-runs the reserve loop (amends "abort").
   Original text: Recovery is abort ("`saga_state` is dropped"). If a resume path is ever
   added, it runs only over `order_items` rows `WHERE unit_price IS NULL`, and
   each item's pricing `UPDATE` is write-once (`WHERE unit_price IS NULL`).
@@ -4708,7 +4718,7 @@ is closed by a reconciliation sweep"), and, in
   - **A3:** redesign of the sweep and refund indexes. Not decided.
   - **B1:** `ON CONFLICT` for the refund insert. Not decided.
   - **B2, B3:** the retried create (and the `409` it returns) and a request
-    fingerprint. **Decided 2026-11-05, designed not built** ("Order creation: retries, conflicts, deadlines and Inventory failures"; no fingerprint column).
+    fingerprint. **Decided 2026-11-05; implemented, tested (races mock Inventory)** ("Order creation: retries, conflicts, deadlines and Inventory failures"; no fingerprint column).
   - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`. Not
     decided.
   - **B5:** which clock function stamps `expires_at`. **Decided 2026-11-05:**
