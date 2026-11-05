@@ -21,9 +21,8 @@ import java.util.Optional;
  *
  * <p>These methods do not write outbox rows and do not touch the clock. The
  * service layer wraps them in the same local transaction as any outbox row.
- * Not built here on purpose: {@code CREATED -> PENDING_PAYMENT}, which stamps
- * {@code expires_at} from a database clock (open item B5 and the derived
- * deadlines).
+ * Not built yet: {@code CREATED -> PENDING_PAYMENT}, which resets
+ * {@code expires_at} to the payment window (payment phase).
  *
  * <p>A native {@code UPDATE} bypasses the persistence context, so an
  * {@link Order} already loaded in the same transaction is stale afterwards.
@@ -42,10 +41,15 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             + "WHERE id = :id AND status = 'CREATED' AND amount IS NULL", nativeQuery = true)
     int setAmount(@Param("id") Long id, @Param("amount") BigDecimal amount);
 
+    /**
+     * {@code CREATED -> RESERVATION_FAILED}. The cause goes into
+     * {@code failure_detail} (debug only) in the same statement, so it is
+     * written only by the caller that won.
+     */
     @Modifying
-    @Query(value = "UPDATE orders SET status = 'RESERVATION_FAILED' "
+    @Query(value = "UPDATE orders SET status = 'RESERVATION_FAILED', failure_detail = :failureDetail "
             + "WHERE id = :id AND status = 'CREATED'", nativeQuery = true)
-    int markReservationFailed(@Param("id") Long id);
+    int markReservationFailed(@Param("id") Long id, @Param("failureDetail") String failureDetail);
 
     @Modifying
     @Query(value = "UPDATE orders SET status = 'PAYMENT_UNAVAILABLE' "
