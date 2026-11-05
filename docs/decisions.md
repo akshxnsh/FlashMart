@@ -2000,6 +2000,9 @@ cannot drift.
 `orders` 1—1 `saga_state` disappears from the relationship model. `CLAUDE.md`'s
 "Order Service schema: finalized" line needs `saga_state` removed.
 
+**Correction: amended by "Order creation: retries, conflicts, deadlines and Inventory failures"** (2026-11-05): recovery is now abort by expiry
+or resume on a retried create while `CREATED`.
+
 ---
 
 ## Decision: Inventory publishes nothing and owns no outbox
@@ -3599,6 +3602,17 @@ INSERT but leaves the UPDATE broken, since Postgres never bumps `updated_at` by
 itself. And with `@CreationTimestamp` the column must stay insertable, because
 Hibernate generates the value and has to write it.
 
+**Which database function (added 2026-11-05):** the table above fixes the
+*clock*; this fixes the *function*.
+- **Deadlines** (a time later compared to fire a timeout, such as
+  `orders.expires_at`) use `clock_timestamp()`. `now()` is fixed when the
+  transaction starts, so in a long transaction it gives a shorter window than
+  promised.
+- **Audit and ordering stamps** may use `now()`.
+- **`stock_reservations.reserved_at` stays `now()`**: Inventory's reconciler
+  compares hours-old rows, so the offset is noise.
+- Reasoning and the `expires_at` case: "Order creation: retries, conflicts, deadlines and Inventory failures".
+
 **Consequences:**
 A new time column is placed in this table before it is written. Changing a row's
 pattern is a real decision, not a tidy-up.
@@ -4357,6 +4371,147 @@ target). See `architecture.md` §8 for what was and was not exercised.**
 
 ---
 
+## Decision: Order creation: retries, conflicts, deadlines and Inventory failures
+
+**Context / Problem:**
+Order's create endpoint is the first piece that has to behave when things go
+wrong: a client retries after a timeout, two tabs submit together, the process
+crashes mid-loop, Inventory is slow, or a reservation is released under the
+loop's feet. The schema (V2 to V7) already has the guards
+(`uk_orders_buyer_id_idempotency_key`, `uk_orders_buyer_sale_live_or_paid`, the
+CAS rule). What was undecided is what the request does when a guard fires. This
+closes the open items B2, B3 and B5, the two "retried create" items, the
+`RESERVATION_RELEASED` item, the `CREATED` deadline, and the two CHECK items
+from the Oct 29 review. All ten points below were settled with Akshansh before
+writing.
+
+**Options Considered:**
+1. Unique violation: (a) SELECT before INSERT; (b) catch the violation and parse
+   the constraint name; (c) catch any unique violation and re-query.
+2. Retry on `RESERVATION_FAILED`: (a) re-run the loop; (b) replay the failure;
+   (c) add a column holding the original outcome.
+3. Retry on `CREATED`: (a) abort only (today's rule); (b) re-run the loop.
+4. `CREATED` deadline: (a) a capped deadline alone; (b) no cap; (c) a cap on
+   item count derived from a policy, plus a deadline derived from the timeouts.
+5. Inventory failure mid-loop: (a) `ORDER_EXPIRED`; (b) `RESERVATION_FAILED`
+   with a cause; (c) leave it `CREATED` for the sweep.
+6. `expires_at` clock: `now()` or `clock_timestamp()`; JPA `save` or a native
+   `INSERT ... RETURNING`.
+
+**Chosen Approach:**
+
+1. **Unique-violation losers.** Catch *any* unique violation on the order
+   insert. The transaction is aborted by Postgres, so re-query in a **new**
+   transaction. Never parse the constraint name.
+   - Found by `(buyer_id, idempotency_key)`: it is a replay (see 2, 3, 5).
+   - Else a live-or-paid order exists for `(buyer, sale)`: `409
+     ORDER_ALREADY_OPEN`, returning the existing order. The message depends on
+     its status; `PAID` means "you already bought this".
+   - Else `409 CONFLICT_RETRY`: the client retries with the same key.
+   - Rejected: SELECT before INSERT. The two indexes are the real guard; a
+     code check passes for both of two simultaneous tabs.
+2. **Retry on `RESERVATION_FAILED`.** Replay the failure with no reason. Never
+   call Inventory again. A new attempt needs a new idempotency key. The replay
+   body is less detailed than the first response (accepted). No extra column;
+   `failure_detail` stays debug-only.
+3. **Retry on `CREATED`: re-run the reserve loop.** This changes "recovery is
+   abort" to "abort by expiry **or** resume on retry". It is safe only if:
+   every write is a CAS or write-once and losing is not an error; the outbox row
+   is written only when the CAS wins; the re-run happens only while the order is
+   `CREATED` and before `expires_at`. It is a **hypothesis** until a two-thread
+   test (a retry racing the original request, and the sweep) proves it.
+4. **`RESERVATION_RELEASED` mid-loop.** Someone else already decided this
+   order's fate. Stop the loop. No CAS, no event. Re-read the real status and
+   report it. If it is still `CREATED`, alert; do not guess.
+5. **Same key, different request: `409 IDEMPOTENCY_KEY_REUSED`.** Compare the
+   request with the stored `orders.flash_sale_id` and `order_items`, merged and
+   order-insensitive. No fingerprint column. This check runs **before** the
+   replay rules in 2 and 3.
+6. **The `expires_at` clock (B5).** The database stamps it with
+   `clock_timestamp() + duration`, through a native `INSERT ... RETURNING id`
+   (not a JPA `save`). Rule: **deadlines use `clock_timestamp()`; audit stamps
+   may use `now()`; `reserved_at` stays `now()`** (the reconciler compares rows
+   that are hours old, so the offset is noise there).
+7. **The `CREATED` deadline.** The policy is "the longest a crashed order may
+   block a buyer" = **60 s** (config). The per-call timeout to Inventory is
+   **2 s, provisional**. So `maxLines = floor(60 / 2) = 30` (config), and
+   `expires_at = clock_timestamp() + 2 s * lines + margin`, margin **5 s,
+   provisional**. Day 5 multiplies by the retry attempts. Rejected: a capped
+   deadline alone (it silently expires a big healthy order mid-loop) and no cap
+   (the worst case is unbounded).
+   - Evidence for 2 s, from the Inventory load runs (one laptop, load tool
+     co-located; runs (b) and (c) not repeated): 1,000 ramped buyers OK, p99
+     13 / 89 ms; 5,000 buyers p99 9.4 to 11.6 s with refusals. Recheck on Day 9.
+8. **Inventory timeout or refusal mid-loop.** In one transaction: CAS
+   `CREATED -> RESERVATION_FAILED` and an outbox
+   `OrderCancelled{RESERVATION_FAILED}`; `failure_detail` = the cause; respond
+   `503 INVENTORY_UNAVAILABLE`. Not `ORDER_EXPIRED`: that label belongs to the
+   sweep and emails the buyer (Notification's table), and the sweep does not
+   exist until Day 7.
+   **Known gap:** a timed-out call can still commit *after* the release and
+   orphan a reservation. Covered only by the Day 7 republish and the reconciler,
+   which is designed, **not built, not verified**.
+9. **HTTP client.** Spring Cloud OpenFeign through the 2025.1.x release train
+   (2025.1.2 states compatibility with Boot 4.0.7 and 4.1.0). Order is on Boot
+   4.1.1 (`order-service/pom.xml`), so compatibility is **unverified until it
+   resolves and starts**. Explicit connect and read timeouts; no reliance on
+   defaults.
+10. **V8 migration (V7 is taken)** adds two CHECKs: `refunds`: `status =
+    'PROCESSING'` implies `claimed_at IS NOT NULL`; `orders`:
+    `payment_reconciled_at` may be set only when `status` is `PAYMENT_FAILED`,
+    `PAYMENT_UNAVAILABLE`, `ORDER_EXPIRED` or `RESERVATION_FAILED`. No payment
+    can exist for `RESERVATION_FAILED`; it is included so the rule is "any
+    failure state" and a later scan needs no migration.
+
+**Why:**
+- The indexes decide races; code can only react. Catching any violation
+  survives an insert that breaks both indexes and a later constraint rename.
+- Replaying a failure without calling Inventory keeps a retry from
+  re-reserving stock for an order already ended.
+- Resuming `CREATED` helps the buyer whose request timed out client-side: the
+  retry finishes the order instead of waiting out the deadline while the
+  one-live-order rule blocks them.
+- The cap is a policy a human can read ("60 s"); the deadline is derived from
+  the timeouts it races, as the standing deadlines rule requires.
+- `now()` is fixed at the start of the transaction. In a long transaction it
+  gives a deadline earlier than intended, so a healthy order gets a shorter
+  window than it was promised.
+
+**Trade-offs:**
+- The `RESERVATION_FAILED` replay tells the buyer less than the first answer.
+- Resume on retry adds a concurrency path that abort-only did not have.
+- A 30-item cap and a 60 s policy are provisional numbers with a thin evidence
+  base (one laptop).
+- The orphan-reservation window in point 8 stays open until Day 7.
+
+**Consequences:**
+- **Amends** "`saga_state` is dropped" (its "Recovery here is abort" sentence)
+  and the recorded-not-built resume note under `order_items` (architecture §4):
+  a resume path now exists, still limited to rows `WHERE unit_price IS NULL`
+  with write-once pricing `UPDATE`s.
+- **Extends** architecture §6: `RESERVATION_FAILED` now also covers an
+  Inventory timeout or refusal, not only the three reserve "no" outcomes. Still
+  no new state, no migration. Its `failure_detail` says which.
+- **Conflicts with V2's comment** on `expires_at` ("written as `now() +
+  interval`"). V2 is applied and never edited; this entry wins, and
+  architecture §4 is corrected. No schema change is needed for it.
+- **Refines** "Deadlines and leases are derived": the `CREATED` deadline is now
+  *provisionally* derived (values above); the refund claim lease, sweep
+  interval and payment window stay open.
+- Closes the open "two database clock functions" item (DECIDED 2026-11-05):
+  the rule is now written into "Who stamps a time column depends on who
+  compares it".
+- V8 is applied against existing rows: check them first (CLAUDE.md
+  Verification 4). Each CHECK needs a test that rejects a bad row.
+- Tests required: the two-thread resume test (3); a retry after
+  `RESERVATION_FAILED` that never reaches Inventory; the key-reuse check running
+  before replay (5); a unique-violation loser re-querying in a new transaction
+  (1); `expires_at` stamped by the DB (6).
+- Status: all ten points are **designed**. Nothing here is implemented, tested
+  or load-tested. The 2 s timeout is provisional.
+
+---
+
 ## Open Items (not yet decided or not yet built)
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
@@ -4392,7 +4547,7 @@ is closed by a reconciliation sweep"), and, in
   which Notion renders natively. On 2026-10-22 they were updated for the
   implementation-phase reserve changes (item-in-sale check, replay quantity
   check, the quantity cap, `ITEM_NOT_IN_SALE` → `RESERVATION_FAILED`).
-- **The two derived deadlines** — the short `CREATED` deadline and the refund
+- **The `CREATED` deadline is now provisionally derived** (60 s policy, 2 s per call, 5 s margin; see "Order creation: retries, conflicts, deadlines and Inventory failures"). Still open: the refund stale-claim lease, sweep interval and payment window. Original text: **The two derived deadlines** — the short `CREATED` deadline and the refund
   stale-claim lease — plus the Order sweep interval and the payment window.
   Blocked on the Feign/Resilience4j timeout configuration by design, not by
   oversight.
@@ -4442,7 +4597,9 @@ is closed by a reconciliation sweep"), and, in
   republish an upsert event for every existing brand and user as a one-off
   deployment step. No schema change fixes it, and a synchronous fallback to
   Identity on a cache miss would undo the reason the cache exists. Kafka phase.
-- **Two database clock functions are in use for the same job (recorded, not
+- **DECIDED 2026-11-05: see "Who stamps a time column depends on who compares
+  it" and "Order creation: retries, conflicts, deadlines and Inventory failures". Original text kept below.**
+  **Two database clock functions are in use for the same job (recorded, not
   decided; the reserve part is DECIDED 2026-11-04 in "Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction": `now()` decides
   liveness and `reserved_at` for reserve, `clock_timestamp()` stays for
   Identity's trigger and Order's DB-stamped columns. Still open for any other
@@ -4499,10 +4656,10 @@ is closed by a reconciliation sweep"), and, in
 - **FR-B1 (buyer browse) has no endpoint.** It waits for security and
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
-- **Order's handling of `RESERVATION_RELEASED`** mid-loop is not specified.
+- **DECIDED 2026-11-05 (designed, not built): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **Order's handling of `RESERVATION_RELEASED`** mid-loop: stop, no CAS, no event, re-read the real status.
 - **Decided, not built:** all three reserve "no" outcomes end the order as
   `RESERVATION_FAILED`. See "Reserve contract revised".
-- **For Order's API piece: what a retried create with the same idempotency key
+- **DECIDED 2026-11-05 (designed, not built): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **For Order's API piece: what a retried create with the same idempotency key
   returns when the order is already `RESERVATION_FAILED`.** `failure_detail` is
   debug only, so the retry cannot read the original outcome from it. Not
   decided.
@@ -4512,7 +4669,7 @@ is closed by a reconciliation sweep"), and, in
 - **Order's create-order request must reject `quantity > 5`** before any
   `reserve` call, so a buyer's mistake gets a `400` instead of firing an
   Inventory alert. See "Per-item quantity cap of 5".
-- **For Order's API piece: a unique violation on order insert must map to
+- **DECIDED 2026-11-05 (designed, not built): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **For Order's API piece: a unique violation on order insert must map to
   `409`** and return the existing live-or-paid order, so the buyer can finish
   paying it. Never a `500`. See "One live-or-paid order per buyer per sale".
 - **A buyer cannot start a new order while an unpaid one is open**, until it
@@ -4520,8 +4677,8 @@ is closed by a reconciliation sweep"), and, in
   open).
 - **One person with two accounts is not covered** by the one-live-order rule.
   The cap of 5 is also still per item per order.
-- **A retried create while the order is still `CREATED` is not specified.**
-  Recovery is abort ("`saga_state` is dropped"). If a resume path is ever
+- **DECIDED 2026-11-05 (designed, not built): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **A retried create while the order is still `CREATED`** now re-runs the reserve loop (amends "abort").
+  Original text: Recovery is abort ("`saga_state` is dropped"). If a resume path is ever
   added, it runs only over `order_items` rows `WHERE unit_price IS NULL`, and
   each item's pricing `UPDATE` is write-once (`WHERE unit_price IS NULL`).
 - **Identity, API phase (designed, not built):** a lost signup race must read
@@ -4551,10 +4708,10 @@ is closed by a reconciliation sweep"), and, in
   - **A3:** redesign of the sweep and refund indexes. Not decided.
   - **B1:** `ON CONFLICT` for the refund insert. Not decided.
   - **B2, B3:** the retried create (and the `409` it returns) and a request
-    fingerprint. Not decided. See also the two retried-create items above.
+    fingerprint. **Decided 2026-11-05, designed not built** ("Order creation: retries, conflicts, deadlines and Inventory failures"; no fingerprint column).
   - **B4:** a webhook arriving before the order is `PENDING_PAYMENT`. Not
     decided.
-  - **B5:** which clock function stamps `expires_at`. Not decided. See also
-    the `now()` vs `clock_timestamp()` item.
+  - **B5:** which clock function stamps `expires_at`. **Decided 2026-11-05:**
+    `clock_timestamp()`, DB-stamped ("Order creation: retries, conflicts, deadlines and Inventory failures").
   - A `CHECK` on `payment_reconciled_at`, and a `CHECK` that `PROCESSING`
-    implies `claimed_at`. Not decided.
+    implies `claimed_at`. **Decided 2026-11-05; V8, not written yet.**
