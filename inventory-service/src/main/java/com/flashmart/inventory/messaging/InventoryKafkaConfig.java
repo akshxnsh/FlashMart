@@ -84,9 +84,15 @@ public class InventoryKafkaConfig {
         DefaultErrorHandler handler = new DefaultErrorHandler(InventoryKafkaConfig::skip, backOff);
         handler.addNotRetryableExceptions(MalformedEventException.class);
         handler.setCommitRecovered(true);
-        handler.setRetryListeners((record, ex, attempt) -> log.warn(
-                "Inventory consumer failed on {}-{}@{} (attempt {}), will retry with backoff: {}",
-                record.topic(), record.partition(), record.offset(), attempt, rootMessage(ex)));
+        handler.setRetryListeners((record, ex, attempt) -> {
+            // The listener is also told about the first failure of a message
+            // that is about to be skipped. That one is not retried, and the
+            // ERROR from skip() already covers it, so no "will retry" WARN.
+            if (!isMalformed(ex)) {
+                log.warn("Inventory consumer failed on {}-{}@{} (attempt {}), will retry with backoff: {}",
+                        record.topic(), record.partition(), record.offset(), attempt, rootMessage(ex));
+            }
+        });
         return handler;
     }
 
@@ -95,6 +101,15 @@ public class InventoryKafkaConfig {
         log.error("Skipping malformed message {}-{}@{} (key {}), NOT retried, no dead-letter topic. "
                         + "That order's stock stays RESERVED until fixed by hand. Reason: {}. Raw message: {}",
                 record.topic(), record.partition(), record.offset(), record.key(), rootMessage(ex), record.value());
+    }
+
+    private static boolean isMalformed(Throwable ex) {
+        for (Throwable t = ex; t != null; t = t.getCause()) {
+            if (t instanceof MalformedEventException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String rootMessage(Throwable ex) {
