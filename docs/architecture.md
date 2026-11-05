@@ -702,7 +702,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     `OrderCancelled` is not tested), any load. The late-reservation gap (a
     timed-out reserve that still commits in Inventory after the order failed) is
     still covered only by Day 7 designs.
-- **Day 5, fee and deadline (branch `feat/day5-fee-deadline`): IMPLEMENTED and
+- **Day 5, fee and deadline (merged from `feat/day5-fee-deadline`): IMPLEMENTED and
   TESTED** on real Postgres; all values **provisional**, unmeasured, recheck
   Day 9. Design: `decisions.md`, "Day 5: payment step, resilience and derived
   deadlines", points 1 and 6. `amount = SUM(subtotal) + 49.00` in the existing
@@ -713,9 +713,10 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   `status = 'CREATED'` from `setAmount` had left the old test green (it used an
   order that already had an amount); a new test with a NULL-amount, non-CREATED
   order fails without the guard. Not exercised: any payment call.
-- **Day 5 payment step (branch `feat/day5-payment-step`): IMPLEMENTED and
-  TESTED against a JDK HttpServer stub and mocks only: not against the real
-  payment-stub, not against a real gateway, not load-tested.** Design and the
+- **Day 5 payment step (merged from `feat/day5-payment-step`): IMPLEMENTED and
+  TESTED against a JDK HttpServer stub and mocks; VERIFIED UNDER FAILURE against
+  the real payment-stub on one laptop (the failure demo below); not against a
+  real gateway, not load-tested.** Design and the
   loser/replay rules: `decisions.md`, "Day 5: payment step, resilience and
   derived deadlines". Values provisional.
   - Flow after the reserve loop and amount: `requirePayable` → `initiate` (no
@@ -749,15 +750,36 @@ machine, every communication pattern, every decision in `docs/decisions.md`
     one CAS win; crash with the amount set, then retry, ends PENDING_PAYMENT.
     Break-and-restore: the `status = 'CREATED'` guard of each CAS and the
     4xx-not-retried rule each failed their tests when broken.
-  - **Not exercised:** the real payment-stub, a real gateway (RZP-1 is
-    assumed by the stubs, which return `pay_` + key), the webhook (Day 6), the
-    sweep (Day 7), the relay and consumers (so stock release after
-    `OrderCancelled{PAYMENT_UNAVAILABLE}` is not tested), any load.
+  - **Breaker logging:** every state transition is logged at WARN with the
+    failure rate and call counts (`PaymentResilienceConfig`); a unit test drives
+    the real breaker bean through CLOSED -> OPEN -> HALF_OPEN -> CLOSED. On the
+    half-open and closed transitions the logged rate is the new, empty window's
+    (`-1.0%`); only `-> OPEN` lines carry the rate the decision used.
+  - **Not exercised:** a real gateway (RZP-1 is assumed by the stubs: the JDK
+    stubs return `pay_` + key, the payment-stub keys payments by
+    `Idempotency-Key`), the webhook (Day 6), the sweep (Day 7), the relay and
+    consumers (so stock release after `OrderCancelled{PAYMENT_UNAVAILABLE}` is
+    not tested), any load.
+- **Day 5 failure demo (`docs/testing.md`): VERIFIED UNDER FAILURE against the
+  payment-stub only, on one laptop, one run per scenario (scenarios 3 to 5
+  run twice), no load, no webhook.** Real inventory,
+  order and payment-stub processes. Measured: stub ERROR_5XX gives `503
+  PAYMENT_UNAVAILABLE` in 0.55 to 0.59 s once warm (1.6 s for the first request
+  after start-up; two fast `500`s plus the 500 ms wait, not the timeout ceiling), the order `PAYMENT_UNAVAILABLE` with one
+  `OrderCancelled`; once the breaker opened, requests failed in 37 to 68 ms with
+  no call reaching the stub; OPEN -> HALF_OPEN -> CLOSED was observed in
+  Order's log (half-open entered only at the first call after the 10 s); the
+  breaker reopened at 3 of 5 failed calls (60%) as configured. SLOW_AFTER 3000
+  ms: both attempts time out, `503`, but **the stub holds the payment created by
+  attempt 1, and nothing refunds it** (the lost-reply gap; Day 6). Switching
+  the stub to HEALTHY inside the 500 ms retry wait gave `201` with the payment
+  attempt 1 created (2 of 2 runs, timing dependent).
 - **Day 5, still designed only:** sweep (Day 7), refund worker (stretch).
-- **Payment stub (`payment-stub/`, branch `feat/day5-payment-stub`): BUILT and
-  TESTED ALONE; not run against Order (Order's payment step was tested against a JDK stub, not this app); NOT verified against a real gateway.**
+- **Payment stub (`payment-stub/`, merged from `feat/day5-payment-stub`): BUILT
+  and TESTED ALONE (its own suite); run against Order only in the failure demo
+  above; NOT verified against a real gateway.** Listens on 127.0.0.1 only.
   A separate small Spring Boot app on port 8085, its own process (so Order's real
-  timeouts, retries and breaker will be exercised over real HTTP), no DB,
+  timeouts, retries and breaker are exercised over real HTTP), no DB,
   in-memory `ConcurrentHashMap` keyed by `Idempotency-Key`.
   `POST /api/payments/initiate`: same key and body replays the same
   `paymentRef` (`202`); same key with a different body is `400
@@ -779,7 +801,13 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   Gateway, Kafka, Redis, security. All four services
   share one local Postgres credential pair but each owns a separate database.
 
-**Tested: 336 tests, all passing, 0 failures, 0 errors, 0 skipped** — all four
+**Tested on `main` after Day 5: 386 tests, all passing, 0 failures, 0 errors,
+0 skipped** — all five suites run on `main` on 2026-11-05 after the Day 5
+merges, Order DB reset with `seed.sh` first: Order 217, Inventory 81,
+Identity 47, Notification 29, payment-stub 12. Order's 38 since Day 4: the fee
+and deadline (11), the payment step (24), the breaker transition log (3).
+
+**Day 4 figure (kept for history): 336 tests, all passing** — all four
 services run on branch `feat/day4-order-create` on 2026-11-05: Order 179,
 Inventory 81, Identity 47, Notification 29 (the previous four-service figure
 was 284: Order 127 plus 81, 47, 29). Order's 52 new tests are V8 (11), the
@@ -1000,7 +1028,8 @@ verified under failure.
 
 **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
 `8084`; `8080` is reserved for the API Gateway. `8085` is the payment
-stub (built and tested alone, not run against Order; see §8).
+stub, on 127.0.0.1 only (built and tested; run against Order in the Day 5
+failure demo; see §8).
 
 **Diagrams and ERDs: current, checked 2026-10-22.** All sequence diagrams
 (including reconciliation sweep and partial-item failure), both state diagrams
