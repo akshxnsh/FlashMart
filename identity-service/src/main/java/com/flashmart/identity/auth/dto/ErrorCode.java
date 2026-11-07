@@ -6,5 +6,7 @@ public enum ErrorCode {
     /** 409: the email belongs to another user. */
     EMAIL_TAKEN,
     /** 401: unknown email or wrong password, deliberately indistinguishable. */
-    INVALID_CREDENTIALS
+    INVALID_CREDENTIALS,
+    /** 401: the refresh token is unknown, expired, or was already used (reuse also revokes all the user's tokens). */
+    INVALID_REFRESH_TOKEN
 }

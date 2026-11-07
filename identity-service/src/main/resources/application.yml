@@ -33,3 +33,6 @@ identity:
     secret: ${JWT_SECRET:}
     # Access token lifetime (point 2). Provisional.
     access-ttl: 15m
+    # Refresh token lifetime (point 2). Opaque token, stored hashed in
+    # refresh_tokens; expires_at is stamped by the database clock. Provisional.
+    refresh-ttl: 7d

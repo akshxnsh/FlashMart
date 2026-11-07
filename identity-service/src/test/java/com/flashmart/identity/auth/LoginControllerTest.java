@@ -174,7 +174,7 @@ class LoginControllerTest {
     void theResponseNeverCarriesThePasswordOrHash() throws Exception {
         String body = login(EMAIL, PASSWORD).andReturn().getResponse().getContentAsString();
         JsonNode node = json.readTree(body);
-        assertEquals(Set.of("accessToken", "expiresIn"), Set.copyOf(node.propertyNames()));
+        assertEquals(Set.of("accessToken", "refreshToken", "expiresIn"), Set.copyOf(node.propertyNames()));
         assertTrue(!body.contains(PASSWORD) && !body.contains("bcrypt"));
     }
 }

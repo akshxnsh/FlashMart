@@ -1,6 +1,7 @@
 package com.flashmart.identity.auth;
 
 import com.flashmart.identity.auth.dto.LoginRequest;
+import com.flashmart.identity.auth.dto.RefreshTokenRequest;
 import com.flashmart.identity.auth.dto.SignupRequest;
 import com.flashmart.identity.auth.dto.SignupResponse;
 import com.flashmart.identity.auth.dto.TokenResponse;
@@ -25,6 +26,7 @@ public class AuthController {
 
     private final SignupService signupService;
     private final LoginService loginService;
+    private final TokenService tokenService;
 
     @PostMapping("/signup")
     @ResponseStatus(HttpStatus.CREATED)
@@ -35,5 +37,17 @@ public class AuthController {
     @PostMapping("/login")
     public TokenResponse login(@Valid @RequestBody LoginRequest request) {
         return loginService.login(request);
+    }
+
+    @PostMapping("/refresh")
+    public TokenResponse refresh(@Valid @RequestBody RefreshTokenRequest request) {
+        return tokenService.refresh(request.refreshToken());
+    }
+
+    /** Always 204 for a well-formed body: logging out an unknown or already revoked token is a no-op. */
+    @PostMapping("/logout")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void logout(@Valid @RequestBody RefreshTokenRequest request) {
+        tokenService.logout(request.refreshToken());
     }
 }

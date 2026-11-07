@@ -30,13 +30,16 @@ public class LoginService {
 
     private final JdbcTemplate jdbc;
     private final PasswordEncoder passwordEncoder;
-    private final JwtIssuer jwt;
+    private final TokenTransactions tokens;
+    private final TokenService tokenService;
     private final String dummyHash;
 
-    public LoginService(JdbcTemplate jdbc, PasswordEncoder passwordEncoder, JwtIssuer jwt) {
+    public LoginService(JdbcTemplate jdbc, PasswordEncoder passwordEncoder, TokenTransactions tokens,
+                        TokenService tokenService) {
         this.jdbc = jdbc;
         this.passwordEncoder = passwordEncoder;
-        this.jwt = jwt;
+        this.tokens = tokens;
+        this.tokenService = tokenService;
         byte[] random = new byte[16];
         new SecureRandom().nextBytes(random);
         this.dummyHash = passwordEncoder.encode(Base64.getEncoder().encodeToString(random));
@@ -49,11 +52,13 @@ public class LoginService {
         if (user == null || !matches || tooLongForBcrypt(request.password())) {
             throw new InvalidCredentialsException();
         }
-        return new TokenResponse(jwt.issueAccessToken(user.id()), jwt.accessTtlSeconds());
+        // The password check ran outside any transaction; only the token
+        // insert opens one (TokenTransactions.issue).
+        return tokenService.response(tokens.issue(user.id()));
     }
 
     /**
-     * Signup never stores a password over 72 bytes, but bcrypt's CHECK ignores
+     * Signup never stores a password over 72 bytes, but bcrypt's comparison ignores
      * every byte past 72, so "stored password + anything" would otherwise
      * match. Rejected after the hash check, so the work done is the same.
      */

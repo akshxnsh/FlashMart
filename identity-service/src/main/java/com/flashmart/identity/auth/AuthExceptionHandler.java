@@ -57,4 +57,10 @@ public class AuthExceptionHandler {
     public ErrorResponse invalidCredentials(InvalidCredentialsException ex) {
         return new ErrorResponse(ErrorCode.INVALID_CREDENTIALS, ex.getMessage());
     }
+
+    @ExceptionHandler(InvalidRefreshTokenException.class)
+    @ResponseStatus(HttpStatus.UNAUTHORIZED)
+    public ErrorResponse invalidRefreshToken(InvalidRefreshTokenException ex) {
+        return new ErrorResponse(ErrorCode.INVALID_REFRESH_TOKEN, ex.getMessage());
+    }
 }
