@@ -40,6 +40,12 @@
 			<groupId>org.springframework.cloud</groupId>
 			<artifactId>spring-cloud-starter-gateway-server-webflux</artifactId>
 		</dependency>
+		<!-- Looks services up for the lb:// routes. Fetch only: the Gateway never
+		     registers itself (application.yml). Brings Spring Cloud LoadBalancer. -->
+		<dependency>
+			<groupId>org.springframework.cloud</groupId>
+			<artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+		</dependency>
 		<!-- Verifies Identity's HS256 access tokens. CPU only, no I/O, so it is
 		     safe on the event loop. impl and the JSON binding are runtime only;
 		     jjwt-jackson uses Jackson 2 (Boot's jackson-2 BOM), as in Identity. -->

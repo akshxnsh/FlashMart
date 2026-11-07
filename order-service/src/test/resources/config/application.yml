@@ -33,3 +33,9 @@ spring:
   datasource:
     hikari:
       maximum-pool-size: 4
+
+# No Eureka client in tests: no suite needs a running Eureka server, and no
+# test context registers anything.
+eureka:
+  client:
+    enabled: false

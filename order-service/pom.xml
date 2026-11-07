@@ -49,6 +49,15 @@
 			<groupId>org.springframework.cloud</groupId>
 			<artifactId>spring-cloud-starter-openfeign</artifactId>
 		</dependency>
+		<!-- Registers with the Eureka server so the API Gateway can find this
+		     service (decisions.md, "Day 8", addendum "Gateway and discovery").
+		     Registration only: the Feign clients keep their fixed
+		     url, so they do not go through the load balancer it brings.
+		     Version from the Spring Cloud BOM. -->
+		<dependency>
+			<groupId>org.springframework.cloud</groupId>
+			<artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+		</dependency>
 		<!-- Core libraries only, wired by hand in PaymentResilienceConfig: no
 		     resilience4j Boot starter (its Boot 4 compatibility is unverified).
 		     Version 2.3.0 comes from the Spring Cloud BOM. -->

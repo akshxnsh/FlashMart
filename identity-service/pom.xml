@@ -30,8 +30,30 @@
 		<java.version>21</java.version>
 		<!-- Not managed by Boot; pinned here. -->
 		<jjwt.version>0.13.0</jjwt.version>
+		<!-- The same release train as order-service, api-gateway and
+		     eureka-server; used here only for the Eureka client. -->
+		<spring-cloud.version>2025.1.2</spring-cloud.version>
 	</properties>
+	<dependencyManagement>
+		<dependencies>
+			<dependency>
+				<groupId>org.springframework.cloud</groupId>
+				<artifactId>spring-cloud-dependencies</artifactId>
+				<version>${spring-cloud.version}</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
+	</dependencyManagement>
 	<dependencies>
+		<!-- Registers with the Eureka server so the API Gateway can find this
+		     service (decisions.md, "Day 8", addendum "Gateway and discovery").
+		     Registration only: this service calls nothing through discovery.
+		     Version from the Spring Cloud BOM. -->
+		<dependency>
+			<groupId>org.springframework.cloud</groupId>
+			<artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
+		</dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-actuator</artifactId>

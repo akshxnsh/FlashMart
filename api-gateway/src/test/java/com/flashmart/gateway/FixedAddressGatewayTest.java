@@ -2,11 +2,16 @@ package com.flashmart.gateway;
 
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
-/** {@link GatewayContractTest} with the routes pointing at fixed addresses (the stubs' ports). */
+/**
+ * {@link GatewayContractTest} through the fallback profile {@code fixed}: the
+ * routes point at fixed addresses (the stubs' ports), no discovery.
+ */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ActiveProfiles("fixed")
 @Import(GatewayContractTest.FixedClock.class)
 class FixedAddressGatewayTest extends GatewayContractTest {
 

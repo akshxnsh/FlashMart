@@ -5,3 +5,10 @@
 gateway-auth:
   jwt-secret: test-only-jwt-secret-0123456789-0123456789-0123456789-abcdefghij
   signing-secret: test-only-gateway-signing-secret-0123456789
+
+# No Eureka client in tests: lb:// routes resolve through Spring Cloud's
+# SimpleDiscoveryClient instead (spring.cloud.discovery.client.simple.*, set
+# per test class), so no test needs a running Eureka server.
+eureka:
+  client:
+    enabled: false

@@ -4,3 +4,9 @@
 # (InventoryConsumerKafkaTest turns them back on against @EmbeddedKafka).
 kafka:
   consumers-enabled: false
+
+# No Eureka client in tests: no suite needs a running Eureka server, and no
+# test context registers anything.
+eureka:
+  client:
+    enabled: false
