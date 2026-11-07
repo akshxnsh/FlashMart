@@ -4,6 +4,8 @@ package com.flashmart.order.dto;
 public enum ErrorCode {
     /** 400: a field, header or body that cannot be accepted. */
     INVALID_REQUEST,
+    /** 401: the Gateway's signed buyer identity is missing, wrong, too old or from the future. */
+    UNAUTHORIZED,
     /** 400: a quantity outside 1..5, per line or after merging duplicates. */
     INVALID_QUANTITY,
     /** 400: more distinct products than maxLines. */

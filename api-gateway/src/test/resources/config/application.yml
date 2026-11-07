@@ -1,0 +1,7 @@
+# Test-only overrides (classpath:/config/ wins over classpath:/). NOT real
+# secrets. The JWT one is 64 bytes on purpose: long enough that an HS512 token
+# signed with it would verify if the Gateway accepted HS512, so the "HS256
+# only" test means something.
+gateway-auth:
+  jwt-secret: test-only-jwt-secret-0123456789-0123456789-0123456789-abcdefghij
+  signing-secret: test-only-gateway-signing-secret-0123456789

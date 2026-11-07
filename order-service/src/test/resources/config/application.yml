@@ -4,6 +4,10 @@
 payment-webhook:
   secret: test-only-webhook-secret
 
+# Not a real secret: TestGatewayHeaders signs with it (40 bytes).
+gateway-identity:
+  signing-secret: test-only-gateway-signing-secret-0123456
+
 # No relay schedule and no topic creation in tests, so no test context talks
 # to a broker unless it asks to (OutboxRelayTest runs the relay by hand
 # against @EmbeddedKafka and turns topic creation back on).

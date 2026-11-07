@@ -112,6 +112,17 @@ order:
 payment-webhook:
   secret: ${PAYMENT_WEBHOOK_SECRET:}
 
+# The buyer identity the API Gateway signs (decisions.md, "Day 8", point 5).
+# GATEWAY_SIGNING_SECRET is held by the Gateway and Order only, never the JWT
+# secret. Blank or shorter than 32 bytes fails startup (GatewayIdentity). A
+# signed header older than max-age or more than max-future ahead of Order's
+# clock is a 401. max-age is the decision's 60 s; max-future (clock skew
+# allowance) was chosen when built. Both PROVISIONAL, unmeasured.
+gateway-identity:
+  signing-secret: ${GATEWAY_SIGNING_SECRET:}
+  max-age: 60s
+  max-future: 5s
+
 # Kafka (decisions.md, "Day 6", point 6). Locally the docker-compose broker.
 kafka:
   bootstrap: ${KAFKA_BOOTSTRAP:localhost:9092}

@@ -1,0 +1,47 @@
+server:
+  # Reserved for the Gateway since the scaffolding (architecture.md §8, Ports).
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      server:
+        webflux:
+          # NO default filters and NO Retry filter anywhere: a POST the Gateway
+          # repeats is a request the buyer never sent. Retry safety is the
+          # client resending with the same Idempotency-Key (decisions.md,
+          # "Day 8", addendum "Gateway and discovery", point 6).
+          routes:
+            # Fixed addresses (commit 1 of the build order). There is NO route
+            # for /internal/**: Order -> Inventory reserve is never routable.
+            - id: identity
+              uri: ${flashmart.routes.identity-uri}
+              predicates:
+                - Path=/api/auth/**
+            - id: order
+              uri: ${flashmart.routes.order-uri}
+              predicates:
+                - Path=/api/orders/**,/webhooks/payment
+            - id: inventory
+              uri: ${flashmart.routes.inventory-uri}
+              predicates:
+                - Path=/api/flash-sales/**,/api/products/**
+
+flashmart:
+  routes:
+    identity-uri: http://localhost:8081
+    inventory-uri: http://localhost:8082
+    order-uri: http://localhost:8083
+
+# Named gateway-auth, not gateway: Spring's relaxed binding would map the
+# environment variable GATEWAY_SIGNING_SECRET straight onto a property called
+# gateway.signing-secret, silently outranking any config file (tests included).
+gateway-auth:
+  # The same HS256 secret Identity signs with (decisions.md, "Day 8", point 1).
+  # From the environment only; blank or shorter than 32 bytes stops start-up.
+  jwt-secret: ${JWT_SECRET:}
+  # Signs the buyer id forwarded to Order (point 5). A DIFFERENT secret from the
+  # JWT one; held by the Gateway and Order only. Same start-up rule.
+  signing-secret: ${GATEWAY_SIGNING_SECRET:}
