@@ -5282,7 +5282,9 @@ and nothing is load-tested or verified under failure. (Text below is the
 design as written, except the `clock_timestamp()` correction in point 4 and the
 second accepted cost there.) Every number (token lifetimes, rate limits, the
 60 s header age, bcrypt cost, page size) is **provisional and unmeasured**; recheck
-the rate limits on Day 9. Day 7 is the last fully built piece.
+the rate limits on Day 9. Day 7 is the last fully built piece. The Gateway's
+stack and discovery are settled in the addendum "Gateway and discovery" at the
+end of this entry (also designed, not built).
 
 **Context / Problem:**
 Today anyone can call Order with any buyer id: `POST /api/orders` reads a
@@ -5471,5 +5473,140 @@ as buyer 8 by typing `X-Buyer-Id: 8`; and one script must not be able to send
   "Gateway can mint" property; the per-IP key being unfair on shared networks.
 - Tests required when built are listed in `docs/testing.md`, "Day 8 planned proofs
   (NOT run)".
+
+**DESIGNED, not built.**
+
+### Addendum (2026-11-08): Gateway and discovery
+
+**Status:** **DESIGNED, not built.** Nothing below exists in code yet. Every
+timing named here is a library default, read from the Spring Cloud `2025.1.2`
+sources (Netflix `5.0.2`, Eureka `2.0.6`, LoadBalancer `5.0.2`), **not measured**.
+
+**Context / Problem:**
+Point 5 above says the Gateway checks the JWT and signs the buyer id, but not
+what the Gateway is built on or how it finds Identity, Inventory and Order. The
+early entry "Go multi-service (Gateway + Eureka discovery) from day one" chose
+Eureka for discovery but never said who uses it. That choice matters because
+Order already calls Inventory and the payment gateway over Feign, and the Day 5
+deadlines (3 s per reserve call, the 60 s `CREATED` budget, the payment retry
+count) were derived assuming **exactly one attempt per call**. A load balancer
+that quietly retries on another instance would break that maths. Example: Order
+sends `reserve` for the last unit, the call times out at 3 s, and a load
+balancer retries it on a second Inventory instance; the deadline budget now has
+a 6 s call in it that nobody planned for.
+
+**Options Considered:**
+1. Gateway stack: (a) Spring Cloud Gateway on WebFlux (reactive); (b) Spring
+   Cloud Gateway on Web MVC (blocking, one thread per request).
+2. Who uses discovery: (a) the Gateway only; (b) the Gateway and Order's Feign
+   clients.
+3. Eureka server set-up: (a) one standalone server; (b) a peer-replicated pair.
+   Self-preservation on or off. Security on or off.
+4. Eureka timings: (a) library defaults; (b) tuned short for the demo.
+5. Behaviour when no instance is known, and when Eureka itself is down.
+6. Automatic retries in the Gateway: (a) none; (b) retry `GET`s; (c) retry
+   everything.
+7. Instance count: (a) one per service; (b) several, everywhere.
+
+**Chosen Approach (all DESIGNED, none built):**
+
+1. **Spring Cloud Gateway, reactive (WebFlux).** The Gateway spends almost all
+   its time waiting on Identity, Inventory or Order; a few event-loop threads can
+   hold thousands of waiting requests, where a blocking server needs one thread
+   each. It also ships `RedisRateLimiter`, which point 7 relies on. **Rule: no
+   blocking call ever runs in the Gateway.** Its only own work is the JWT check
+   and the HMAC (CPU only, no I/O); a JDBC call or a blocking HTTP client there
+   would stall an event-loop thread and every request queued on it.
+2. **Eureka is used by the Gateway ONLY.** Order's Feign clients
+   (Order → Inventory `reserve`, Order → payment gateway) **keep their fixed
+   URLs**. Reason: the Day 5 derived timeouts (3 s per `reserve`, the 60 s
+   `CREATED` budget, the payment retry and breaker values) assume one attempt
+   per call and no load-balancer retries. Moving Feign to discovery is allowed
+   later only after re-deriving those values and **measuring** them (they are
+   provisional and unmeasured today).
+3. **Eureka server: its own module (`eureka-server`), port `8761`, standalone**
+   (`register-with-eureka: false`, `fetch-registry: false`: a single server has
+   no peer to copy from). **Self-preservation OFF for the demo.** With only three
+   or four instances, one hard kill drops renewals below the 85 % threshold, the
+   server decides "the network is broken, not the service" and keeps the dead
+   instance listed for good. Production keeps it ON, because there a mass
+   heartbeat loss usually is a network split. **No security locally:** anyone
+   who can reach `8761` can register a fake `order-service` and receive buyers'
+   traffic (registry poisoning). Known limitation, accepted for a laptop demo.
+   (The early repo-layout entry's name `discovery-service` predates this; the
+   module is `eureka-server`.)
+4. **Keep Eureka's DEFAULT timings; set none of them.** Read from the sources of
+   the chosen versions: an instance sends a heartbeat every **30 s**; its lease
+   lasts **90 s**; the server looks for expired leases every **60 s**; the
+   server's read-only response cache refreshes every **30 s**; the Gateway
+   re-fetches the registry every **30 s**; the Gateway's LoadBalancer caches the
+   instance list for **35 s**. Eureka's own `Lease` code says a lease really
+   expires after **about 2 × 90 s**, because `renew()` already adds the duration
+   once. So a **hard-killed** instance can stay in use for **minutes** (adding
+   the steps gives roughly 180 + 60 + 30 + 30 + 35 s, about 5.5 min worst case:
+   an estimate from config, **not measured**). A **graceful** stop sends a
+   cancel, so only the caches (30 + 30 + 35 s) are left. The demo therefore uses
+   a graceful stop, or says plainly that discovery is **eventually
+   consistent**. Every value is config and can be shortened later.
+5. **No instance → `503 SERVICE_UNAVAILABLE`, body `{code, message}`**, the same
+   error shape as the rest of the Gateway. **Eureka down → the Gateway keeps
+   routing with its cached registry** (instances that were known keep working).
+   **A Gateway restarted while Eureka is down has an empty registry, so every
+   discovered route answers `503`** until Eureka is back. **Start-up order:**
+   Eureka, then Identity / Inventory / Order, then the Gateway
+   (`development.md`). A business service must still start if Eureka is down
+   (it warns and keeps retrying registration).
+6. **No automatic Gateway retries**, above all on `POST`. A `POST /api/orders`
+   retried by the Gateway after Order received it is a second request the buyer
+   never sent. Retry safety comes from the **client** resending with the same
+   `Idempotency-Key`, which Order already handles. Spring Cloud Gateway adds a
+   `Retry` filter only when one is configured; that **no retry happens by default
+   on `lb://` routes** (including any retry inside the HTTP client underneath) is
+   a claim to be **checked by a test when built**, not assumed.
+7. **One instance per service by default.** Optional demo: **two Inventory
+   instances behind `GET /api/flash-sales`**, a stateless read, so either
+   instance gives the same answer. **NEVER two Order instances:** racing between
+   Order instances is untested (the expiry sweep and the CAS writes were only
+   raced inside one process), and the outbox relay would publish rows twice.
+   Each instance registers as `${spring.application.name}:${server.port}`, so
+   two instances on different ports show up separately.
+
+**Build order (one branch):** the Gateway with **fixed addresses** first (JWT,
+signed header, Order's check), then the Eureka server, then registration and the
+switch to `lb://` routes, keeping the fixed addresses as a fallback profile.
+
+**Why:**
+- Reactive fits a component that mostly waits, and the rate limiter we already
+  chose lives there.
+- Keeping Feign on fixed URLs protects deadlines that were derived on Day 5
+  (provisional, unmeasured); discovery at the edge alone gives the learning value (registration,
+  leases, `lb://`, eventual consistency) without touching the order path's maths.
+- Defaults first, so the demo shows the real behaviour of the tool, including
+  how slow eviction is; tuning comes after measuring.
+- No retries, because only the client knows whether a request is safe to repeat,
+  and it proves that with the `Idempotency-Key`.
+
+**Trade-offs:**
+- Order cannot scale out or move ports without a config change (fixed URLs).
+- With default timings a hard-killed instance keeps receiving traffic for
+  minutes; those requests fail (`502`/`504` style errors) until eviction.
+- Self-preservation off: a real network blip could empty the registry in
+  production. Acceptable only because this is a laptop demo.
+- No Eureka security: registry poisoning is possible for anyone on the network.
+- No Gateway retry: a buyer sees an error the Gateway could sometimes have hidden.
+- The Gateway depends on Eureka at its own start-up (point 5).
+
+**Consequences:**
+- Two new modules: `api-gateway` (`8080`) and `eureka-server` (`8761`).
+- Identity, Inventory and Order gain the Eureka client (registration only);
+  their test suites must run with the client **disabled**, so no suite needs a
+  running Eureka. Notification and the payment-stub do not register.
+- The Eureka client brings Spring Cloud LoadBalancer onto Order's classpath; the
+  Feign clients keep an explicit `url`, which should bypass it. To be confirmed
+  by Order's existing tests when built.
+- All Spring Cloud modules use one release train: the one Order already uses
+  for OpenFeign (`2025.1.2`).
+- Tests required when built: the Day 8 proofs in `testing.md`, plus 503 on no
+  instance and "a `POST` is attempted exactly once".
 
 **DESIGNED, not built.**
