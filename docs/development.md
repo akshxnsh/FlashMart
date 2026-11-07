@@ -44,6 +44,16 @@
   unpublished until a relay runs.
 - The services run on the host (IDE or jar): identity 8081, inventory 8082,
   order 8083, notification 8084, payment stub 8085 (127.0.0.1 only).
+- **Start-up order once the Gateway and Eureka exist (Day 8, DESIGNED, not
+  built):** Eureka server (`8761`) first, then Identity / Inventory / Order, then
+  the API Gateway (`8080`) last. Reason: the Gateway finds services only through
+  Eureka; a Gateway started while Eureka is down has an empty registry and
+  answers `503 SERVICE_UNAVAILABLE` on every discovered route until Eureka is
+  back. A business service started before Eureka still starts (it warns and
+  retries registration). With the default Eureka timings a newly started or
+  stopped service can take tens of seconds to minutes to appear in or leave the
+  Gateway's view; stop services gracefully (not a hard kill) in a demo.
+  `decisions.md`, "Day 8", addendum "Gateway and discovery".
 
 ## Running the tests
 
