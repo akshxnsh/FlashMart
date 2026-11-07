@@ -33,6 +33,17 @@ typical marketplace "should" have it.
 
 ### Buyer
 - FR-B1: The system shall let a buyer browse active and upcoming flash sales.
+  *Design note (Day 8, **designed, not built**, no endpoint exists):* "active
+  and upcoming" means not cancelled and not yet ended (`end_time > now()` on the
+  database clock). Paged, 10 per page, ordered by start time; stock is shown only
+  as a coarse `inStock` flag, never an exact count; uncached. Accepted: a sale
+  that ends between two page requests can cause the next page to skip one.
+  `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse", point 8.
+- FR-B6 *(new, designed only, not built)*: The system shall let a buyer sign up
+  and log in, and shall tell Order who the buyer is only through a credential
+  the buyer cannot forge. Added because FR-BR1 covers brands only and no
+  requirement covered buyer authentication. Brand login is not designed.
+  `decisions.md`, "Day 8", points 1 to 6.
 - FR-B2: The system shall let a buyer attempt a purchase only while the
   relevant sale is within its active time window.
 - FR-B3: The system shall let a buyer place a single order containing
@@ -121,6 +132,12 @@ full metrics table.
 - NFR-R2: Held stock shall be reliably released when its order expires,
   even if the buyer never returns, the client crashes, or the service
   handling the purchase dies mid-flow.
+- NFR-R3 *(new, designed only, not built)*: The system shall limit how fast one
+  buyer (order endpoints) or one client address (login and signup) can send
+  requests, so that one client cannot take the shared capacity. This is
+  protection, not correctness: if the limiter is unavailable it fails open, and
+  NFR-C1 (no overselling) never depends on it. Limits are provisional
+  (`decisions.md`, "Day 8", point 7).
 
 ## 7. Constraints
 
@@ -129,7 +146,11 @@ full metrics table.
 - Payment is a real out-of-process HTTP integration (via OpenFeign to the
   Razorpay Clone service), not simulated in-process.
 - All external client traffic enters exclusively through the API Gateway;
-  no service is called directly by a client.
+  no service is called directly by a client. *Status: the Gateway is
+  **designed (Day 8), not built**, so today clients can call any service port.
+  Even once built, the service ports (`:8082`, `:8083`) stay reachable directly
+  on the host and Inventory has no auth; closing that needs a network boundary,
+  which is out of scope (`decisions.md`, "Day 8", point 5).*
 - A flash sale is fully mutable until it opens and immutable afterwards. Its
   per-product sale price, its start and end times, and its cancellation are
   all configurable by the brand (FR-BR3) only while the sale has not yet
