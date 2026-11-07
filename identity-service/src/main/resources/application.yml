@@ -20,3 +20,10 @@ spring:
       # never generates or mutates DDL. See docs/decisions.md.
       ddl-auto: validate
     show-sql: true
+
+identity:
+  password:
+    # bcrypt work factor (decisions.md, "Day 8", point 6). Each +1 doubles the
+    # time per hash. Provisional: the milliseconds per hash on this laptop are
+    # not measured.
+    bcrypt-strength: 10
