@@ -12,11 +12,13 @@
   stub both fail at startup if `PAYMENT_WEBHOOK_SECRET` is blank, and both must
   use the same value. (`docker compose` does read the repo-root `.env`, for its
   own `${...}` values.)
-- **Day 8 secrets: DESIGNED, not built, so nothing reads them yet.** When Day 8
-  is built, `JWT_SECRET` (Identity and the Gateway only) and
+- **Day 8 secrets.** `JWT_SECRET` (Identity and the Gateway only) and
   `GATEWAY_SIGNING_SECRET` (the Gateway and Order only) have **no defaults**, and
   a service that needs one **refuses to start** if it is blank, the same rule as
-  `PAYMENT_WEBHOOK_SECRET`. They must be two different values, and each pair must
+  `PAYMENT_WEBHOOK_SECRET`. **Identity reads `JWT_SECRET` now** (it signs access
+  tokens) and refuses to start if it is blank or shorter than 32 bytes, so
+  Identity needs it exported before it starts. The Gateway and Order's signed-header
+  check are designed, not built, so nothing reads `GATEWAY_SIGNING_SECRET` yet. They must be two different values, and each pair must
   match across its services. Use a random value of your own locally; never commit
   one. (`decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse".)
 

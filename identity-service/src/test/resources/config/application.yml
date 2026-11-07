@@ -1,0 +1,7 @@
+# Test-only overrides, layered over src/main/resources/application.yml
+# (classpath:/config/ wins over classpath:/). Not a real secret: it lets the
+# suite start without JWT_SECRET, and tests verify tokens with it. 40 bytes, so
+# it passes the 32-byte minimum.
+identity:
+  jwt:
+    secret: test-only-jwt-secret-0123456789abcdefghij

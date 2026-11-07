@@ -39,11 +39,15 @@ typical marketplace "should" have it.
   as a coarse `inStock` flag, never an exact count; uncached. Accepted: a sale
   that ends between two page requests can cause the next page to skip one.
   `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse", point 8.
-- FR-B6 *(new, designed only, not built)*: The system shall let a buyer sign up
+- FR-B6 *(new; partly built)*: The system shall let a buyer sign up
   and log in, and shall tell Order who the buyer is only through a credential
   the buyer cannot forge. Added because FR-BR1 covers brands only and no
   requirement covered buyer authentication. Brand login is not designed.
-  `decisions.md`, "Day 8", points 1 to 6.
+  `decisions.md`, "Day 8", points 1 to 6. *Status:* Identity's signup, login,
+  refresh and logout are **implemented and tested at MockMvc level only** (real
+  Postgres, no real HTTP, no gateway). The "credential the buyer cannot forge"
+  half (gateway, signed header, Order's check) is **designed, not built**.
+  `architecture.md` §8.
 - FR-B2: The system shall let a buyer attempt a purchase only while the
   relevant sale is within its active time window.
 - FR-B3: The system shall let a buyer place a single order containing
