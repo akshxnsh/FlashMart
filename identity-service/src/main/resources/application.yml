@@ -50,3 +50,10 @@ eureka:
     # One entry per process, so two instances on different ports register
     # separately instead of overwriting each other.
     instance-id: ${spring.application.name}:${server.port}
+    # Register 127.0.0.1, not the machine's host name. Found in the Day 8
+    # smoke run: Windows registered "<host>.mshome.net" (the Hyper-V/ICS
+    # adapter), which the Gateway's Netty DNS resolver cannot resolve, so every
+    # lb:// call was a 500 (UnknownHostException). Everything runs on one
+    # laptop; a multi-host set-up would need the real address here instead.
+    prefer-ip-address: true
+    ip-address: 127.0.0.1
