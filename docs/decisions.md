@@ -17,6 +17,12 @@
 > controllers, Kafka, Redis or security code existed and nothing was
 > load-tested; `reserve` and the Day-1 repositories have since been built (see
 > `architecture.md` §8). Kafka, Redis and security remain *designed*.
+>
+> **Correction (Day 8 docs pass):** the last sentence is out of date for Kafka.
+> The outbox relay and producer (Day 6) and Inventory's two consumers (Day 7)
+> are implemented and tested; see `architecture.md` §8. **Redis and security are
+> still designed only**; "Day 8: auth, gateway identity, rate limiting, browse"
+> (last entry) designs them and is itself **not built**.
 
 ---
 
@@ -4867,6 +4873,11 @@ is closed by a reconciliation sweep"), and, in
 - **FR-B1 (buyer browse) has no endpoint.** It waits for security and
   caching. Any future stock hint is a coarse `soldOut` flag, never an exact
   count.
+  **Correction (Day 8 docs pass):** browse is now *designed*: uncached, paged,
+  with an `inStock` flag (not an exact count). It does not wait for caching.
+  Still no endpoint (not built). See "Day 8: auth, gateway identity, rate
+  limiting, browse", point 8. The "coarse flag, never an exact count" rule
+  stands; the flag is named `inStock` there, not `soldOut`.
 - **DECIDED 2026-11-05 (implemented, tested (races mock Inventory)): see "Order creation: retries, conflicts, deadlines and Inventory failures".** **Order's handling of `RESERVATION_RELEASED`** mid-loop: stop, no CAS, no event, re-read the real status.
 - **Decided; implemented and tested (Day 4):** all three reserve "no" outcomes end the order as
   `RESERVATION_FAILED`. See "Reserve contract revised".
@@ -4897,6 +4908,9 @@ is closed by a reconciliation sweep"), and, in
   brand or a user; published `outbox` rows need a cleanup job. See "Identity's
   remaining tables". Since Day 6 Order's relay marks its own `outbox` rows
   published, so Order has the same unbuilt cleanup need (noted, not decided).
+  **Correction (Day 8 docs pass):** the signup race and the JWT subject type are
+  now *designed* (not built): "Day 8: auth, gateway identity, rate limiting,
+  browse", points 2 and 6. The outbox cleanup job is still not decided.
 - **Razorpay Clone is not built yet**, and three of its behaviours are
   requirements FlashMart's design leans on: idempotency keys honoured on
   `initiate`, idempotency keys honoured on `refund`, and a payment-status
@@ -5241,6 +5255,13 @@ each consumer and the sweep use them.
 - Topics stay single-partition. Key = order id already keeps one order's events
   in order; more partitions would only help scaling. Noted as a limitation.
 - Closes the expiry-sweep part of A3. The refund-index part and A2 stay open.
+- **Correction (Day 8 docs pass):** this entry's "no Kafka dependency and no
+  consumer yet" (first bullet above) and "Nothing here is implemented or tested"
+  (next bullet) are the original design-time wording and are out of date. The
+  Status line at the top of this entry is current: Inventory's consumers, the
+  sweep (with drain loop), V9 and Version A of the republish are implemented and
+  tested (`architecture.md` §8); the reconciler and the reconciliation sweep are
+  designed only.
 - **Nothing here is implemented or tested.** Tests required when built: a
   duplicate `OrderCancelled` adds no stock the second time; a `CONFIRMED`
   reservation is not released; a duplicate `PaymentConfirmed` is quiet; confirm
@@ -5249,3 +5270,192 @@ each consumer and the sweep use them.
   states and never for `PAID`; two sweep instances on one order write one outbox
   row; the sweep racing a payment start gives one winner; `EXPLAIN` shows the
   partial index in use.
+
+## Decision: Day 8: auth, gateway identity, rate limiting, browse
+
+**Status:** **DESIGNED, not built.** Nothing in this entry is implemented, tested,
+load-tested or verified under failure. No gateway module, no Identity endpoint, no
+Spring Security, no Redis use and no browse endpoint exists yet (`architecture.md`
+§8 is the status source of truth). Every number (token lifetimes, rate limits, the
+60 s header age, bcrypt cost, page size) is **provisional and unmeasured**; recheck
+the rate limits on Day 9. Day 7 is the last built piece.
+
+**Context / Problem:**
+Today anyone can call Order with any buyer id: `POST /api/orders` reads a
+temporary, forgeable `X-Buyer-Id` header (Day 4 TODO). Buyers cannot sign up or
+log in (Identity has entities only, and the seeded users have placeholder hashes
+that can never match). Nothing limits how fast one client can hit Order, and
+FR-B1 (browse) has no endpoint. Day 8 has to answer four linked questions: who is
+the caller, how does Order learn that safely, how fast may they call, and what may
+a buyer see before they buy. Example: buyer 7 must not be able to place an order
+as buyer 8 by typing `X-Buyer-Id: 8`; and one script must not be able to send
+10,000 order requests a second just because it holds a valid login.
+
+**Options Considered:**
+1. Token signing: (a) HS256 with a shared secret; (b) RS256 with a key pair;
+   (c) opaque session ids looked up in a store.
+2. Token contents and lifetime: (a) one long-lived token; (b) a short access token
+   plus a refresh token.
+3. Refresh token storage: (a) Redis; (b) Postgres in Identity; (c) stateless
+   (a long-lived JWT).
+4. Refresh rotation: (a) none, reuse the same token for 7 days; (b) rotate with a
+   compare-and-set, no grace window; (c) rotate with a short grace window.
+5. How Order learns the buyer: (a) Order validates the JWT itself; (b) the Gateway
+   validates it and forwards a plain `X-Buyer-Id`; (c) the Gateway validates it and
+   forwards `X-Buyer-Id` plus a signature.
+6. Passwords and signup: bcrypt cost, and how a lost signup race is reported.
+7. Rate limiting: (a) Spring Cloud Gateway `RedisRateLimiter` (token bucket);
+   (b) a hand-written Redis counter; (c) none until Day 9. And what happens when
+   Redis is down: fail open or fail closed.
+8. Browse: (a) offset paging; (b) cursor paging; (c) no paging with a cap;
+   (d) cached or uncached.
+
+**Chosen Approach (all decided, none built):**
+
+1. **JWT, HS256.** The secret comes from the `JWT_SECRET` environment variable.
+   Only Identity (signs) and the Gateway (verifies) hold it, and **both refuse to
+   start if it is blank**, the same rule as `PAYMENT_WEBHOOK_SECRET`. Rejected:
+   RS256, because the point of a key pair is that the verifier cannot sign, and
+   here both parties are services we own and deploy together. Rejected: opaque
+   session ids, because every request would need a store lookup.
+2. **Lifetimes and claims.** Access token 15 minutes, refresh token 7 days, both
+   config values. Claims are exactly `sub` (the id), `typ` (`user` or `brand`),
+   `iat`, `exp` and nothing else. `typ` exists because brand 7 and user 7 share an
+   id (they are separate tables). **Only `user` tokens are issued on Day 8**; the
+   Gateway rejects any token whose `typ` is not `user` on `/api/orders/**`. Brand
+   login is not designed here (brands and users cannot share a login endpoint;
+   `architecture.md` §4, Identity).
+3. **Refresh token = an opaque random value, stored as a hash only, in Postgres.**
+   Identity migration **V8** adds `refresh_tokens(id, user_id, token_hash UNIQUE,
+   expires_at, revoked_at, created_at)`, all times `TIMESTAMPTZ`. The database
+   never holds a usable token, so a leaked table cannot be replayed. Postgres, not
+   Redis: refresh is a cold path (once per 15 minutes per buyer), and what we need
+   is durability and a revoke that commits in the same transaction as the new
+   token, not speed. Cleaning up expired rows is **designed only** (no job, no
+   decision on its schedule), the same open item as the outbox cleanup.
+4. **Rotate every refresh token with a compare-and-set:**
+   `UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = ? AND
+   revoked_at IS NULL AND expires_at > now()`. **1 row** = this call won: issue a
+   new access + refresh pair in the same transaction. **0 rows** = look the hash
+   up: if the row exists and is already revoked, that token is being **reused**,
+   so revoke **all** of that user's refresh tokens; if it is unknown or only
+   expired, answer `401` and change nothing. **No grace window.** Endpoints:
+   signup, login, refresh, logout (logout is the same CAS on the presented token;
+   a repeated logout must be harmless, its exact response is chosen when built).
+   **No access-token revocation:** an access token stays valid until its 15
+   minutes end. Accepted: two browser tabs refreshing with the same token at the
+   same moment look exactly like theft, so the loser's tab logs the buyer out
+   everywhere. We chose a rule that is safe and sometimes annoying over a grace
+   window that makes stolen-token reuse harder to see.
+5. **The Gateway validates the JWT once, then signs the buyer id for Order.** It
+   strips any client-supplied `X-Buyer-Id`, then forwards `X-Buyer-Id` plus an
+   `HMAC-SHA256` over the buyer id and a timestamp (header names and the
+   separator in the signed text are chosen when built; the signed text must have
+   a delimiter, so buyer `1` at time `23` and buyer `12` at time `3` cannot
+   produce the same input). The key is a **separate** secret,
+   `GATEWAY_SIGNING_SECRET`, held only by the Gateway and Order, so a leak of the
+   JWT secret does not let someone sign buyer ids and the reverse. Order answers
+   `401` for a missing signature, a bad signature, or a timestamp older than 60 s,
+   and **refuses to start with a blank secret**. The payment webhook keeps its own
+   HMAC (`PAYMENT_WEBHOOK_SECRET`) and no JWT. `/internal/**` is never routed
+   through the Gateway. **Limit, stated plainly:** Inventory (`:8082`) and Order
+   (`:8083`) are still reachable directly on localhost, and Inventory has no auth
+   at all, so this design protects the front door only. Anyone who can reach a
+   service port directly can skip the Gateway (Order still rejects an unsigned
+   request; Inventory does not). Closing it needs a network boundary, which is out
+   of scope here. A signed header can also be replayed for up to 60 s.
+6. **Passwords.** bcrypt through Spring's `DelegatingPasswordEncoder` (so the hash
+   carries its own algorithm id and cost can change later), cost 10 (config),
+   password length 8 to 72 **bytes** (bcrypt ignores everything past 72 bytes, so
+   a longer password would silently be a shorter one). Email is trimmed and
+   lowercased **before insert and before lookup**, which is what
+   `ck_users_email_normalized` already requires. **Signup race:** two simultaneous
+   signups with the same email: the loser's insert fails with SQLState `23505` on
+   `uk_users_email`; map it to `409` "email already taken", never a `500`
+   (the same catch-any-`23505` rule as Order's create). **Login** answers the same
+   `401` for an unknown email and a wrong password, and for an unknown email it
+   still checks the password against a dummy hash, so response time does not tell
+   an attacker which emails exist. **Seeded users keep their unusable
+   placeholder hashes**; they cannot log in.
+7. **Rate limiting: `RedisRateLimiter` (a token bucket) in the Gateway.**
+   `/api/orders/**` is limited **per buyer id** at **5 requests/s, burst 10**;
+   `/api/auth/**` is limited **per client IP** at **1/s, burst 5**. The JWT filter
+   runs **before** the limiter, because the order key is the buyer id read from
+   the validated token. Browse is not limited. **If Redis is down the limiter
+   fails open** (requests pass). Reason: the limiter is protection, not
+   correctness; it does **not** prevent overselling, which the conditional
+   `UPDATE` in Inventory guarantees on its own. The fail-open behaviour of the
+   chosen limiter is a claim to be checked when built, not assumed. **Day 9
+   trap:** the oversell load test (5,000 concurrent requests, 500 units) must use
+   many different buyers, or a raised limit, or almost every request will be a
+   `429` before it reaches Inventory and the test will measure the limiter.
+8. **Browse: `GET /api/flash-sales?page=N`** in Inventory. `page` is 0-based and
+   the page size is fixed at 10 (no earlier page-size cap exists in these docs to
+   replace). Rows shown: not `CANCELLED` and `end_time > now()`, with `now()` from
+   the database clock as in `reserve`, ordered by `start_time, id`. So a sale
+   shows from creation until it ends: scheduled and live, never ended or
+   cancelled. It reuses the existing `FlashSaleResponse`, `FlashSaleItemResponse`
+   and `FlashSaleState`. Stock is a coarse **`inStock` flag, never an exact
+   number**. `hasNext` comes from asking for 11 rows and returning 10, so there is
+   no `COUNT(*)`. Items load in **one extra query** for the page's sales (not one
+   per sale). A bad `page` (negative, not a number) is `400 INVALID_REQUEST`.
+   **Uncached.** Rejected: caching, until a measurement says browse needs it.
+   Accepted: offset paging can skip a sale. If a sale ends between a buyer's
+   page 0 and page 1, every later row moves up one place and the first row of the
+   next page is skipped. A cursor (`start_time, id` of the last row seen) is the
+   fix at scale; not built, not needed at this size.
+
+**Why:**
+- The risk on the order path is a forged buyer id, so the Gateway checks the JWT
+  once and Order checks only a cheap signature. Order never needs the JWT secret.
+- Two secrets mean two separate blast radii. A leaked `JWT_SECRET` forges logins
+  but cannot make Order trust a buyer id; a leaked `GATEWAY_SIGNING_SECRET` cannot
+  mint a token.
+- A refresh CAS makes "who used this token first" one atomic row update, the same
+  idea as the order-status CAS: the loser knows it lost. Hashing means the table is
+  not a list of working credentials.
+- Failing open keeps buying possible during a Redis outage, which matters more than
+  the limit. Overselling is stopped by the database, not the limiter.
+- Browse is read-only and cheap at 10 rows; a cache would add an invalidation
+  problem (a sale cancelled or ending must vanish at once) for no measured gain.
+
+**Trade-offs:**
+- HS256: the Gateway **can mint tokens**, not just check them. If the Gateway is
+  compromised, so are all logins. Accepted: we own both sides.
+- Point 4: the two-tab race logs the buyer out everywhere. Access tokens cannot be
+  revoked early: a stolen access token works for up to 15 minutes.
+- Point 5: `:8082` and `:8083` stay reachable directly; Inventory has no auth.
+  Replay of a signed header works for 60 s.
+- Point 7: the per-IP key on `/api/auth/**` is unfair on a shared network (one
+  office or one mobile carrier can lock out its neighbours at 1 request/s). Fail
+  open means a Redis outage removes all limits. The 5/s per buyer value is a guess.
+- Point 8: offset paging can skip a sale (above). `inStock` hides how much is left.
+- bcrypt at cost 10 on the signup/login path is deliberately slow; the cost in
+  milliseconds on this laptop is **not measured**.
+
+**Consequences:**
+- New required environment variables: `JWT_SECRET` (Identity, Gateway) and
+  `GATEWAY_SIGNING_SECRET` (Gateway, Order). No defaults, a blank value stops
+  start-up. `.env.example` and `development.md` list them.
+- Identity gets migration **V8** (`refresh_tokens`), the first signup/login/
+  refresh/logout code, and Spring Security (or equivalent) for bcrypt; Identity
+  still publishes `UserUpserted` on signup (existing rule).
+- A new Gateway module on port `8080` (reserved until now). Spring Cloud Gateway
+  and its Redis dependency are first used here.
+- **Redis is used for the first time.** The compose Redis has never been started
+  (`development.md`).
+- Order drops the forgeable `X-Buyer-Id` as a trusted input: it will accept the
+  header only with a valid signature.
+- Inventory gains its first public read endpoint (`GET /api/flash-sales`).
+- **Day 9 trap (also in point 7):** the oversell load test needs many buyers or a
+  raised limit. Because seeded users cannot log in, the load test also needs real
+  signups or a seed that writes real bcrypt hashes; not decided.
+- Supersedes the "temporary, forgeable `X-Buyer-Id`" TODO (`architecture.md` §8,
+  Day 4), the "FR-B1 waits for security and caching" open item and the Identity
+  API-phase open item (Correction pointers added on each; their text is unchanged).
+- **Limits of this design, in one list:** items 4, 5, 7 and 8 above; the HS256
+  "Gateway can mint" property; the per-IP key being unfair on shared networks.
+- Tests required when built are listed in `docs/testing.md`, "Day 8 planned proofs
+  (NOT run)".
+
+**DESIGNED, not built.**
