@@ -41,6 +41,24 @@ class JwtSecretStartupTest {
         assertTrue(causedByJwtSecret(failure), "failed, but not because of the secret: " + failure);
     }
 
+    /**
+     * The one case only the blank check covers: 40 spaces pass the 32-byte
+     * length check, so only "is blank" can refuse them. The message must say
+     * "blank", which proves the blank check (not the length check) fired.
+     */
+    @Test
+    void secretOfOnlySpacesLongerThan32BytesStopsStartupAsBlank() {
+        Throwable failure = startWith("--identity.jwt.secret=" + " ".repeat(40));
+        boolean blank = false;
+        for (Throwable c = failure; c != null; c = c.getCause()) {
+            if (c instanceof IllegalStateException && c.getMessage() != null
+                    && c.getMessage().contains("identity.jwt.secret is blank")) {
+                blank = true;
+            }
+        }
+        assertTrue(blank, "failed, but not with the blank-secret message: " + failure);
+    }
+
     @Test
     void secretShorterThan32BytesStopsStartup() {
         Throwable failure = startWith("--identity.jwt.secret=" + "x".repeat(31));
