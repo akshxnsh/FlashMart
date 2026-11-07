@@ -27,3 +27,9 @@ identity:
     # time per hash. Provisional: the milliseconds per hash on this laptop are
     # not measured.
     bcrypt-strength: 10
+  jwt:
+    # HS256 key, from JWT_SECRET (decisions.md, "Day 8", point 1). No default:
+    # a blank or shorter-than-32-byte value stops start-up (JwtIssuer).
+    secret: ${JWT_SECRET:}
+    # Access token lifetime (point 2). Provisional.
+    access-ttl: 15m

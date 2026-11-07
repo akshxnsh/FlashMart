@@ -51,4 +51,10 @@ public class AuthExceptionHandler {
     public ErrorResponse emailTaken(EmailTakenException ex) {
         return new ErrorResponse(ErrorCode.EMAIL_TAKEN, ex.getMessage());
     }
+
+    @ExceptionHandler(InvalidCredentialsException.class)
+    @ResponseStatus(HttpStatus.UNAUTHORIZED)
+    public ErrorResponse invalidCredentials(InvalidCredentialsException ex) {
+        return new ErrorResponse(ErrorCode.INVALID_CREDENTIALS, ex.getMessage());
+    }
 }

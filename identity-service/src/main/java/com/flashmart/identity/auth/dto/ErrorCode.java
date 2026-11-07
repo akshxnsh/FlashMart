@@ -4,5 +4,7 @@ public enum ErrorCode {
     /** 400 for a bad field or unreadable body; 415 for a body that is not JSON. */
     INVALID_REQUEST,
     /** 409: the email belongs to another user. */
-    EMAIL_TAKEN
+    EMAIL_TAKEN,
+    /** 401: unknown email or wrong password, deliberately indistinguishable. */
+    INVALID_CREDENTIALS
 }
