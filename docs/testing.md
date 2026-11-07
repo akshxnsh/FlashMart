@@ -983,3 +983,264 @@ test.
 - Start-up through the real `JWT_SECRET` environment variable: tests set the
   `identity.jwt.secret` property directly.
 - Expired-row cleanup of `refresh_tokens` (designed only, no job).
+
+## Day 8 gateway and Eureka: smoke run on real processes (2026-11-08)
+
+**Label: run once (run 3 below), on one laptop, in a Claude Code session.** Real
+processes: `eureka-server`, Identity, Inventory, Order, `api-gateway`, all from
+their jars. Not load-tested, no Kafka, no payment-stub, one instance of each
+service. Every number below is one measurement from that one run, not an
+average. Branch `feat/day8-gateway-eureka`.
+
+### Setup
+
+- Jars built with `./mvnw -DskipTests package` in each module.
+- Start order as designed (`development.md`): Eureka, then Identity / Inventory
+  / Order, then the Gateway.
+- Order started with `--outbox.relay.enabled=false --kafka.create-topics=false
+  --order.sweep.enabled=false`, Inventory with `--kafka.consumers-enabled=false`
+  (and the actuator `shutdown` endpoint exposed, for the graceful stop). No
+  broker needed.
+- `JWT_SECRET` and `GATEWAY_SIGNING_SECRET`: random per run, exported only to
+  the processes. DB credentials and `PAYMENT_WEBHOOK_SECRET` from `.env`.
+- Eureka timings: the library defaults, nothing set (`decisions.md`, "Day 8",
+  addendum "Gateway and discovery", point 4).
+- "Hard kill" is `taskkill /F` on the `java.exe` PID (TerminateProcess: no
+  shutdown hook, so no deregistration). Each hard kill was confirmed by the port
+  closing.
+
+### Results (run 3)
+
+| Step | Result |
+|---|---|
+| Registry after start | `IDENTITY-SERVICE`, `INVENTORY-SERVICE`, `ORDER-SERVICE` listed, 71.9 s after the three were launched (they took 42.0 s to open their ports on this laptop) |
+| Signup, then login, through `:8080` | `201` (user id 2031), then `200`; first try, 17.9 s after the Gateway was launched |
+| `POST /api/orders` through `:8080` with the login token, the client ALSO sending `X-Buyer-Id: 1` | Reached Order: `409 RESERVATION_FAILED` (`ITEM_NOT_IN_SALE`; sale 999999 does not exist, on purpose). The row `orders.id=75366` has `buyer_id=2031`: the signed-up user, not the forged 1 |
+| `POST :8083/api/orders` directly, bare `X-Buyer-Id` | `401 {"code":"UNAUTHORIZED","message":"missing gateway identity headers"}` |
+| `GET /api/flash-sales` through `:8080`, Inventory up | `404` from Inventory itself (browse is not built), so the route reached it |
+| **Graceful stop** of Inventory (actuator shutdown) | Process gone after 3.0 s; **gone from Eureka's `/eureka/apps` after 7.8 s**; the Gateway answered `503 SERVICE_UNAVAILABLE` from 8.0 s |
+| Inventory restarted | Listed again after 29.6 s; the Gateway routed to it again after 46.2 s |
+| **Hard kill** of Inventory | Port closed after 3.6 s; **stayed listed in Eureka for 224.3 s** (3 min 44 s) after the kill |
+| No Inventory instance: `GET /api/flash-sales` through `:8080` | `503 {"code":"SERVICE_UNAVAILABLE","message":"no instance of the target service is available"}` |
+| **Eureka hard-killed** while everything else runs | 7.7 s later: login through `:8080` `200`; `POST /api/orders` reached Order (`503 INVENTORY_UNAVAILABLE` from Order itself, because Inventory was still dead); 68.4 s later (past one 30 s fetch and one 35 s LoadBalancer cache period) login still `200` |
+
+### What it shows
+
+- The Gateway's JWT check and signed header work end to end on real
+  processes: Order stored the buyer from the token, and a client-sent
+  `X-Buyer-Id` changed nothing.
+- Order refuses a direct call that carries only a bare `X-Buyer-Id`.
+- A graceful stop leaves the registry in seconds (7.8 s here).
+- A hard-killed instance stays listed for minutes with the default timings
+  (224.3 s here). That is shorter than the "about 5.5 min worst case" estimate
+  in the addendum, which assumed every timer lands at its worst point. It is
+  one run, not a bound.
+- With Eureka down, the Gateway keeps routing from its cached registry, at
+  least for the 68 s measured.
+
+### Surprises
+
+- **Run 1 and run 2 failed, and run 1 found a real bug.** The services
+  registered under the Windows host name `<host>.mshome.net` (the Hyper-V/ICS
+  adapter, `172.20.16.1`). The Gateway's Netty DNS resolver cannot resolve that
+  name, so every `lb://` call was a `500` with nothing in the log
+  (`UnknownHostException`, found after adding logging). Fixed in commit
+  `fix(discovery)`: the services register `127.0.0.1`
+  (`eureka.instance.prefer-ip-address`), and the Gateway now logs any error it
+  turns into a `500`. **The test suites could not see this:** they use static
+  discovery with `127.0.0.1` URIs.
+- Run 2's hard-kill and Eureka-down numbers were **invalid and are not
+  reported**. `kill -9` from Git Bash killed only the MSYS wrapper; the
+  `java.exe` kept running (Inventory still answered its own `404` while
+  "killed"). The script now uses `taskkill /F` and checks the port closes. The
+  same run's wait also outlived the 15-minute access token, so the script now
+  logs in again before each later step.
+- **While a hard-killed instance is still listed, the Gateway also answers
+  `503 SERVICE_UNAVAILABLE` with the message "no instance of the target service
+  is available"**, because a refused connection is mapped to the same `503`.
+  The status is right, but the message is wrong for that case, and a client
+  cannot tell "no instance" from "instance listed but dead". Not changed.
+
+### Not covered
+
+- Load, more than one instance of any service (the optional two-Inventory demo
+  was not run), a real network between hosts, a Gateway restarted while Eureka
+  is down (designed to give `503`s; not run), Eureka down for longer than 68 s.
+- A hard kill was measured once; the listed time depends on where the
+  heartbeat, eviction and cache timers happen to be.
+- No Kafka, no payment-stub, no successful order (no sale existed). No webhook
+  through the real Gateway to the real Order (the webhook pass-through is
+  covered by the Gateway tests against a stub).
+- Brand tokens: Identity issues none, so the `403` was tested only in the
+  Gateway tests.
+
+### Left behind after the run
+
+Nothing: all five processes stopped, and the script deletes the smoke user
+(and its refresh tokens) from Identity and its orders, items and outbox rows
+from Order. Checked after the run: 0 rows left.
+
+### The script
+
+```bash
+#!/usr/bin/env bash
+# Day 8 gateway + Eureka smoke run (docs/testing.md). Real processes on one
+# laptop: eureka-server, identity, inventory, order, api-gateway. No Kafka:
+# Order runs with the relay and topic creation off, Inventory with its
+# consumers off. Secrets: DB and webhook from the repo-root .env (never
+# printed); JWT_SECRET and GATEWAY_SIGNING_SECRET are random per run.
+# Jars must be built first (./mvnw -DskipTests package in each module).
+set -u
+ROOT="C:/Coding Shuttle/FlashMart"
+OUT="${SMOKE_OUT:-$TMP/day8-smoke}"
+mkdir -p "$OUT"
+cd "$ROOT" || exit 1
+set -a; . ./.env; set +a
+export JWT_SECRET="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')"
+export GATEWAY_SIGNING_SECRET="$(python -c 'import secrets;print(secrets.token_urlsafe(48))')"
+
+trap 'for n in gateway identity order inventory inventory2 eureka; do hardkill $n; done' EXIT
+GW=http://127.0.0.1:8080
+EU=http://127.0.0.1:8761
+now() { date +%s.%N; }
+since() { python -c "import sys;print(f'{float(sys.argv[2])-float(sys.argv[1]):.1f}')" "$1" "$(now)"; }
+# A port is "up" if anything answers HTTP on it (netstat does not list the
+# java listeners in every shell, so it is not used).
+up() { [ "$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:$1/")" != 000 ]; }
+log() { echo "[$(date +%H:%M:%S)] $*"; }
+status() { curl -s -o "$OUT/body.txt" -w '%{http_code}' "$@"; }
+listed() { curl -s -H 'Accept: application/json' "$EU/eureka/apps" | grep -o "\"instanceId\":\"$1\"" | head -1; }
+jsonget() { python -c "import sys,json;print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$(cygpath -w "$OUT/body.txt")" "$1"; }
+wait_port() { for _ in $(seq 1 240); do up "$1" && return 0; sleep 0.5; done; return 1; }
+
+start() { # name jar args...
+    local name=$1 jar=$2; shift 2
+    java -jar "$jar" "$@" > "$OUT/$name.log" 2>&1 &
+    eval "JAR_$name=$(basename "$jar")"
+}
+# The Windows PID of the java.exe running a jar. kill -9 from Git Bash only
+# kills the MSYS wrapper and leaves java running (seen in run 2), so a hard
+# kill is taskkill /F (TerminateProcess: no shutdown hooks, no deregistration).
+winpid_of() { powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*$1*' }).ProcessId" | tr -d ''; }
+hardkill() { local v="JAR_$1"; [ -n "${!v:-}" ] || return 0; for pid in $(winpid_of "${!v}"); do taskkill //F //PID "$pid" > /dev/null; done; return 0; }
+# A fresh access token (they live 15 min, and the hard-kill wait can be longer).
+fresh_token() { status -X POST "$GW/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" > /dev/null; TOKEN=$(jsonget accessToken); }
+
+log "start eureka-server"
+start eureka eureka-server/target/eureka-server-0.0.1-SNAPSHOT.jar
+wait_port 8761 || { log "eureka did not start"; exit 1; }
+until [ "$(status -H 'Accept: application/json' "$EU/eureka/apps")" = 200 ]; do sleep 0.5; done
+log "eureka up"
+
+T_SVC=$(now)
+start identity identity-service/target/identity-service-0.0.1-SNAPSHOT.jar
+start inventory inventory-service/target/inventory-service-0.0.1-SNAPSHOT.jar --kafka.consumers-enabled=false \
+    --management.endpoints.web.exposure.include=health,shutdown --management.endpoint.shutdown.access=unrestricted
+start order order-service/target/order-service-0.0.1-SNAPSHOT.jar --outbox.relay.enabled=false \
+    --kafka.create-topics=false --order.sweep.enabled=false
+for p in 8081 8082 8083; do wait_port $p || { log "port $p did not open"; exit 1; }; done
+log "identity, inventory, order listening after $(since "$T_SVC") s"
+until [ -n "$(listed identity-service:8081)" ] && [ -n "$(listed inventory-service:8082)" ] && [ -n "$(listed order-service:8083)" ]; do sleep 1; done
+log "RESULT registry lists all 3 services, $(since "$T_SVC") s after they were started"
+curl -s -H 'Accept: application/json' "$EU/eureka/apps" > "$OUT/registry.json"
+python -c "import json;a=json.load(open(r'$(cygpath -w "$OUT/registry.json")'))['applications']['application'];print('   apps:', sorted(x['name'] for x in a))"
+
+T_GW=$(now)
+start gateway api-gateway/target/api-gateway-0.0.1-SNAPSHOT.jar
+wait_port 8080 || { log "gateway did not start"; exit 1; }
+log "gateway listening after $(since "$T_GW") s"
+
+EMAIL="smoke-$(date +%s)@example.com"
+PASS='smoke-password-123'
+until [ "$(status -X POST "$GW/api/auth/signup" -H 'Content-Type: application/json' \
+        -d "{\"name\":\"Smoke\",\"email\":\"$EMAIL\",\"password\":\"$PASS\"}")" = 201 ]; do
+    [ "$(since "$T_GW" | cut -d. -f1)" -gt 120 ] && { log "signup never succeeded: $(cat "$OUT/body.txt")"; exit 1; }
+    sleep 1
+done
+USER_ID=$(jsonget id)
+log "RESULT signup through :8080 -> 201, user id $USER_ID ($(since "$T_GW") s after gateway start)"
+S=$(status -X POST "$GW/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}")
+TOKEN=$(jsonget accessToken)
+log "RESULT login through :8080 -> $S"
+
+S=$(status -X POST "$GW/api/orders" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -H "Idempotency-Key: smoke-$(date +%s)" -H 'X-Buyer-Id: 1' \
+    -d '{"flashSaleId":999999,"items":[{"productId":1,"quantity":1}]}')
+log "RESULT POST /api/orders through :8080 (client also sent X-Buyer-Id: 1) -> $S $(cat "$OUT/body.txt")"
+ORDER_ID=$(jsonget orderId 2>/dev/null || echo "")
+if [ -n "$ORDER_ID" ]; then
+    BUYER=$(PGPASSWORD="$DB_PASSWORD" psql -h localhost -U "$DB_USERNAME" -d order-service -tAc "select buyer_id from orders where id=$ORDER_ID")
+    log "RESULT orders.id=$ORDER_ID has buyer_id=$BUYER (signed-up user id $USER_ID)"
+fi
+
+S=$(status -X POST http://127.0.0.1:8083/api/orders -H 'Content-Type: application/json' -H 'Idempotency-Key: smoke-direct' \
+    -H "X-Buyer-Id: $USER_ID" -d '{"flashSaleId":999999,"items":[{"productId":1,"quantity":1}]}')
+log "RESULT direct POST :8083/api/orders with a bare X-Buyer-Id -> $S $(cat "$OUT/body.txt")"
+
+S=$(status "$GW/api/flash-sales" -H "Authorization: Bearer $TOKEN")
+log "RESULT GET /api/flash-sales through :8080 with Inventory up -> $S (Inventory has no browse endpoint yet, so its own 404 proves the route reached it)"
+
+# --- graceful stop of Inventory ---
+T0=$(now)
+curl -s -X POST http://127.0.0.1:8082/actuator/shutdown > /dev/null
+log "inventory: graceful shutdown requested"
+while up 8082; do sleep 0.2; done
+log "inventory process gone after $(since "$T0") s"
+until [ -z "$(listed inventory-service:8082)" ]; do sleep 0.5; done
+log "RESULT graceful stop: gone from Eureka's /eureka/apps after $(since "$T0") s"
+until [ "$(status "$GW/api/flash-sales" -H "Authorization: Bearer $TOKEN")" = 503 ]; do sleep 0.5; done
+log "RESULT gateway answers 503 after $(since "$T0") s: $(cat "$OUT/body.txt")"
+
+# --- restart, then hard kill ---
+T0=$(now)
+start inventory2 inventory-service/target/inventory-service-0.0.1-SNAPSHOT.jar --kafka.consumers-enabled=false
+wait_port 8082
+until [ -n "$(listed inventory-service:8082)" ]; do sleep 0.5; done
+log "inventory restarted, listed again after $(since "$T0") s"
+until [ "$(status "$GW/api/flash-sales" -H "Authorization: Bearer $TOKEN")" = 404 ]; do sleep 0.5; done
+log "RESULT gateway routes to the restarted Inventory again after $(since "$T0") s"
+
+T0=$(now)
+hardkill inventory2
+while up 8082; do sleep 0.2; done
+log "inventory: HARD kill (taskkill /F); port 8082 closed after $(since "$T0") s"
+SEEN=""
+while [ -n "$(listed inventory-service:8082)" ]; do
+    fresh_token
+    S=$(status "$GW/api/flash-sales" -H "Authorization: Bearer $TOKEN")
+    [ "$S" != "$SEEN" ] && { log "   while still listed, gateway answers $S $(cat "$OUT/body.txt")"; SEEN=$S; }
+    [ "$(since "$T0" | cut -d. -f1)" -gt 900 ] && { log "still listed after 900 s, giving up"; break; }
+    sleep 2
+done
+log "RESULT hard kill: inventory stayed listed in Eureka for $(since "$T0") s"
+fresh_token
+T1=$(now)
+until [ "$(status "$GW/api/flash-sales" -H "Authorization: Bearer $TOKEN")" = 503 ] && grep -q "no instance" "$OUT/body.txt"; do sleep 1; done
+log "RESULT after it left the registry, the gateway answered 503 after another $(since "$T1") s"
+S=$(status "$GW/api/flash-sales" -H "Authorization: Bearer $TOKEN")
+log "RESULT no Inventory instance: GET /api/flash-sales through :8080 -> $S $(cat "$OUT/body.txt")"
+
+# --- Eureka down ---
+hardkill eureka
+T0=$(now)
+while up 8761; do sleep 0.2; done
+log "eureka: HARD kill; port 8761 closed"
+fresh_token
+sleep 5
+S=$(status -X POST "$GW/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}")
+log "RESULT Eureka down $(since "$T0") s: login through :8080 -> $S"
+S=$(status -X POST "$GW/api/orders" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -H "Idempotency-Key: smoke-eu-$(date +%s)" -d '{"flashSaleId":999999,"items":[{"productId":1,"quantity":1}]}')
+log "RESULT Eureka down $(since "$T0") s: POST /api/orders through :8080 -> $S $(cat "$OUT/body.txt")"
+sleep 60
+S=$(status -X POST "$GW/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}")
+log "RESULT Eureka down $(since "$T0") s (past one 30 s fetch and one 35 s cache period): login through :8080 -> $S"
+
+# --- clean up ---
+for n in gateway identity order inventory inventory2 eureka; do hardkill $n; done
+PGPASSWORD="$DB_PASSWORD" psql -h localhost -U "$DB_USERNAME" -d order-service -q -c \
+  "delete from outbox where aggregate_id in (select id from orders where buyer_id=$USER_ID); delete from order_items where order_id in (select id from orders where buyer_id=$USER_ID); delete from orders where buyer_id=$USER_ID;"
+PGPASSWORD="$DB_PASSWORD" psql -h localhost -U "$DB_USERNAME" -d identity-service -q -c \
+  "delete from refresh_tokens where user_id=$USER_ID; delete from users where id=$USER_ID;"
+log "cleaned up: processes stopped, smoke user and orders deleted"
+```
