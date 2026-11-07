@@ -955,3 +955,31 @@ units) must use many different buyers or a raised limit, or it will mostly measu
 `429`s from proof 3's limiter. Seeded users cannot log in (unusable password
 hashes), so the test needs real signups or a seed with real bcrypt hashes; not
 decided.
+
+## Day 8 Identity: built and tested, and what was not tested
+
+**Label: implemented and tested at MockMvc level on real Postgres, on branch
+`feat/day8-identity-auth` (not merged).** The Identity suite ran **116** tests,
+all passing, in a Claude Code session after signup, login, refresh/logout and V8
+were built, and **117** after a start-up test for a space-only `JWT_SECRET` was
+added (same session; 0 failures, 0 errors, 0 skipped). Identity was 47 before
+Day 8. The other services' counts were not re-run. No HTTP process, no gateway,
+no load. Break-and-restore was done on the signup `23505` mapping, the refresh
+CAS conditions, the reuse revoke-all (including its commit) and the start-up
+secret check; the blank-secret check was only partly covered until the 117th
+test.
+
+**NOT tested:**
+- A real HTTP process or the gateway: only MockMvc and direct service calls ran;
+  tokens were verified in tests with jjwt, not by a gateway.
+- Login timing. An unknown email does the same bcrypt work as a known one (a
+  test checks the call), but the response times were **not measured**, and bcrypt
+  milliseconds per hash at cost 10 on this laptop are **unmeasured**.
+- Non-ASCII emails: Java's `toLowerCase(Locale.ROOT)` and Postgres's `lower()` may
+  disagree for some characters. That would break `ck_users_email_normalized` on
+  insert and surface as a `500` (not a `409`). Not exercised.
+- Several Identity instances racing on one database (the races used two threads
+  in one JVM).
+- Start-up through the real `JWT_SECRET` environment variable: tests set the
+  `identity.jwt.secret` property directly.
+- Expired-row cleanup of `refresh_tokens` (designed only, no job).

@@ -6,8 +6,10 @@
 > code behind it (entities in every service; Inventory's `reserve` and its two
 > Kafka consumers; Order's create path, payment step, payment webhook, outbox
 > relay and expiry sweep; the payment stub), each with its own label there.
-> **Day 7 is the last piece built. Day 8 (auth, gateway identity, rate limiting,
-> browse) is DESIGNED, NOT BUILT** (`decisions.md`, "Day 8: auth, gateway
+> **Day 7 is the last piece fully built. Day 8 (auth, gateway identity, rate
+> limiting, browse) is DESIGNED; only Identity's signup/login/refresh/logout and
+> V8 are built (MockMvc-tested, §8); the Gateway, signed header, Order's check,
+> Redis limiter and browse are NOT built** (`decisions.md`, "Day 8: auth, gateway
 > identity, rate limiting, browse"); where this document describes the Gateway,
 > JWT, rate limiting or browse it is describing that design, not code.
 > **First laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached.**
@@ -32,7 +34,7 @@ radius, not by domain noun.
 | **API Gateway** | Nothing (no DB) | Stateless routing, JWT at the edge, per-buyer / per-IP rate limiting (Redis), signs the buyer id it forwards. **Designed on Day 8, not built** (§3, "Edge: Gateway"). |
 | **Order Service** | `orders`, `order_items`, `refunds`, `outbox` | Sole authority on an order's fate (§6). Hot/bursty, isolated from cold traffic. |
 | **Inventory Service** | `flash_sales`, `flash_sale_items`, `stock_reservations`, `products` | The hottest, most contended row in the system (`flash_sale_items`). Isolated so contention can't lock-starve unrelated services. |
-| **Identity Service** | `brands`, `api_keys`, `users`, `outbox`, and `refresh_tokens` (V8, designed Day 8, not built) | Brands and buyers share one access pattern — cold, low-volume auth — not because they're the same kind of entity. |
+| **Identity Service** | `brands`, `api_keys`, `users`, `outbox`, and `refresh_tokens` (V8, Day 8, implemented, MockMvc-tested) | Brands and buyers share one access pattern — cold, low-volume auth — not because they're the same kind of entity. |
 | **Notification Service** | `notification_log`, `brand_contacts`, `buyer_contacts` | Cold, batch-tolerant; owns its own contact caches so it has no runtime dependency on Identity. |
 | **Razorpay Clone** (external) | Payment state | Separate project, called via OpenFeign. Not built yet (§9). |
 
@@ -67,9 +69,9 @@ proceeding.
 **Asynchronous — inbound webhook:**
 - **Razorpay Clone → Order** — payment result, signature-verified (FR-P2). Carries **our order id**, by which Order loads the row (never by `payment_ref`, which may be `NULL`; §6). Applies the one-payment invariant (§6); returns 200 only after its transaction commits, so a pre-commit crash is replayed by the gateway's own retry. Wire contract (decisions.md, "Day 6", point 4): `POST /webhooks/payment`, body `{order_id, payment_ref, status, amount}` (amount a string), HMAC-SHA256 hex of the raw body in `X-Signature`; `401` / `400` / `404` / `409` (order still `CREATED`) / `200`. Implemented and tested; sent only by the payment-stub so far (§8).
 
-**Edge: Gateway, identity and rate limiting (Day 8: DESIGNED, NOT BUILT).** Design: `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse". Nothing below exists in code yet; Order today still trusts the temporary, forgeable `X-Buyer-Id` header (§8, Day 4).
+**Edge: Gateway, identity and rate limiting (Day 8: DESIGNED; Identity's endpoints and V8 are built and MockMvc-tested, the rest is not built).** Design: `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse". Only the Identity part of the flow below exists in code (§8); the Gateway, the signed header, Order's check, rate limiting and browse do not. Order today still trusts the temporary, forgeable `X-Buyer-Id` header (§8, Day 4).
 - **Identity flow.** A buyer signs up or logs in at Identity (`/api/auth/**`) and gets an HS256 access JWT (15 min; claims `sub`, `typ` = `user`|`brand`, `iat`, `exp` only) and an opaque refresh token (7 days, stored as a hash in Identity's `refresh_tokens`, Postgres). Only `user` tokens are issued. `JWT_SECRET` is held by Identity and the Gateway only; both refuse a blank value.
-- **Refresh.** Each refresh is a compare-and-set on `refresh_tokens` (`revoked_at IS NULL AND expires_at > now()`): one winner gets a new pair; a revoked token seen again revokes every refresh token of that user (no grace window; a two-tab race logs the buyer out everywhere, accepted). Endpoints: signup, login, refresh, logout. Access tokens are not revocable before they expire.
+- **Refresh.** Each refresh is a compare-and-set on `refresh_tokens` (`revoked_at IS NULL AND expires_at > clock_timestamp()`, both stamped by the database clock): one winner gets a new pair; a revoked token seen again revokes every refresh token of that user (no grace window; a two-tab race logs the buyer out everywhere, accepted). Endpoints: signup, login, refresh, logout. Access tokens are not revocable before they expire.
 - **Gateway to Order.** The Gateway validates the JWT once (rejecting `typ != user` on `/api/orders/**`), strips any client `X-Buyer-Id`, and forwards `X-Buyer-Id` plus an HMAC over the buyer id and a timestamp, keyed by `GATEWAY_SIGNING_SECRET` (Gateway and Order only; separate from the JWT secret). Order answers `401` for a missing, bad or more-than-60 s-old signature and refuses a blank secret. The payment webhook keeps its own HMAC; `/internal/**` is never routed. **Limit:** `:8082` and `:8083` are reachable directly, and Inventory has no auth, so this guards the front door only.
 - **Rate limiting.** Spring Cloud Gateway `RedisRateLimiter` (token bucket), provisional values, recheck Day 9: `/api/orders/**` per buyer id 5/s burst 10; `/api/auth/**` per client IP 1/s burst 5; browse unlimited. The JWT filter runs before the limiter. The limiter **fails open** if Redis is down: it is protection, not correctness, and does not prevent overselling (the conditional `UPDATE` does). Day 9 trap: the oversell load test needs many buyers or a raised limit, or it measures `429`s.
 - **Browse (FR-B1).** `GET /api/flash-sales?page=N` in Inventory: 0-based, fixed page size 10, not `CANCELLED` and `end_time > now()` (database clock), ordered by `start_time, id`; an `inStock` flag, never an exact count; `hasNext` from an 11-row fetch, no `COUNT`; items in one extra query; a bad page is `400 INVALID_REQUEST`; uncached. Offset paging can skip a sale that ends between two pages (accepted; a cursor is the fix at scale).
@@ -326,11 +328,12 @@ users(id, name, email UNIQUE, password_hash, created_at, updated_at)
   --   login endpoint — brand and buyer login must be separate, since one
   --   address could match a row in either table
 refresh_tokens(id, user_id, token_hash UNIQUE, expires_at, revoked_at, created_at)
-  -- DESIGNED (Day 8), NOT BUILT: would be Identity migration V8. Times are
+  -- IMPLEMENTED and TESTED at MockMvc level (Day 8, Identity migration V8;
+  --   see §8). Times are
   --   TIMESTAMPTZ. token_hash is a hash of an opaque random token; the token
   --   itself is never stored. user_id is a same-service FK to users.
   --   Rotation is a compare-and-set on revoked_at IS NULL AND expires_at >
-  --   now(); a revoked token seen again revokes all of that user's tokens.
+  --   clock_timestamp(); a revoked token seen again revokes all of that user's tokens.
   --   Expired-row cleanup: designed only, no job. See decisions.md, "Day 8"
 outbox(id, aggregate_id, event_type, payload_json, created_at,
        published_at, attempts, last_error)
@@ -571,13 +574,36 @@ Full context and trade-offs live in `docs/decisions.md`.
 machine, every communication pattern, every decision in `docs/decisions.md`
 (Revision 3 and the implementation-phase entries after it).
 
-**Last built: Day 7. Day 8 (auth, gateway identity, rate limiting, browse):
-DESIGNED, not started.** See `decisions.md`, "Day 8: auth, gateway identity,
-rate limiting, browse" and §3, "Edge: Gateway". Nothing for Day 8 is
-implemented or tested: no Gateway module, no Identity V8 or endpoints, no
-Spring Security, no Redis use, no browse endpoint, no signed-header check in
-Order. The test counts below (490 after Day 7) are unchanged, because Day 8 so
-far changes docs only.
+**Day 8 (auth, gateway identity, rate limiting, browse): PARTLY BUILT.**
+See `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse" and
+§3, "Edge: Gateway". **Implemented and tested, at MockMvc level only
+(branch `feat/day8-identity-auth`, not merged):** Identity's `POST
+/api/auth/signup`, `login`, `refresh` and `logout` and migration V8
+(`refresh_tokens`). **Still NOT built (designed only):** the Gateway module, the
+signed `X-Buyer-Id` header, Order's check of it, the Redis rate limiter and the
+browse endpoint; Order still trusts the forgeable `X-Buyer-Id`. Test count:
+the Identity suite ran **116** tests, all passing, in a Claude Code session
+after the three pieces were built, and **117** after a start-up test for a
+space-only `JWT_SECRET` was added (run in the same session, 0 failures, 0
+errors, 0 skipped). Identity was 47 on 2026-11-06; the other services' counts
+below (490 total after Day 7) were not re-run and are unchanged.
+
+*Day 8 Identity implementation notes:*
+- Login also rejects any password over 72 bytes: bcrypt ignores everything past
+  72 bytes, so "stored password + anything" would otherwise match.
+- A stored hash without the `{bcrypt}` prefix (the seed's placeholders) gives
+  `401`, not `500`; `DelegatingPasswordEncoder` would otherwise throw.
+- Dependencies: jjwt 0.13.0 (api compile; impl and jackson runtime) and
+  `spring-security-crypto` 7.1.1. **No `spring-boot-starter-security`.**
+- `jjwt-jackson` brings Jackson 2, so Jackson 2 and Boot's Jackson 3 are both on
+  Identity's classpath.
+- Signup writes **no `UserUpserted` outbox row** (Identity's outbox events are
+  designed only); users created by signup are covered by the one-off backfill
+  republish (§9).
+- Refresh and logout: the rotation CAS and revoke-all use `clock_timestamp()`;
+  a refresh with a logged-out token counts as reuse (accepted cost, `decisions.md`
+  Day 8 point 4). Not tested: see `docs/testing.md`, "Day 8 Identity: built and
+  tested, and what was not tested".
 
 **Implemented:**
 - **Inventory Service** — all four entities (`Product`, `FlashSale`,
@@ -615,7 +641,9 @@ far changes docs only.
   fires, not a clean `OUT_OF_STOCK`.
 - **Identity Service** — entity layer complete: `Brand`, `User`, `ApiKey` and
   `OutboxEvent` on migrations V1–V7, including the `bump_updated_at` trigger
-  attached to both identity tables.
+  attached to both identity tables. **Day 8 (MockMvc-tested, see the Day 8 note
+  above):** V8 `refresh_tokens` and `RefreshToken`, plus signup, login,
+  refresh and logout.
 - **Notification Service** — entity layer complete: `NotificationLog`, `BrandContact` and
   `BuyerContact` on migrations V1–V2.
 - **Order Service** — all four tables (`orders`, `order_items`, `refunds`,
@@ -1079,7 +1107,9 @@ far changes docs only.
   /webhooks/payment` (and the payment-stub's own); the API Gateway, the
   reconciliation sweep, the refund worker, Inventory's stale-reservation
   reconciler, Order's internal status endpoint, Identity's relay, Notification's
-  consumers (nothing consumes `BrandUpserted` / `UserUpserted`), Redis, security.
+  consumers (nothing consumes `BrandUpserted` / `UserUpserted`), Redis, the
+  signed-header check and any security in Order or Inventory. (Identity's four
+  `/api/auth/**` controllers and V8 exist since Day 8; the Gateway does not.)
   All four services share one local Postgres credential pair but each owns a
   separate database.
 

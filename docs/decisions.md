@@ -5273,12 +5273,16 @@ each consumer and the sweep use them.
 
 ## Decision: Day 8: auth, gateway identity, rate limiting, browse
 
-**Status:** **DESIGNED, not built.** Nothing in this entry is implemented, tested,
-load-tested or verified under failure. No gateway module, no Identity endpoint, no
-Spring Security, no Redis use and no browse endpoint exists yet (`architecture.md`
-§8 is the status source of truth). Every number (token lifetimes, rate limits, the
+**Status:** **DESIGNED; partly built since (2026-11-08).** Identity's signup,
+login, refresh and logout and migration V8 (points 1 to 4 and 6) are implemented
+and tested at MockMvc level on branch `feat/day8-identity-auth`; see
+`architecture.md` §8 for counts. Everything else here (the gateway, the signed
+header and Order's check, the rate limiter, browse) is **designed, not built**,
+and nothing is load-tested or verified under failure. (Text below is the
+design as written, except the `clock_timestamp()` correction in point 4 and the
+second accepted cost there.) Every number (token lifetimes, rate limits, the
 60 s header age, bcrypt cost, page size) is **provisional and unmeasured**; recheck
-the rate limits on Day 9. Day 7 is the last built piece.
+the rate limits on Day 9. Day 7 is the last fully built piece.
 
 **Context / Problem:**
 Today anyone can call Order with any buyer id: `POST /api/orders` reads a
@@ -5334,8 +5338,11 @@ as buyer 8 by typing `X-Buyer-Id: 8`; and one script must not be able to send
    token, not speed. Cleaning up expired rows is **designed only** (no job, no
    decision on its schedule), the same open item as the outbox cleanup.
 4. **Rotate every refresh token with a compare-and-set:**
-   `UPDATE refresh_tokens SET revoked_at = now() WHERE token_hash = ? AND
-   revoked_at IS NULL AND expires_at > now()`. **1 row** = this call won: issue a
+   `UPDATE refresh_tokens SET revoked_at = clock_timestamp() WHERE token_hash = ?
+   AND revoked_at IS NULL AND expires_at > clock_timestamp()`. (Corrected
+   2026-11-08 from `now()`: `expires_at` is stamped with `clock_timestamp()` at
+   insert, and the time-column rule says one database clock function both writes
+   and reads a compared column; `now()` is frozen at transaction start.) **1 row** = this call won: issue a
    new access + refresh pair in the same transaction. **0 rows** = look the hash
    up: if the row exists and is already revoked, that token is being **reused**,
    so revoke **all** of that user's refresh tokens; if it is unknown or only
@@ -5347,6 +5354,13 @@ as buyer 8 by typing `X-Buyer-Id: 8`; and one script must not be able to send
    same moment look exactly like theft, so the loser's tab logs the buyer out
    everywhere. We chose a rule that is safe and sometimes annoying over a grace
    window that makes stolen-token reuse harder to see.
+   **Second accepted cost (found while building): a refresh with a token that
+   was logged out counts as REUSE** and revokes all of that user's live refresh
+   tokens, because a logged-out token is just a revoked token. So a buggy client
+   that retries an old, logged-out token logs the buyer's other devices out.
+   Why kept: telling logout from rotation would need a revoked-reason column
+   plus extra rules (which reason counts as theft?), and a dead token coming
+   back is suspicious anyway.
 5. **The Gateway validates the JWT once, then signs the buyer id for Order.** It
    strips any client-supplied `X-Buyer-Id`, then forwards `X-Buyer-Id` plus an
    `HMAC-SHA256` over the buyer id and a timestamp (header names and the
