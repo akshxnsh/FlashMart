@@ -121,7 +121,8 @@ section replaced; the run's numbers above are unchanged.
 
 ### Left behind after the run (relevant for Day 6 and 7)
 
-- `orders`: 7 `PENDING_PAYMENT` (they expire only once the Day 7 sweep exists),
+- `orders`: 7 `PENDING_PAYMENT` (they expire only once the Day 7 sweep exists;
+  the sweep has since been built and tested, Day 7),
   6 `PAYMENT_UNAVAILABLE`; `outbox`: 6 `OrderCancelled` rows never published
   (no relay).
 - Inventory item 2: `available_stock` 37 of 50, 13 `RESERVED` reservations. The
@@ -924,3 +925,33 @@ echo; echo "== stopping $(ts)"
 stop_order; stop_inventory; kill "$STUB_PID"; wait "$STUB_PID" 2>/dev/null
 echo "done"
 ```
+
+## Day 8 planned proofs (NOT run)
+
+**Label: DESIGNED, not built, not run.** Nothing below has been written or
+executed. This is the list of what must be shown when Day 8 is built
+(`decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse"). No
+result, count or timing exists for any line. Per `CLAUDE.md`: a guard that
+carries correctness gets a break-and-restore, and a concurrency claim gets a test
+that actually races.
+
+| # | Proof (what the test does) | Expected | Kind | What it cannot see |
+|---|---|---|---|---|
+| 1 | Call `POST /api/orders` through the Gateway with **no token** (and again with a malformed, an expired and a `typ=brand` token) | `401` each time; Order is never called | Gateway test, real JWT filter | A token signed with a stolen secret (by design it would pass) |
+| 2 | Call an `/internal/**` path (reserve, order status) **through the Gateway** | `404` (not routed); calling the service port directly still works, which is the accepted limit | Gateway route test | Reachability of `:8082` / `:8083` from outside the host |
+| 3 | Hammer `/api/orders/**` as one buyer faster than 5/s, burst 10 | First ~10 pass, then `429`; a second buyer at the same moment is not limited; the 429s never reach Order | Gateway + real Redis (compose Redis, first use) | Redis down: the fail-open claim needs its own run (stop Redis, expect requests to pass), not assumed |
+| 4 | **Two simultaneous signups with the same email** (two threads, a barrier, same normalised email; also one with `A@x.com` and one with `a@x.com `) | Exactly one `201`; the other `409` "email already taken"; never a `500`; one row | Concurrent test on real Postgres, `uk_users_email` | A single-threaded run; it must actually race. Break-and-restore: drop the `23505` catch and see the `500` |
+| 5 | **Refresh token reuse**: refresh once (new pair), then present the *old* token again | Second call `401`; **all** that user's refresh tokens are now revoked, including the new one | Real Postgres | The two-tab case is the accepted cost here, not a bug to fix |
+| 6 | **Refresh CAS race**: two threads refresh the same token at once | Exactly one gets a new pair; the loser gets `401`; the table shows one new live token or, if the loser's reuse path ran, none (state which, then assert it) | Concurrent test, real Postgres. Break-and-restore: remove `revoked_at IS NULL` from the `UPDATE` and see two winners | Behaviour across several Identity instances |
+| 7 | **Forged or stale signed header**: call Order directly with (a) no signature, (b) a wrong signature, (c) a valid signature over a timestamp older than 60 s, (d) a valid signature but a client-chosen `X-Buyer-Id` that differs from the signed one; also a Gateway call with a client-supplied `X-Buyer-Id` | (a) to (d) `401`; the Gateway strips the client header so Order sees only the JWT's buyer id | Order web slice plus one Gateway-to-Order run | Replay inside the 60 s window (accepted, not tested away); a blank-secret start-up refusal needs its own test in Gateway and Order |
+| 8 | **Browse page edges**: 0 sales; exactly 10 (`hasNext` false); 11 (`hasNext` true, page 1 holds 1); an ended sale and a cancelled sale are hidden; a scheduled and a live sale are shown; ordering `start_time, id` with a tie on `start_time`; page `-1` and `abc` give `400 INVALID_REQUEST`; items arrive in one extra query | As listed | Real Postgres, database clock. Assert the query count (no N+1) | Cache behaviour (there is none by design); the skipped-sale effect when a sale ends between pages (documented, accepted) |
+
+Also required by the design, so listed here once: a start-up test in each of
+Identity, Gateway and Order that a blank `JWT_SECRET` / `GATEWAY_SIGNING_SECRET`
+refuses to start (the same shape as the existing `PAYMENT_WEBHOOK_SECRET` tests).
+
+**Day 9 trap (from the design):** the oversell load test (5,000 requests, 500
+units) must use many different buyers or a raised limit, or it will mostly measure
+`429`s from proof 3's limiter. Seeded users cannot log in (unusable password
+hashes), so the test needs real signups or a seed with real bcrypt hashes; not
+decided.
