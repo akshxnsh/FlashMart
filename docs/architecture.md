@@ -3,9 +3,14 @@
 > Current design per every entry in `docs/decisions.md` (Revision 3 and the
 > implementation-phase entries after it). Supersedes the PRD wherever they
 > conflict (see `CLAUDE.md`). Design document — Section 8 is what actually has
-> code behind it (entities in every service; Inventory's `reserve`; Order's
-> create path, payment step, payment webhook and outbox relay; the payment
-> stub), each with its own label there. **First laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached.**
+> code behind it (entities in every service; Inventory's `reserve` and its two
+> Kafka consumers; Order's create path, payment step, payment webhook, outbox
+> relay and expiry sweep; the payment stub), each with its own label there.
+> **Day 7 is the last piece built. Day 8 (auth, gateway identity, rate limiting,
+> browse) is DESIGNED, NOT BUILT** (`decisions.md`, "Day 8: auth, gateway
+> identity, rate limiting, browse"); where this document describes the Gateway,
+> JWT, rate limiting or browse it is describing that design, not code.
+> **First laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached.**
 
 ## 1. System Overview
 
@@ -24,10 +29,10 @@ radius, not by domain noun.
 
 | Service | Owns | Why this boundary |
 |---|---|---|
-| **API Gateway** | Nothing (no DB) | Stateless routing, JWT at the edge, coarse rate limiting. |
+| **API Gateway** | Nothing (no DB) | Stateless routing, JWT at the edge, per-buyer / per-IP rate limiting (Redis), signs the buyer id it forwards. **Designed on Day 8, not built** (§3, "Edge: Gateway"). |
 | **Order Service** | `orders`, `order_items`, `refunds`, `outbox` | Sole authority on an order's fate (§6). Hot/bursty, isolated from cold traffic. |
 | **Inventory Service** | `flash_sales`, `flash_sale_items`, `stock_reservations`, `products` | The hottest, most contended row in the system (`flash_sale_items`). Isolated so contention can't lock-starve unrelated services. |
-| **Identity Service** | `brands`, `api_keys`, `users`, `outbox` | Brands and buyers share one access pattern — cold, low-volume auth — not because they're the same kind of entity. |
+| **Identity Service** | `brands`, `api_keys`, `users`, `outbox`, and `refresh_tokens` (V8, designed Day 8, not built) | Brands and buyers share one access pattern — cold, low-volume auth — not because they're the same kind of entity. |
 | **Notification Service** | `notification_log`, `brand_contacts`, `buyer_contacts` | Cold, batch-tolerant; owns its own contact caches so it has no runtime dependency on Identity. |
 | **Razorpay Clone** (external) | Payment state | Separate project, called via OpenFeign. Not built yet (§9). |
 
@@ -61,6 +66,13 @@ proceeding.
 
 **Asynchronous — inbound webhook:**
 - **Razorpay Clone → Order** — payment result, signature-verified (FR-P2). Carries **our order id**, by which Order loads the row (never by `payment_ref`, which may be `NULL`; §6). Applies the one-payment invariant (§6); returns 200 only after its transaction commits, so a pre-commit crash is replayed by the gateway's own retry. Wire contract (decisions.md, "Day 6", point 4): `POST /webhooks/payment`, body `{order_id, payment_ref, status, amount}` (amount a string), HMAC-SHA256 hex of the raw body in `X-Signature`; `401` / `400` / `404` / `409` (order still `CREATED`) / `200`. Implemented and tested; sent only by the payment-stub so far (§8).
+
+**Edge: Gateway, identity and rate limiting (Day 8: DESIGNED, NOT BUILT).** Design: `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse". Nothing below exists in code yet; Order today still trusts the temporary, forgeable `X-Buyer-Id` header (§8, Day 4).
+- **Identity flow.** A buyer signs up or logs in at Identity (`/api/auth/**`) and gets an HS256 access JWT (15 min; claims `sub`, `typ` = `user`|`brand`, `iat`, `exp` only) and an opaque refresh token (7 days, stored as a hash in Identity's `refresh_tokens`, Postgres). Only `user` tokens are issued. `JWT_SECRET` is held by Identity and the Gateway only; both refuse a blank value.
+- **Refresh.** Each refresh is a compare-and-set on `refresh_tokens` (`revoked_at IS NULL AND expires_at > now()`): one winner gets a new pair; a revoked token seen again revokes every refresh token of that user (no grace window; a two-tab race logs the buyer out everywhere, accepted). Endpoints: signup, login, refresh, logout. Access tokens are not revocable before they expire.
+- **Gateway to Order.** The Gateway validates the JWT once (rejecting `typ != user` on `/api/orders/**`), strips any client `X-Buyer-Id`, and forwards `X-Buyer-Id` plus an HMAC over the buyer id and a timestamp, keyed by `GATEWAY_SIGNING_SECRET` (Gateway and Order only; separate from the JWT secret). Order answers `401` for a missing, bad or more-than-60 s-old signature and refuses a blank secret. The payment webhook keeps its own HMAC; `/internal/**` is never routed. **Limit:** `:8082` and `:8083` are reachable directly, and Inventory has no auth, so this guards the front door only.
+- **Rate limiting.** Spring Cloud Gateway `RedisRateLimiter` (token bucket), provisional values, recheck Day 9: `/api/orders/**` per buyer id 5/s burst 10; `/api/auth/**` per client IP 1/s burst 5; browse unlimited. The JWT filter runs before the limiter. The limiter **fails open** if Redis is down: it is protection, not correctness, and does not prevent overselling (the conditional `UPDATE` does). Day 9 trap: the oversell load test needs many buyers or a raised limit, or it measures `429`s.
+- **Browse (FR-B1).** `GET /api/flash-sales?page=N` in Inventory: 0-based, fixed page size 10, not `CANCELLED` and `end_time > now()` (database clock), ordered by `start_time, id`; an `inStock` flag, never an exact count; `hasNext` from an 11-row fetch, no `COUNT`; items in one extra query; a bad page is `400 INVALID_REQUEST`; uncached. Offset paging can skip a sale that ends between two pages (accepted; a cursor is the fix at scale).
 
 **Asynchronous — Kafka** (each publisher owns an `outbox`, same local
 transaction as the business change):
@@ -313,6 +325,13 @@ users(id, name, email UNIQUE, password_hash, created_at, updated_at)
   --   employee may also shop). The consequence is that there can be no single
   --   login endpoint — brand and buyer login must be separate, since one
   --   address could match a row in either table
+refresh_tokens(id, user_id, token_hash UNIQUE, expires_at, revoked_at, created_at)
+  -- DESIGNED (Day 8), NOT BUILT: would be Identity migration V8. Times are
+  --   TIMESTAMPTZ. token_hash is a hash of an opaque random token; the token
+  --   itself is never stored. user_id is a same-service FK to users.
+  --   Rotation is a compare-and-set on revoked_at IS NULL AND expires_at >
+  --   now(); a revoked token seen again revokes all of that user's tokens.
+  --   Expired-row cleanup: designed only, no job. See decisions.md, "Day 8"
 outbox(id, aggregate_id, event_type, payload_json, created_at,
        published_at, attempts, last_error)
   -- published_at REPLACES the `published` boolean: NULL means not yet sent.
@@ -552,6 +571,14 @@ Full context and trade-offs live in `docs/decisions.md`.
 machine, every communication pattern, every decision in `docs/decisions.md`
 (Revision 3 and the implementation-phase entries after it).
 
+**Last built: Day 7. Day 8 (auth, gateway identity, rate limiting, browse):
+DESIGNED, not started.** See `decisions.md`, "Day 8: auth, gateway identity,
+rate limiting, browse" and §3, "Edge: Gateway". Nothing for Day 8 is
+implemented or tested: no Gateway module, no Identity V8 or endpoints, no
+Spring Security, no Redis use, no browse endpoint, no signed-header check in
+Order. The test counts below (490 after Day 7) are unchanged, because Day 8 so
+far changes docs only.
+
 **Implemented:**
 - **Inventory Service** — all four entities (`Product`, `FlashSale`,
   `FlashSaleItem`, `StockReservation`) on Flyway migrations V1–V7. Every time
@@ -653,7 +680,7 @@ machine, every communication pattern, every decision in `docs/decisions.md`
   Design: `decisions.md`, "Order creation: retries, conflicts, deadlines and Inventory failures".
   - `POST /api/orders` (gateway not built): `Idempotency-Key` (non-blank, max 255)
     and a temporary, forgeable `X-Buyer-Id` header (TODO Day 8: gateway-signed
-    identity). Bean Validation added to Order. Quantity 1..5 per line and on the
+    identity; **designed, not built**, see §3, "Edge: Gateway"). Bean Validation added to Order. Quantity 1..5 per line and on the
     merged total of a duplicated product; at most `maxLines` = floor((60 s - 6.5 s) / 3 s) =
     17 distinct products (Day 5: derived in `CreateOrderSettings` from config, not
     typed in; tested: 17 accepted, 18 is a `400`). A bad request is a `400` and Inventory is never called
@@ -1410,9 +1437,10 @@ or "recorded, not decided" still need a design decision.
   derived deadlines"). An `amount > 0` assertion before `initiate` is a bug
   guard only. The fee and the guard are tested (§8); since Day 5 the guard
   (`requirePayable`) runs right before the `initiate` call.
-- **FR-B1 (buyer browse) has no endpoint.** It waits for security and
-  caching. Any future stock hint is a coarse `soldOut` flag, never an exact
-  count.
+- **FR-B1 (buyer browse): designed on Day 8, not built; no endpoint exists.**
+  Moved out of the open list: the design (uncached, paged, an `inStock` flag,
+  never an exact count) is in §3, "Edge: Gateway" and `decisions.md`, "Day 8".
+  It no longer waits for caching.
 - **Decided 2026-11-05; implemented and tested (Day 4):** on
   `RESERVATION_RELEASED` mid-loop Order stops the loop, writes no CAS and no
   event, re-reads the real status and reports it; if still `CREATED`, it logs
@@ -1451,11 +1479,28 @@ or "recorded, not decided" still need a design decision.
   with Inventory mocked; not exercised against a real Inventory or the sweep. Also: same key with a
   different request is `409 IDEMPOTENCY_KEY_REUSED`, checked before replay.
   See the conditional rule on `order_items` (§4).
-- Identity, for the API phase: a lost signup race must surface as "email
-  already taken", not a 500; the JWT must say whether its subject is a brand
-  or a user (brand 7 and user 7 share an id); published `outbox` rows need a
-  cleanup job. Since Day 6 Order's relay marks its own `outbox` rows
-  published, so Order has the same unbuilt cleanup need (noted, not decided).
+- **Identity, API phase: designed on Day 8, not built.** The lost signup race
+  (`409`, never a `500`) and the JWT subject type (`typ`, because brand 7 and
+  user 7 share an id) are decided in `decisions.md`, "Day 8", and are no longer
+  open decisions. Still open: published `outbox` rows need a cleanup job, and
+  so do expired `refresh_tokens` rows (designed only). Since Day 6 Order's relay
+  marks its own `outbox` rows published, so Order has the same unbuilt cleanup
+  need (noted, not decided).
+- **New with Day 8 (see `decisions.md`, "Day 8"; DESIGNED, NOT BUILT; every
+  value provisional and unmeasured):**
+  - **Limits the design accepts:** `:8082` and `:8083` stay reachable directly
+    (Inventory has no auth); a signed header can be replayed for 60 s; HS256
+    means the Gateway can mint tokens; the per-IP key on `/api/auth/**` is
+    unfair on shared networks; the two-tab refresh race logs a buyer out
+    everywhere; access tokens are not revocable; browse offset paging can skip
+    a sale that ends between pages.
+  - **Open, not decided:** the refresh-token and outbox cleanup jobs; how the
+    Day 9 load test gets many logged-in buyers (seeded users have unusable
+    password hashes); whether the limiter really fails open in the chosen
+    library (to be checked when built, not assumed); brand login (only `user`
+    tokens are designed).
+  - **Day 9 trap:** the oversell load test needs many buyers or a raised
+    limit, or the per-buyer limit answers `429` before Inventory is reached.
 - Build Razorpay Clone with the behaviours this design leans on
   (`docs/requirements.md` §9, `RZP-1`–`RZP-9`), above all: idempotency on
   `initiate` and `refund`, a payment-status lookup queryable by our idempotency
