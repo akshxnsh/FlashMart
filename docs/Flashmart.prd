@@ -2,14 +2,21 @@
 ## Project Design Document & Build Plan
 
 **Backend Engineering — Spring Boot Microservices**
-Prepared by Akshansh · **Revision 4 — September 2026** (supersedes Revision 3, September 2026) · status re-synced 2026-10-22
+Prepared by Akshansh · **Revision 4 — September 2026** (supersedes Revision 3, September 2026) · status re-synced 2026-11-08 (Day 7 built, Day 8 designed)
 
-> **Status of this document.** The design is **designed**. Implemented and persistence-tested:
-> every entity in all four services, on Flyway migrations. Implemented and tested at the HTTP
-> layer only: Inventory's reserve contract (DTOs, validation, error mapping), with **no reserve
-> logic behind it**. No repositories, service implementations, other controllers, gateway,
-> Kafka, Redis or security exist anywhere. Nothing is load-tested or verified under failure.
-> Section 8's metrics are **targets until measured**. Details in §9.
+> **This document is subordinate to `docs/architecture.md`** (status in its §8, open items in
+> its §9) and reflects **Day 7 built + Day 8 designed, not built**. Where a sentence below
+> disagrees with `architecture.md`, `architecture.md` wins. Sections that could not be
+> reconciled line by line carry a one-line pointer instead of a second copy of the status.
+>
+> **Status of this document.** Built through Day 7 (entities in all four services; Inventory's
+> `reserve` and Kafka consumers; Order's create path, payment step, payment webhook, outbox
+> relay and expiry sweep; the payment stub). **Day 8 (auth, gateway identity, rate limiting,
+> browse) is designed only: no Gateway, no Spring Security, no Redis use, no browse endpoint.**
+> The Razorpay Clone does not exist. Load results are first laptop runs only, and the
+> 5,000-buyer / p99 target is not reached. Section 8's metrics are **targets until measured**.
+> Details in §9 and `architecture.md` §8. (The `FlashMart_Project_Plan_v3.pdf` plan is not in
+> this repository.)
 >
 > **Source of truth.** `docs/architecture.md` (reflecting every entry in `docs/decisions.md`,
 > Revision 3 and the implementation-phase entries after it) is authoritative. This document is regenerated from it and is subordinate to it
@@ -85,6 +92,10 @@ states, fewer synchronous calls — and the remaining pieces got sharper contrac
 - **A product's name is frozen while a live sale includes it.**
 - **The payment webhook loads its order by our order id, never by `payment_ref`**, which gets
   a partial `UNIQUE` as a safety net only.
+- **Day 8 is designed, not built** (`docs/decisions.md`, "Day 8: auth, gateway identity, rate
+  limiting, browse"): HS256 JWT (access 15 min, refresh 7 days stored hashed in Identity),
+  a Gateway that validates the JWT once and forwards a signed buyer id, Redis token-bucket rate
+  limits, and an uncached paged browse endpoint. See §3.3.
 
 ---
 
@@ -121,8 +132,8 @@ consistent outcome **without a distributed transaction**.
 
 | Concept | Where it is used in FlashMart |
 |---|---|
-| Optimistic locking / versioning | `flash_sale_items.version` guards `available_stock` under concurrent decrement. The contended row is the shared counter, not the per-buyer reservation row. |
-| Pessimistic locking / Redis locks | **Open.** Candidates if optimistic alone proves insufficient under load — to be decided *and* load-tested, not assumed (§10). Paired with the transaction isolation level below; the two interact directly. |
+| Optimistic locking / versioning | `flash_sale_items.version` exists and every raw `UPDATE` bumps it, but **`reserve` does not use `WHERE version = ?`**: it uses one atomic conditional `UPDATE` on `available_stock` (decided, `decisions.md`, "Reserve write path"). The contended row is the shared counter, not the per-buyer reservation row. |
+| Pessimistic locking / Redis locks | **Decided and built** (see `architecture.md` §8): no lock; one atomic conditional `UPDATE` on `available_stock`. Load-measured on one laptop only; a Redis counter or queue in front stays the fallback if a later load test needs it. |
 | Idempotency keys | Order creation `UNIQUE(buyer_id, idempotency_key)`; payment initiate (key derived from order ID, forwarded to the gateway); reserve `UNIQUE(order_id, flash_sale_item_id)`. |
 | Compare-and-set / state-guarded writes | Every write to `orders.status`, by all four writers (request thread, expiry sweep, webhook handler, circuit-breaker path). |
 | Saga (orchestrated) | Order drives per-item reservation → payment initiate → webhook confirmation, with asynchronous compensation via `OrderCancelled`. |
@@ -133,11 +144,11 @@ consistent outcome **without a distributed transaction**.
 | Local read caches | Notification's `brand_contacts` / `buyer_contacts`, fed by events instead of synchronous Identity calls. |
 | Reconciliation sweeps | Order's payment reconciliation sweep; Inventory's stale-reservation reconciler. Inventory's is explicitly bounded per pass, to avoid flooding Order during a systemic backlog (e.g. Kafka down for hours). Order's sweep is scope-bounded and idempotency-guarded via `payment_reconciled_at`, but whether it also needs a bounded-rows-per-pass limit (to avoid flooding Razorpay Clone if many orders die at once) has not been explicitly decided. |
 | Circuit breaker / Resilience4j | Wraps the Feign call to the payment gateway — fail fast, mark `PAYMENT_UNAVAILABLE`. |
-| Transaction isolation levels | Deliberate choice on the stock path, with documented trade-offs. ⚠ Not yet settled in `architecture.md`. Paired with the locking-strategy row above — decide together. |
+| Transaction isolation levels | **Decided and built:** READ COMMITTED on the stock path, with the trade-offs in `docs/decisions.md`, "Reserve write path". |
 | State machine | Order: 2 transient + 5 terminal states. Reservation: `RESERVED → CONFIRMED | RELEASED`. |
 | Webhook handling | Inbound, signature-verified payment webhook (`FR-P2`); 200 returned only after commit. |
 | Indexing | Derived from named hot queries: expiry sweep, reconciliation sweep, outbox relay, reconciler, API-key auth (§4.6). |
-| Caching + invalidation, rate limiting | Coarse rate limiting at the Gateway is designed. ⚠ Redis catalog caching and fine-grained token-bucket limiting are carried forward from Revision 3 and **not yet designed** in `architecture.md`. |
+| Caching + invalidation, rate limiting | **Rate limiting designed on Day 8, not built:** Redis token bucket in the Gateway (per buyer on orders, per IP on auth), fails open. **Catalog caching: not designed and not planned**; browse is uncached by decision (`decisions.md`, "Day 8"). |
 | Microservices + service boundaries | Four services, each owning its database; boundaries drawn by traffic shape and failure blast radius. |
 
 ---
@@ -148,7 +159,7 @@ consistent outcome **without a distributed transaction**.
 
 | Service | Owns | Why this boundary |
 |---|---|---|
-| **API Gateway** | Nothing (no DB) | Stateless routing, JWT at the edge, coarse rate limiting. |
+| **API Gateway** | Nothing (no DB) | Stateless routing, JWT at the edge, rate limiting. Designed on Day 8, not built. |
 | **Order Service** | `orders`, `order_items`, `refunds`, `outbox` | Sole authority on an order's fate (§5). Hot/bursty, isolated from cold traffic. |
 | **Inventory Service** | `flash_sales`, `flash_sale_items`, `stock_reservations`, `products` | Holds the hottest, most contended row in the system. Isolated so contention cannot lock-starve unrelated services. |
 | **Identity Service** | `brands`, `api_keys`, `users`, `outbox` | Brands and buyers share **one access pattern** — cold, low-volume auth — not because they are the same kind of entity. |
@@ -255,8 +266,10 @@ Inventory and Notification publish nothing.
 
 ### 3.3 API Gateway
 
-Spring Cloud Gateway in front of every service, owning authentication, coarse rate limiting,
-and routing. Routes are illustrative and will be finalized with the API design.
+Spring Cloud Gateway in front of every service, owning authentication, rate limiting,
+and routing. **Designed on Day 8, not built** (port `8080`, no module exists). Routes below are
+illustrative; the rate-limit values in this sketch are the Day 8 provisional ones, replacing the
+earlier 50/100 placeholder. `architecture.md` §3, "Edge: Gateway" is authoritative.
 
 ```yaml
 # application.yml (API Gateway)
@@ -272,22 +285,24 @@ spring:
             - JwtAuthFilter
             - name: RequestRateLimiter
               args:
-                redis-rate-limiter.replenishRate: 50
-                redis-rate-limiter.burstCapacity: 100
+                # per buyer id (read from the validated JWT, so the JWT filter runs first)
+                redis-rate-limiter.replenishRate: 5
+                redis-rate-limiter.burstCapacity: 10
 
         - id: inventory-service
           uri: lb://INVENTORY-SERVICE
           predicates:
             - Path=/api/products/**, /api/flash-sales/**
           filters:
-            - JwtAuthFilter
+            - JwtAuthFilter   # browse (GET /api/flash-sales) is designed unlimited and uncached
 
         - id: identity-service
           uri: lb://IDENTITY-SERVICE
           predicates:
             - Path=/api/auth/**, /api/brands/**, /api/users/**
           filters:
-            - JwtAuthFilter   # login/signup paths exempted inside the filter
+            - JwtAuthFilter   # login/signup/refresh exempted inside the filter;
+                              # /api/auth/** is rate limited per client IP, 1/s burst 5
 
         - id: payment-webhook
           uri: lb://ORDER-SERVICE
@@ -297,7 +312,11 @@ spring:
 ```
 
 - JWT validated once at the Gateway; downstream services trust a forwarded, gateway-signed
-  identity header.
+  identity header (Day 8 design: `X-Buyer-Id` plus an HMAC over buyer id and timestamp, a
+  separate `GATEWAY_SIGNING_SECRET`, Order rejects anything missing, bad or older than 60 s).
+  The Gateway can mint tokens (HS256) and `:8082` / `:8083` stay reachable directly; both are
+  accepted limits (`decisions.md`, "Day 8"). Until the Gateway is built, Order trusts a
+  forgeable `X-Buyer-Id`.
 - **`/internal/**` is deliberately absent and must stay absent.** The reserve endpoint and the
   order-status endpoint are service-to-service only; exposing either through the Gateway would
   let a client reserve stock or read order state directly.
@@ -310,7 +329,7 @@ spring:
 
 ```
 Buyer -> API Gateway  : POST /api/orders (JWT, Idempotency-Key, flash_sale_id, item list)
-Gateway -> Order      : routed after JWT validation + coarse rate limit
+Gateway -> Order      : routed after JWT validation + rate limit (Day 8 design, not built)
 Order                 : merge duplicate lines; reject any quantity > 5 (400, before any
                         reserve call); INSERT orders (CREATED, expires_at = reserve
                         deadline, amount NULL) + all order_items rows up front
@@ -509,8 +528,8 @@ flash_sale_items(id, flash_sale_id, product_id, sale_price,
   -- sale_price: DECIMAL(12,2), immutable once the sale is live; the API refuses any
   --   third decimal, since Postgres would silently round it
   -- total_stock fixed (reporting); available_stock is the decremented counter
-  -- version: optimistic lock -- THE contended row under concurrent decrement
-  -- OPEN: optimistic alone vs. pessimistic vs. Redis lock -- decide + load-test (§10)
+  -- version: bumped by every raw UPDATE; THE contended row under concurrent decrement
+  -- DECIDED and built: no lock, one atomic conditional UPDATE (READ COMMITTED); see architecture.md
 
 stock_reservations(id, order_id, flash_sale_item_id, quantity, status, reserved_at)
   -- UNIQUE(order_id, flash_sale_item_id) -- idempotent reserve on retry
@@ -670,9 +689,10 @@ Rules applied to every entity, each recorded with its reasoning in `docs/decisio
 
 Service scaffolding: fixed ports identity `8081`, inventory `8082`, order `8083`, notification
 `8084` (8080 reserved for the Gateway); one shared credential pair against one Postgres instance
-with a separate database per service; Kafka, Feign, Resilience4j and Security deferred to
-their phases. Validation is in Inventory (added with its DTOs); the other services add it in
-their own API phase.
+with a separate database per service. (When written: Kafka, Feign, Resilience4j and Security
+deferred to their phases; since then Feign, Resilience4j and Kafka have been added where used,
+Security is still nowhere. See `architecture.md` §7 and §8.) Validation is in Inventory and
+Order; the other services add it in their own API phase.
 
 ---
 
@@ -798,7 +818,7 @@ Mapped session-for-session to the Coding Shuttle Razorpay Clone cohort schedule.
 | 12 | Vault Service, Card Payment | **Out of scope** — FlashMart stores no card data by design; the buyer pays entirely on the gateway's side. Stated explicitly in `docs/requirements.md` §8 | Resolved |
 | 13 | Spring Security, Banking Simulator | JWT auth for buyers and brands; Banking Simulator reused for payment failure injection | |
 | 14 | API Key Authentication | API-key auth for brand-facing endpoints (`key_hash` lookup) | |
-| 15 | Redis caching, basic rate limiting | ⚠ Catalog read caching + buy-endpoint limiting — carried forward, **not yet designed** | |
+| 15 | Redis caching, basic rate limiting | Buy-endpoint and auth rate limiting: **designed on Day 8, not built.** Catalog read caching: not designed, not planned (browse is uncached by decision) | |
 | 16 | Rate Limiting, Idempotency | Idempotent order creation, initiate, and reserve — all three already have their DB constraints designed | |
 | 17 | Transactions, Locking, Outbox | Locking on `available_stock`, isolation level decision, outbox tables in Order + Identity | |
 | 18 | Outbox with Kafka | Outbox → Kafka relays; `PaymentConfirmed`, `OrderCancelled`, `BrandUpserted`, `UserUpserted`; idempotent consumers | |
@@ -807,9 +827,16 @@ Mapped session-for-session to the Coding Shuttle Razorpay Clone cohort schedule.
 | 22 | Distributed microservices setup | Four services behind the API Gateway, `/internal/**` unexposed | |
 | 13–15 *(parallel track — runs alongside 13–15 above, not after 22; listed last only because this table is otherwise chronological)* | Advanced microservices, Kafka, Docker | Kafka backbone, Eureka discovery, Dockerized deployment | |
 
+**The "State" column above is a Revision 4 snapshot and is out of date; it is not maintained.**
+For what is built, see `architecture.md` §8 (in short: entities, `reserve`, Order's create path,
+payment step, webhook, relay and expiry sweep, and Inventory's consumers are built; the refund
+worker, reconciliation sweep, Inventory's stale-reservation reconciler, Gateway, security, Redis
+and Notification's consumers are not; Day 8 is designed only).
+
 Sequencing note: the sweeps and the refund worker (sessions 19–20) are what make the design's
 correction paths real. Until they exist, the design's guarantees are structural, not
-operational.
+operational. (The expiry sweep was built on Day 7; the refund worker and the reconciliation
+sweep were not.)
 
 ---
 
@@ -840,32 +867,37 @@ correspond to the `NFR-P*` targets in `docs/requirements.md`.
 
 ## 9. Current Status
 
+**`docs/architecture.md` §8 is the status source of truth and wins over this section.** This is
+a short summary of it as of 2026-11-08; it keeps the labels distinct (designed / implemented /
+tested / load-tested / verified under failure) and invents no numbers.
+
 | | |
 |---|---|
-| **Designed** | Everything in §3–6, in full — all five schemas, the state machine, every communication pattern, every decision in `docs/decisions.md` (Revision 3 and the implementation-phase entries after it) |
-| **Implemented** | **Inventory:** all four entities (`Product`, `FlashSale`, `FlashSaleItem`, `StockReservation`), Flyway V1–V7, every time column `TIMESTAMPTZ`; plus the API contract layer — request/response DTOs for reserve, products, flash sales and sale items with Bean Validation, the reserve controller, a scoped exception handler, and a `ReservationService` interface whose only bean is a placeholder that throws. **Identity:** entity layer complete — `Brand`, `User`, `ApiKey`, `OutboxEvent`, Flyway V1–V7, `bump_updated_at` on both identity tables. **Notification:** entity layer complete — `NotificationLog`, `BrandContact`, `BuyerContact`, Flyway V1–V2. **Order:** entity layer complete — `Order`, `OrderItem`, `Refund`, `OutboxEvent`, Flyway V1–V7, every guard shipped in the first migration, plus V6's partial unique index (one `CREATED`/`PENDING_PAYMENT`/`PAID` order per buyer per sale) and V7's hardening (a payable status needs a `payment_ref`, non-blank guards, money columns widened to `NUMERIC(14,2)`). **Nowhere:** repositories, service implementations (including `reserve` logic), any controller besides Inventory's reserve endpoint, gateway, Kafka, Redis, security |
-| **Tested** | 233 tests, all passing (Order, 99, and Inventory, 58, run on 2026-10-29 after V7; Identity, 47, and Notification, 29, last run on 2026-10-22): each including a context test and the zone-less-timestamp guard. Persistence tests save into real Postgres in a rolled-back transaction, and every CHECK, unique key and FK is verified to reject bad rows. The tests are shown to fail when the thing they guard is broken. Reserve logic does not exist, so its evaluation order, replay and concurrency are untested |
-| **Load-tested** | **None.** The §8 targets remain unverified by explicit decision, not by omission |
-| **Verified under failure** | None |
+| **Designed** | Everything in §3–6, in full, and `docs/decisions.md` in full. **Day 8** (auth, gateway identity, rate limiting, browse) is designed only |
+| **Implemented and tested (through Day 7)** | Entities and migrations in all four services; Inventory's `reserve` (one atomic conditional `UPDATE`, raced) and its two Kafka consumers (release/confirm); Order's `POST /api/orders` (insert, unique-violation handling, reserve loop), fee and `CREATED` deadline, payment step (retry and breaker), payment webhook handler, outbox relay and Kafka producer, expiry sweep (with drain loop), late-reservation republish (Version A) and V9's partial index; the payment-stub, including signed webhooks with retries |
+| **Not built** | Refund worker, reconciliation sweep, Inventory's stale-reservation reconciler, Order's internal status endpoint, Identity's relay and API, Notification's consumers, Gateway, security, Redis use, browse endpoint, and every Day 8 item. The Razorpay Clone does not exist |
+| **Tested** | **490 tests, all passing** on `main` after Day 7 (run 2026-11-06; Order 290, Inventory 102, Identity 47, Notification 29, payment-stub 22). Unchanged since: Day 8 changes docs only. Many of these races run on real Postgres with Inventory or the gateway mocked or stubbed |
+| **Load-tested** | Inventory's `reserve` only, on one laptop: p99 target met at 100 buyers/s, not met at 500 buyers/s; the 5,000-concurrent / 500-unit target is not reached. Nothing else is load-tested |
+| **Verified under failure** | On one laptop, one run each, against the payment-stub, one Kafka broker and one partition: Order's payment step (Day 5); webhook + relay end to end (Day 6); consumers, expiry sweep, duplicate `OrderCancelled`, Kafka paused, Inventory down (Day 7). Not against a real gateway. `docs/testing.md` |
 
-**Ports:** identity `8081`, inventory `8082`, order `8083`, notification `8084`; `8080` is
-reserved for the API Gateway. All four services share one local Postgres credential pair but
-each owns a separate database.
+**Ports:** gateway `8080` (reserved, not built), identity `8081`, inventory `8082`, order `8083`,
+notification `8084`, payment stub `8085` (127.0.0.1 only). All services share one local Postgres
+credential pair; each owns a separate database.
 
-**Diagrams and ERDs: current, checked 2026-10-22.** They live in the Notion FlashMart page as
-Mermaid blocks and were updated that day for the implementation-phase changes in §0. This
-document's status, flows and open items were re-synced to `architecture.md` the same day.
-
-**Notion log:** a personal engineering log, not a source of truth. Checked and brought up to
-date on 2026-10-22: its "API & Event Contracts" section records every reserve-contract piece,
-and its test totals match the 193 measured that day.
+**Diagrams and ERDs:** they live in the Notion FlashMart page as Mermaid blocks and were last
+checked on 2026-10-22; they do not show anything built since. Notion is a personal log, not a
+source of truth.
 
 ---
 
 ## 10. Open Items & Next Steps
 
-Most items are blocked on something that does not exist yet; those marked "not specified" or
-"not decided" still need a design decision. `architecture.md` §9 is the full list.
+`architecture.md` §9 is the full, current list and wins over this section. The items below that
+were open in Revision 4 and have since been **decided** (locking strategy and isolation level,
+how `reserve` writes the decrement, the `CREATED` deadline, payment window and sweep interval
+(provisional), Order's handling of `RESERVATION_RELEASED` and of the three reserve "no"
+outcomes, retried creates, the `quantity > 5` check, FR-B1 and the Identity signup-race / JWT
+type items (Day 8, designed)) are removed here rather than copied.
 
 **Accepted permanently.** A second captured payment can escape correction entirely if the
 initiate idempotency key ever fails to dedupe **and** a webhook is separately lost — in the
@@ -875,48 +907,29 @@ failures to stack; building "list every payment for this order" plus scanning `P
 judged not worth it against that likelihood. **This is the one place in the design that leans
 on prevention rather than independent correction.**
 
-- Settle the two derived deadlines (`CREATED` deadline, refund claim lease), the Order sweep
-  interval, and the payment window — blocked on real Feign/Resilience4j config **by design**.
-- Decide the locking strategy for `flash_sale_items` — optimistic alone, pessimistic, or Redis
-  — and load-test it. Settle the transaction isolation level on the same write path alongside
-  it; the two interact directly and should be decided together, not separately.
+Still open or not built (see `architecture.md` §9 for the detail):
+
+- **Day 8 is designed, not built** (`decisions.md`, "Day 8"). Its accepted limits: `:8082` /
+  `:8083` stay reachable directly and Inventory has no auth; HS256 means the Gateway can mint
+  tokens; a two-tab refresh race logs a buyer out everywhere; access tokens are not revocable;
+  the per-IP limit is unfair on shared networks; browse offset paging can skip a sale.
 - Build Razorpay Clone with the nine behaviours in §6.5 (`RZP-1`–`RZP-9`).
-- Resolve the one remaining ⚠ item in §2: Redis catalog caching + fine-grained rate limiting.
-  Card-data/vault scope (§7, session 12) is resolved: FlashMart stores no card data by design
-  (buyer pays on the gateway's side), now stated explicitly in `docs/requirements.md` §8.
-  Outbound brand webhooks (§7, session 19–20) is resolved: dropped, no replacement — see
-  `docs/decisions.md`.
-- **Settle how `reserve` writes the decrement.** Two decision entries specify it incompatibly —
-  `WHERE version = ?` versus one statement checking `available_stock` and liveness against the
-  database clock. Under READ COMMITTED the value-based clause needs no retry; the version-based
-  one fails after any concurrent write. A native `UPDATE` also does not bump `version`. Must be
-  settled before `reserve` is built; recorded, not decided.
-- Enforce "frozen once the sale opens" (price, `total_stock`, times, cancellation) in the
-  service layer against the database clock — a CHECK cannot express it. Same for "a product's
-  name is frozen while a live sale includes it".
-- Order's handling of `reserve` outcomes: `OUT_OF_STOCK`, `SALE_NOT_LIVE` and `ITEM_NOT_IN_SALE`
-  all end the order as `RESERVATION_FAILED` (decided, not built). What Order does on
-  `RESERVATION_RELEASED` — not specified.
-- For Order's API piece: what a retried create with the same idempotency key returns when the
-  order is already `RESERVATION_FAILED` (`failure_detail` is debug only, so it cannot say which
-  outcome it was) — not decided.
-- Order's create-order request must reject `quantity > 5` before any reserve call. One person with
-  two accounts is not covered by the one-live-order rule.
-- A retried create while the order is still `CREATED` is not specified; recovery is abort.
-- A zero-amount order is untested (a free item is allowed); a gateway may refuse it. Decide in
-  the payment phase.
-- FR-B1 (buyer browse) has no endpoint; it waits for security and caching.
-- Two database clock functions (`now()` vs `clock_timestamp()`) are in use for compared time
-  columns — pick one on purpose before the next such column.
-- Identity, for the API phase: a lost signup race must read "email already taken", not a 500;
-  the JWT must say whether its subject is a brand or a user; published `outbox` rows need a
-  cleanup job.
+- Refund worker, reconciliation sweep and Inventory's stale-reservation reconciler: designed,
+  not built. The Version B late-reservation gap is documented and its frequency is unmeasured.
+- Pool size and DB timeout values, and re-checking every provisional deadline, lease and rate
+  limit, come from the Day 9 load test. The Day 9 oversell test needs many buyers or a raised
+  limit, or it measures the Day 8 rate limiter.
+- Service-layer enforcement of "frozen once the sale opens" and "a product's name is frozen
+  while a live sale includes it"; an API check so a brand cannot create a sale that starts in
+  the past.
+- Cleanup jobs for published `outbox` rows (Identity and Order) and expired `refresh_tokens`
+  rows (designed only).
 - A one-off **backfill republish** from Identity when Notification is deployed: brands and
   buyers that existed beforehand have no cached contact, so their first receipt fails and
   stays failed. No schema change fixes it; a synchronous fallback would undo the cache.
-- Next in the build order: finish the API/DTO phase (Order, Identity), then reservation and
-  payment — which first needs the locking strategy, isolation level and reserve write path
-  settled together.
+- `brand_contacts` / `BrandUpserted` have no consumer: drop, keep, or add `brand_id` back — not
+  decided.
+- Next in the build order: Day 8 (build what is designed), then the load test (Day 9).
 
 ---
 
@@ -926,8 +939,8 @@ on prevention rather than independent correction.**
 
 - Designed and built FlashMart, flash-sale infrastructure for brands on Spring Boot
   microservices (Order, Inventory, Identity, Notification), handling `[X]` concurrent purchase
-  requests with zero overselling via optimistic concurrency control `[+ locking strategy, once
-  decided]`.
+  requests with zero overselling via one atomic conditional `UPDATE` under READ COMMITTED
+  `[result to be measured; the 5,000-concurrent target is not reached]`.
 - Implemented saga-based multi-item order orchestration with asynchronous compensation, making
   one service the sole authority on order state via compare-and-set writes — races between the
   expiry sweep, the payment webhook, and the request thread resolve on a single row.
@@ -953,5 +966,5 @@ on prevention rather than independent correction.**
 | `docs/architecture.md` | **Source of truth** — current design, supersedes this document on conflict |
 | `docs/decisions.md` | Per-decision context, options, trade-offs, consequences |
 | `docs/requirements.md` | `FR-*` / `NFR-*` requirement IDs |
-| `docs/Flashmart.prd` (this) | Narrative plan: overview, concepts, flows, build plan, status. Status, build-plan states and open items last synced 2026-10-22 |
+| `docs/Flashmart.prd` (this) | Narrative plan: overview, concepts, flows, build plan, status. Re-synced 2026-11-08 to `architecture.md` (Day 7 built, Day 8 designed); §7's state column is a stale snapshot and says so |
 | `CLAUDE.md` | Working agreement and precedence rules |

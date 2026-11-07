@@ -3,7 +3,8 @@
 ## Environment
 
 - Copy `.env.example` to a repo-root `.env` (gitignored) and fill in
-  `DB_USERNAME`, `DB_PASSWORD` and `PAYMENT_WEBHOOK_SECRET`. Optional:
+  `DB_USERNAME`, `DB_PASSWORD` and `PAYMENT_WEBHOOK_SECRET`. Day 8 adds two more
+  (`JWT_SECRET`, `GATEWAY_SIGNING_SECRET`), below. Optional:
   `KAFKA_BOOTSTRAP` (default `localhost:9092`) and `ORDER_WEBHOOK_URL` (default
   `http://localhost:8083/webhooks/payment`). Never commit `.env`.
 - **Spring does not read `.env`.** Export the values into the shell that starts
@@ -11,13 +12,24 @@
   stub both fail at startup if `PAYMENT_WEBHOOK_SECRET` is blank, and both must
   use the same value. (`docker compose` does read the repo-root `.env`, for its
   own `${...}` values.)
+- **Day 8 secrets: DESIGNED, not built, so nothing reads them yet.** When Day 8
+  is built, `JWT_SECRET` (Identity and the Gateway only) and
+  `GATEWAY_SIGNING_SECRET` (the Gateway and Order only) have **no defaults**, and
+  a service that needs one **refuses to start** if it is blank, the same rule as
+  `PAYMENT_WEBHOOK_SECRET`. They must be two different values, and each pair must
+  match across its services. Use a random value of your own locally; never commit
+  one. (`decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse".)
 
 ## Local infra
 
 - **Postgres is a local install** (PostgreSQL 18 on port 5432), one database per
   service. Do **not** start `postgres` (or `redis`) from `docker-compose.yml`:
   it publishes 5432 too and clashes with the local one. The compose `postgres`
-  and `redis` services have never been started or tested.
+  and `redis` services have never been started or tested. **Redis is first used
+  on Day 8** (the Gateway's rate limiter; designed, not built), so until then
+  nothing needs it. When Day 8 is built, `docker compose up -d redis` is the
+  likely way to start it (the compose service is untested; check port 6379 is
+  free first).
 - **Kafka is the only compose service in use:** `docker compose up -d kafka`
   (Docker Desktop running; wait for `healthy`). It is needed only to run Order
   with its outbox relay against a real broker, not for the test suites.
