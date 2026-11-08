@@ -926,10 +926,11 @@ stop_order; stop_inventory; kill "$STUB_PID"; wait "$STUB_PID" 2>/dev/null
 echo "done"
 ```
 
-## Day 8 planned proofs (NOT run)
+## Day 8 planned proofs (original plan; most are now built, see the sections below)
 
-**Label: DESIGNED, not built, not run.** Nothing below has been written or
-executed. This is the list of what must be shown when Day 8 is built
+**Label: this is the PLAN as written before Day 8.** Most proofs now exist as tests
+(Identity, gateway, Order, rate limiter, browse); the results are in the Day 8
+sections below and `architecture.md` §8. Not every row was built as written. This is the list of what must be shown when Day 8 is built
 (`decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse"). No
 result, count or timing exists for any line. Per `CLAUDE.md`: a guard that
 carries correctness gets a break-and-restore, and a concurrency claim gets a test
@@ -1121,7 +1122,8 @@ start() { # name jar args...
 # The Windows PID of the java.exe running a jar. kill -9 from Git Bash only
 # kills the MSYS wrapper and leaves java running (seen in run 2), so a hard
 # kill is taskkill /F (TerminateProcess: no shutdown hooks, no deregistration).
-winpid_of() { powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*$1*' }).ProcessId" | tr -d ''; }
+winpid_of() { powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*$1*' }).ProcessId" | tr -d '
+'; }
 hardkill() { local v="JAR_$1"; [ -n "${!v:-}" ] || return 0; for pid in $(winpid_of "${!v}"); do taskkill //F //PID "$pid" > /dev/null; done; return 0; }
 # A fresh access token (they live 15 min, and the hard-kill wait can be longer).
 fresh_token() { status -X POST "$GW/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" > /dev/null; TOKEN=$(jsonget accessToken); }
@@ -1244,3 +1246,33 @@ PGPASSWORD="$DB_PASSWORD" psql -h localhost -U "$DB_USERNAME" -d identity-servic
   "delete from refresh_tokens where user_id=$USER_ID; delete from users where id=$USER_ID;"
 log "cleaned up: processes stopped, smoke user and orders deleted"
 ```
+
+## Day 8 smoke 2: browse, order, signed webhook and the rate limiter through the Gateway (2026-11-08)
+
+**Label: run once on one laptop (Gateway on the `fixed` profile, so no Eureka),
+real processes: Identity, Inventory, Order, payment-stub, api-gateway, the compose
+Redis, the seeded databases. No Kafka (Order relay off), no load.** The script
+was not saved in the repo (it lived in a scratch folder); the steps are below.
+
+| Step | Result |
+|---|---|
+| Signup, login via `:8080` | `201`, `200` |
+| `GET /api/flash-sales?page=0` with a token | `200`: sale 1 `LIVE` (2 items) and sale 2 `SCHEDULED` (1 item); `hasNext` false; items carry exactly `id`, `productId`, `salePrice`, `inStock`; no `availableStock`/`totalStock` in the body |
+| `?page=-1`; no token | `400 INVALID_REQUEST`; `401` |
+| `POST /api/orders` for seeded sale 1 product 1 | `201 PENDING_PAYMENT`, amount `5048.00` |
+| payment-stub auto-webhook (signed, sent to `:8080/webhooks/payment`) | the order reached `PAID` within a few seconds |
+| 15 concurrent `POST /api/orders` from one buyer (nonexistent sale, so a request that passes is a `409` from Order) | **10 passed, 5 were `429`** (burst 10) |
+
+**Surprises / limits**
+- My first burst was a sequential loop and produced **0 429s**: each order call took
+  about 250 ms, i.e. under 5/s, so the limiter was right not to fire. Only a
+  concurrent burst exceeds the limit.
+- Two copies of the script overlapped in the last run and garbled its log; the
+  figures above are from the first complete burst (a second copy saw 13 passed /
+  2 limited, which fits a bucket partly refilled by the other copy's calls). The
+  `Retry-After` header was not captured in this run (it is covered by
+  `RateLimitTest`).
+- Not covered: Redis stopped during the smoke (done in `RateLimitFailOpenTest`
+  instead), Eureka/`lb://` in this run (smoke 1), more than one instance, load.
+- Cleanup: the smoke user was deleted by hand; the seed was re-run afterwards,
+  which also emptied Order's tables.

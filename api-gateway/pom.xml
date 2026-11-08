@@ -40,6 +40,11 @@
 			<groupId>org.springframework.cloud</groupId>
 			<artifactId>spring-cloud-starter-gateway-server-webflux</artifactId>
 		</dependency>
+		<!-- RedisRateLimiter's client (reactive Lettuce). Version from the Boot BOM. -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+		</dependency>
 		<!-- Looks services up for the lb:// routes. Fetch only: the Gateway never
 		     registers itself (application.yml). Brings Spring Cloud LoadBalancer. -->
 		<dependency>

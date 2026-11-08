@@ -6,6 +6,8 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.Repository;
 import org.springframework.data.repository.query.Param;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -19,6 +21,9 @@ public interface FlashSaleItemRepository extends Repository<FlashSaleItem, Long>
     Optional<FlashSaleItem> findByFlashSaleIdAndProductId(Long flashSaleId, Long productId);
 
     Optional<FlashSaleItem> findById(Long id);
+
+    /** All items of a page of sales in ONE query (no N+1). */
+    List<FlashSaleItem> findByFlashSaleIdInOrderByIdAsc(Collection<Long> flashSaleIds);
 
     /**
      * The whole stock check and decrement in ONE statement, so it is atomic
