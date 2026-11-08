@@ -1,0 +1,25 @@
+server:
+  port: 8761
+
+spring:
+  application:
+    name: eureka-server
+
+# decisions.md, "Day 8", addendum "Gateway and discovery", points 3 and 4.
+eureka:
+  client:
+    # Standalone: one server, no peer. It does not register with itself and
+    # does not fetch a registry from anyone.
+    register-with-eureka: false
+    fetch-registry: false
+  server:
+    # OFF for the laptop demo only. With 3 or 4 instances, one hard kill drops
+    # renewals under the 85 % threshold and self-preservation would then keep
+    # the dead instance listed indefinitely. Production keeps it ON (there a
+    # mass heartbeat loss is usually a network split, not dead services).
+    enable-self-preservation: false
+    # NO timing values are set on purpose: lease, heartbeat, eviction and cache
+    # intervals are the library defaults, so the demo shows the real behaviour.
+
+# NO security: anyone who can reach 8761 can register a fake service and get
+# the Gateway's traffic (registry poisoning). Known, accepted for local use.

@@ -43,3 +43,24 @@ kafka:
     backoff-initial-ms: 1000
     backoff-multiplier: 2.0
     backoff-max-ms: 30000
+
+# Registration with the Eureka server (decisions.md, "Day 8", addendum
+# "Gateway and discovery"). Only the API Gateway looks services up; this
+# service only registers. DEFAULT timings on purpose (heartbeat 30 s, lease
+# 90 s): none are set here. If Eureka is down this service still starts and
+# keeps retrying registration in the background (it logs, it does not fail).
+eureka:
+  client:
+    service-url:
+      defaultZone: http://localhost:8761/eureka
+  instance:
+    # One entry per process, so two instances on different ports register
+    # separately instead of overwriting each other.
+    instance-id: ${spring.application.name}:${server.port}
+    # Register 127.0.0.1, not the machine's host name. Found in the Day 8
+    # smoke run: Windows registered "<host>.mshome.net" (the Hyper-V/ICS
+    # adapter), which the Gateway's Netty DNS resolver cannot resolve, so every
+    # lb:// call was a 500 (UnknownHostException). Everything runs on one
+    # laptop; a multi-host set-up would need the real address here instead.
+    prefer-ip-address: true
+    ip-address: 127.0.0.1

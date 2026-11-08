@@ -1,0 +1,54 @@
+server:
+  # Reserved for the Gateway since the scaffolding (architecture.md §8, Ports).
+  port: 8080
+
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      server:
+        webflux:
+          # NO default filters and NO Retry filter anywhere: a POST the Gateway
+          # repeats is a request the buyer never sent. Retry safety is the
+          # client resending with the same Idempotency-Key (decisions.md,
+          # "Day 8", addendum "Gateway and discovery", point 6).
+          routes:
+            # Found through Eureka (decisions.md, "Day 8", addendum "Gateway and
+            # discovery", point 2). The fixed addresses are the fallback profile
+            # "fixed" (application-fixed.yml). There is NO route for /internal/**:
+            # Order -> Inventory reserve is never routable.
+            - id: identity
+              uri: lb://identity-service
+              predicates:
+                - Path=/api/auth/**
+            - id: order
+              uri: lb://order-service
+              predicates:
+                - Path=/api/orders/**,/webhooks/payment
+            - id: inventory
+              uri: lb://inventory-service
+              predicates:
+                - Path=/api/flash-sales/**,/api/products/**
+
+eureka:
+  client:
+    # The Gateway looks services up but is never a target itself.
+    register-with-eureka: false
+    fetch-registry: true
+    service-url:
+      defaultZone: http://localhost:8761/eureka
+    # DEFAULT timings on purpose (registry fetch every 30 s; LoadBalancer cache
+    # 35 s): none are set here. A stopped instance can stay in use until both
+    # have refreshed; a hard-killed one until Eureka also evicts it.
+
+# Named gateway-auth, not gateway: Spring's relaxed binding would map the
+# environment variable GATEWAY_SIGNING_SECRET straight onto a property called
+# gateway.signing-secret, silently outranking any config file (tests included).
+gateway-auth:
+  # The same HS256 secret Identity signs with (decisions.md, "Day 8", point 1).
+  # From the environment only; blank or shorter than 32 bytes stops start-up.
+  jwt-secret: ${JWT_SECRET:}
+  # Signs the buyer id forwarded to Order (point 5). A DIFFERENT secret from the
+  # JWT one; held by the Gateway and Order only. Same start-up rule.
+  signing-secret: ${GATEWAY_SIGNING_SECRET:}

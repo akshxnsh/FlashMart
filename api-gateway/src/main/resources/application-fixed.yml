@@ -1,0 +1,33 @@
+# Fallback profile "fixed": the Day 8 commit-1 routing, with fixed addresses
+# and no discovery. Use it when Eureka is not running:
+#   java -jar api-gateway.jar --spring.profiles.active=fixed
+# The route list REPLACES the lb:// list in application.yml (a profile's list
+# is not merged item by item). Same paths, same filters; only the targets differ.
+spring:
+  cloud:
+    gateway:
+      server:
+        webflux:
+          routes:
+            - id: identity
+              uri: ${flashmart.routes.identity-uri}
+              predicates:
+                - Path=/api/auth/**
+            - id: order
+              uri: ${flashmart.routes.order-uri}
+              predicates:
+                - Path=/api/orders/**,/webhooks/payment
+            - id: inventory
+              uri: ${flashmart.routes.inventory-uri}
+              predicates:
+                - Path=/api/flash-sales/**,/api/products/**
+
+eureka:
+  client:
+    enabled: false
+
+flashmart:
+  routes:
+    identity-uri: http://localhost:8081
+    inventory-uri: http://localhost:8082
+    order-uri: http://localhost:8083

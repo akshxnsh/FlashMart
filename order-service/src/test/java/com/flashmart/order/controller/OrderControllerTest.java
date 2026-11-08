@@ -1,5 +1,6 @@
 package com.flashmart.order.controller;
 
+import com.flashmart.order.TestGatewayHeaders;
 import com.flashmart.order.TestPayments;
 import com.flashmart.order.client.inventory.InventoryClient;
 import com.flashmart.order.client.payment.PaymentGatewayClient;
@@ -74,7 +75,8 @@ class OrderControllerTest {
             request.header("Idempotency-Key", key);
         }
         if (buyer != null) {
-            request.header("X-Buyer-Id", buyer.toString());
+            // Signed as the Gateway would: Order no longer reads a bare X-Buyer-Id.
+            TestGatewayHeaders.signedAs(request, buyer);
         }
         return mockMvc.perform(request);
     }
@@ -145,11 +147,13 @@ class OrderControllerTest {
         verifyNoInteractions(inventory);
     }
 
+    /** Was a 400 while Order read a bare header; now identity is checked first, so 401 (Day 8). */
     @Test
-    void aMissingOrBadBuyerHeaderIsA400() throws Exception {
-        create("k1", null, body(item(11, 1))).andExpect(status().isBadRequest());
-        create("k1", "abc", body(item(11, 1))).andExpect(status().isBadRequest());
-        create("k1", 0, body(item(11, 1))).andExpect(status().isBadRequest());
+    void aMissingOrBadBuyerIsA401() throws Exception {
+        create("k1", null, body(item(11, 1))).andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.code").value("UNAUTHORIZED"));
+        create("k1", "abc", body(item(11, 1))).andExpect(status().isUnauthorized());
+        create("k1", 0, body(item(11, 1))).andExpect(status().isUnauthorized());
 
         verifyNoInteractions(inventory);
     }
