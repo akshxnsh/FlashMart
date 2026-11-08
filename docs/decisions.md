@@ -5754,3 +5754,66 @@ env var / system property  >  config server  >  local `application.yml`.
   of config-server crashed. Fix: a fresh base directory per start
   (`...-${random.uuid}` under the temp dir), at the cost of one small leftover
   clone per start.
+
+---
+
+## Decision: Day 9, Part B: observability (Prometheus, Grafana, one dashboard as files)
+
+**Status: implemented and tested (endpoint tests, a break-and-restore on the gateway guard); the stack and the
+dashboard were run once on one laptop (`testing.md`, "Day 9 Part B smoke"). Nothing here was load-tested.**
+
+### Decision
+
+Each of order, inventory, identity and the api-gateway exposes Prometheus metrics; a Prometheus and a Grafana in
+`docker-compose.yml` scrape and draw them on one dashboard. The dashboard exists to explain where time goes during
+the Day 9 load test, not to replace the load tool.
+
+### Chosen approach
+
+- **p99 comes from histogram buckets**, not client-side percentiles
+  (`management.metrics.distribution.percentiles-histogram.http.server.requests=true`). Prometheus computes
+  `histogram_quantile(0.99, ...)` from the `_bucket` series. Reason: a client-side percentile cannot be combined
+  across instances or time windows; buckets can. Cost: the answer is only as fine as the bucket edges (Micrometer's
+  defaults here), so a p99 is an estimate between two edges.
+- **Which p99 is the headline.** **Gatling's p99 is the headline**: it is what a buyer experiences (client queueing,
+  Gateway, network, server). **Grafana's p99 is server-side** (each service's own request timer) and **excludes** the
+  Gateway hop, the network and the client's wait, so it is lower and is used to see *which service* the time went to.
+  Never quote the Grafana number as the target result.
+- **Endpoints on each service's own port**, never routed through the Gateway. Exposed: `health`, `prometheus`,
+  `env` only (`/actuator/beans`, `/metrics` etc. answer 404, tested). The Gateway has no route that matches
+  `/actuator/**`: a test evaluates every route's predicate (default `lb://` routes and the `fixed` profile) against
+  actuator paths, and was broken once (a route added for `/actuator/**`) to prove it fails. `PathGuard` is not what
+  protects this (it only rejects dot segments and encoded slashes); the routes are.
+  **Limitation: no authentication on these endpoints.** Anyone who can reach a service port can read its metrics and
+  `/actuator/env`. Local use only, like Eureka and the config server. The Gateway's `AuthFilter` does not apply to
+  its own `/actuator` (it is a route filter).
+- **`/actuator/env` masking (Boot 4 default `show-values: NEVER`, not changed, never `ALWAYS`).** Checked on real
+  processes: `DB_PASSWORD`, `JWT_SECRET`, `GATEWAY_SIGNING_SECRET`, `PAYMENT_WEBHOOK_SECRET` and the
+  properties that carry them show `******`, and none of the four real values appears anywhere in any service's
+  `/actuator/env` output. **Every** value is masked, not only secrets, so the endpoint shows *where* a property comes
+  from (which source won), not its value.
+- **5 s scrape interval.** A short run (a demo, a load test of a few minutes) then has enough points; the cost is more
+  samples, irrelevant at four targets. Rates use a 30 s window (about 6 samples).
+- **Breaker state: yes.** Order's breaker is now created through a `CircuitBreakerRegistry` bound to Micrometer
+  (`resilience4j-micrometer`, same 2.3.0 from the BOM). Exported as
+  `resilience4j_circuitbreaker_state{name="payment-gateway",state=...}` (1 for the current state; names read from the
+  library and confirmed on `/actuator/prometheus`). Behaviour unchanged.
+- **Outbox backlog gauge: no.** Not requested for this piece; the outbox table can be queried directly.
+- **Files, not clicks.** `monitoring/` holds `prometheus.yml`, Grafana's datasource and dashboard provisioning and the
+  dashboard JSON, committed; `docker compose up -d prometheus grafana` rebuilds everything. `allowUiUpdates: false`,
+  so an edit in the Grafana UI is not kept; change the JSON. Grafana's admin password comes from
+  `GRAFANA_ADMIN_PASSWORD` (compose refuses to start without it, same as the DB password).
+- **Metrics settings are in each service's local `application.yml`**, not the config repo (they must work without it).
+- Prometheus reaches the host services through `host.docker.internal` (resolved from a container; all four targets
+  were `up`).
+
+### Trade-offs and consequences
+
+- The compose file now needs `GRAFANA_ADMIN_PASSWORD` set for **any** `docker compose` command (required-variable
+  interpolation covers the whole file). `RateLimitFailOpenTest` runs `docker compose start redis`, so it too needs that
+  variable in `.env`; without it the test fails.
+- Compose derives its project name from the folder, so from another folder (a git worktree) `RateLimitFailOpenTest`
+  cannot find the `flashmart` redis container; set `COMPOSE_PROJECT_NAME=flashmart`. Found while running this piece in
+  a worktree.
+- Notification and payment-stub have no metrics (out of scope; the brief named four services).
+- The gateway's "429" series counts every 429 it returns (the `/api/auth/**` limiter and the order limiter together).

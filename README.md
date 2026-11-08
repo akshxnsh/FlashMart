@@ -123,6 +123,7 @@ Default ports: Gateway 8080, Identity 8081, Inventory 8082, Order 8083, Notifica
 - **One accepted exception to the one-payment invariant:** a second captured payment can escape correction only if initiate idempotency fails to dedupe, a webhook is separately lost, *and* the order reaches `PAID`. Three rare failures must stack.
 - **An early webhook** (arriving while the order is still `CREATED`) is answered non-2xx so the gateway retries. This depends on the gateway retrying long enough.
 - **Rate limiting fails open if Redis is down**, and the browse endpoint is not rate limited.
+- **Metrics and `/actuator/env` are exposed on each service's own port with no authentication** (never routed through the Gateway, but anyone who can reach a service port can read them). Secrets show as `******`; this is for local use only.
 - **A buyer cannot start a new order** while an unpaid one is open, until it pays or expires.
 
 ## Documentation
