@@ -70,5 +70,35 @@ services:
       retries: 12
       start_period: 20s
 
+  # Monitoring (Day 9, Part B). The services run on the host, so Prometheus
+  # reaches them through host.docker.internal (monitoring/prometheus/prometheus.yml).
+  #   docker compose up -d prometheus grafana
+  # Grafana: http://localhost:${GRAFANA_PORT:-3000}, user admin, password from
+  # GRAFANA_ADMIN_PASSWORD (no default). The datasource and the dashboard are
+  # provisioned from files in monitoring/, so nothing is configured by hand.
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      # Already defined by Docker Desktop; this line makes it work on Linux too.
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    depends_on:
+      - prometheus
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
 volumes:
   postgres-data:
