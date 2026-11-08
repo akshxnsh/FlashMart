@@ -1305,3 +1305,20 @@ identity's `expiresIn` from `POST /api/auth/login` (seconds), driven by `identit
   gateway values actually changing, `@Value` values of the fallback copy drifting from the repo.
 - Tests: no test calls port 8888 (client switched off in each service's test config). Checked by searching
   the test output and surefire reports for `8888`: no hits. Not a network capture.
+
+### Hung config server (2026-11-08)
+
+**Label: run once each, one laptop, identity-service only. A throwaway Python script on `8888` accepted TCP
+connections and never replied (`curl` to it timed out), config import timeouts 1000 / 3000 ms.**
+
+| Run | Launch to "Started" line | Result |
+|---|---|---|
+| hung server on 8888 | **23.6 s** (Spring's own "Started in" 21.9 s) | 3 `Read timed out` (6 log lines), the fake server saw 3 connections, log `CONFIG SOURCE: local fallback`, service up |
+| nothing on 8888 (refused) | **13.9 s** | no timeouts, `local fallback`, service up |
+
+The hang added about 9.7 s, i.e. 3 attempts x 3 s. With the library defaults it would be 3 x 185 s read
+timeout by the documented/bytecode values; **that was not measured** (nobody waited). Early-start log lines
+are replayed with the time logging starts, so their own timestamps mislead; the fake server's accept times
+were used. Not run: inventory, order and the gateway against a hung server (same property names, same
+mechanism, not run), a slow-but-answering server. Nothing was left on 8888 afterwards.
+

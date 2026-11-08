@@ -5734,10 +5734,20 @@ env var / system property  >  config server  >  local `application.yml`.
   breaker and rate-limit values on the next restart. GitHub only lets owners/collaborators push (default; not checked here).
 - **No security on the config server itself** (port `8888`, no auth), local use
   only, like Eureka.
-- **A hung (not stopped) config server is not covered.** A refused connection
-  fails at once and the service falls back. A server that accepts and never
-  answers could delay start-up; the client's connect/read timeouts were left at
-  the library defaults (no value was picked by feel). Open.
+- **A hung (not stopped) config server: covered by timeouts.** A refused connection
+  falls back at once. A server that accepts and never answers waited for the client
+  library's defaults, **connect 10000 ms / read 185000 ms** (read from the 5.0.4
+  bytecode; the wait itself was not measured). The client tries it **3 times per
+  start** (seen in the log and on the fake server), so the cost is 3 x read. Each
+  client now sets `spring.cloud.config.request-connect-timeout: 1000` and
+  `request-read-timeout: 3000` in its own local `application.yml` (not in the repo:
+  they must work when the server is down). Why: a healthy request took about 1 s
+  (2.5 s the slowest of 7, each does a git fetch from GitHub), so 3 s keeps a healthy
+  server and a hung one costs about 9 s. 2 s would cost 6 s but could cut off a slow
+  healthy request. Measured once on identity: 23.6 s to start against a hung server
+  vs 13.9 s with nothing listening. Still `optional:`, no fail-fast. If the git
+  fetch per request were cached (`refresh-rate`) the read timeout could be far
+  lower; not done (it would make pushed values lag).
 - **Windows restart bug, found by the smoke run:** with a non-`file://` URI
   Spring deletes and re-clones its base directory at every start, and on
   Windows that delete fails on git's read-only pack files, so the second start
