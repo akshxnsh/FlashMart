@@ -21,3 +21,6 @@ Thumbs.db
 
 # Gatling build output and HTML reports
 load-tests/target/
+
+# Access tokens written by load-tests/make-tokens.sh: live credentials until they expire
+load-tests/tokens/
