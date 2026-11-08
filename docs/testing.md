@@ -1276,3 +1276,26 @@ was not saved in the repo (it lived in a scratch folder); the steps are below.
   instead), Eureka/`lb://` in this run (smoke 1), more than one instance, load.
 - Cleanup: the smoke user was deleted by hand; the seed was re-run afterwards,
   which also emptied Order's tables.
+
+### payment-stub test-isolation fix (2026-11-08)
+
+**Label: implemented; `./mvnw test` for payment-stub alone run 10 times in a row, one laptop. Full output of
+every run kept in a scratch folder (not in the repo). 10 of 10 passed 22/22. The flake was not reproduced in 10.**
+
+- **What changed (test only, no stub code):** `slowBeforeCreatesNothingUntilTheDelayHasPassed` gives up after
+  200 ms, but the stub thread sleeps its full 1000 ms (`SLOW_BEFORE`) and then creates payment `k1`. That ghost
+  payment could land after the next test's `store.clear()` and fail it (seen earlier as `expected: <0> but was:
+  <1>`, 2 of 5 runs, diagnosis recorded on `feat/config-server`). The test now polls (25 ms steps, no fixed
+  sleep) until `k1` appears, so the thread is finished when the test ends. Timeout 5000 ms: about 800 ms of the
+  delay is left after the client gives up, plus a wide margin. The test fails with a message if `k1` never
+  appears.
+- **Not claimed:** "fixed". Ten passing runs are consistent with the cause being removed; they do not prove it
+  (the flake needed about 2 in 5 runs to show before, so 10 clean runs are suggestive, not a proof). The
+  break-and-restore was not repeated for this change.
+- **Same pattern elsewhere?** Checked the other delay test, `slowAfterCreatesThePaymentAndTheRetry...`: not
+  identical. There the payment is created *before* the sleep, so nothing is created after the test's last
+  assertion; the stub thread only sleeps and then writes to a closed connection. Left unchanged.
+- **Full suite on this branch (off `main`), same day:** identity 117, inventory 113, order 308, notification 29,
+  payment-stub 22, api-gateway 46, eureka-server 2 = 637, 0 failures (config-server does not exist on `main`).
+  `COMPOSE_PROJECT_NAME=flashmart` was set for the gateway's fail-open test, as the folder is not named that
+  way in every checkout.
