@@ -39,6 +39,16 @@
   `order-cancelled` itself at startup (`kafka.create-topics`, default `true`).
   `docker compose stop kafka` keeps the topics; `docker compose down` removes
   the container and its data.
+- **Monitoring (Day 9, Part B):** set `GRAFANA_ADMIN_PASSWORD` in `.env` (no default; **every** `docker compose`
+  command now needs it, because compose checks required variables for the whole file), then
+  `docker compose up -d prometheus grafana`. Prometheus: `http://localhost:9090` (the targets page shows each service
+  `up`/`down`); Grafana: `http://localhost:3000`, user `admin`; the dashboard "FlashMart overview" is already there
+  (provisioned from `monitoring/`; edit the JSON, not the UI). A service that is not running shows `down` until it
+  starts (Prometheus scrapes every 5 s). Prometheus reaches the host services at `host.docker.internal`; the metrics
+  are on each service's own port at `/actuator/prometheus`, never through the Gateway, and have no authentication.
+  **Reading it:** the headline p99 is Gatling's (buyer view); Grafana's p99 is server-side and excludes the Gateway,
+  the network and the client's wait. `RateLimitFailOpenTest` runs `docker compose` itself: it needs the variable above,
+  and from another folder (a git worktree) `COMPOSE_PROJECT_NAME=flashmart`.
 - Order's relay is on by default (`outbox.relay.enabled`, default `true`). Set
   it to `false` to run Order with no broker at all; outbox rows then stay
   unpublished until a relay runs.

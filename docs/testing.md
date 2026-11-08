@@ -1366,3 +1366,35 @@ kept in a scratch folder (not in the repo). It FAILED in 2 of the 5 (runs 2 and 
   failure and 22/22 on the immediate rerun. Their output was not kept, so that they were this same test is
   consistent with the above but **not proven**.
 
+## Day 9 Part B smoke: Prometheus, Grafana, the dashboard (2026-11-08)
+
+**Label: run once, one laptop, real processes started from a git worktree: config-server, Eureka, identity,
+inventory, order, payment-stub and the api-gateway on the jars, Kafka, Prometheus and Grafana from compose. Not a load
+test (about 40 orders in all). No screenshot was taken: what is reported is the values each dashboard panel's own query
+returned, run through Grafana's HTTP API (`/api/ds/query`) against the provisioned datasource.**
+
+| Check | What was seen |
+|---|---|
+| Prometheus targets | all four (`api-gateway`, `identity-service`, `inventory-service`, `order-service`) `up`, scraped via `host.docker.internal` |
+| Provisioning | Grafana started from files only: datasource `Prometheus` (uid `prometheus`) and dashboard "FlashMart overview" present |
+| Traffic through the gateway (signup, login, browse, `POST /api/orders`) | order creates `201`; the first batch of 8 all `201` |
+| Request rate panel | `POST /api/orders` and `reserve` rose from 0 to a maximum of about 0.44 req/s, last 0.28 |
+| p99 panel (server side) | `POST /api/orders` p99 min 0.033 s, max 0.71 s; reserve p99 min 0.008 s, max 0.18 s |
+| JVM heap panel | one series per service (about 44 to 124 MB used) |
+| Hikari panel | series for identity, inventory, order; **active and pending were 0 at every sample** (idle samples, no contention seen) |
+| Gateway 429 panel | non-zero (3.8 to 12.6 per minute): **caused by my own traffic script**, whose signup + login pairs exceeded the `/api/auth/**` limiter (1/s per IP); a second batch therefore had many `401`s from empty tokens. Not an order-limiter result. |
+| Breaker: payment-stub stopped, 8 orders | all `503`; Order log `payment circuit breaker CLOSED -> OPEN (failure rate 50.0%, 10 calls in window, 5 failed)`; the panel's query went from `closed=1` to `open=1` (open-state samples, 5 s apart: `0000...0000111`). Not exercised: HALF_OPEN or the return to CLOSED. |
+| `/actuator/env` masking | `DB_PASSWORD`, `JWT_SECRET`, `GATEWAY_SIGNING_SECRET`, `PAYMENT_WEBHOOK_SECRET` and the properties holding them are `******` on all four services; none of the four real values appears in any service's `/actuator/env` (searched by script) |
+| Config source (`/actuator/env/<property>`) | `payment.read-timeout-ms` (order), `gateway-ratelimit.orders.burst` (gateway), `kafka.consumer.backoff-max-ms` (inventory), `identity.jwt.access-ttl` (identity): the winning source is `configserver:https://github.com/akshxnsh/flashmart-config/<service>.yml` in all four; the local `application.yml` is listed below it. **The value itself shows `******`** (Boot 4 masks every value), so the endpoint proves the source, not the number. |
+
+**Surprises**
+- The gateway had **no actuator dependency** at all (the brief assumed it did); it was added.
+- Order's breaker was not tied to any registry, so no breaker metric existed until it was created through a
+  `CircuitBreakerRegistry` (behaviour unchanged; the existing breaker tests still pass).
+- Appending a line to `.env` when it had no trailing newline glued it onto the `DB_PASSWORD` line; caught because
+  compose still said the new variable was missing; `.env` restored from the main folder.
+- In the first full baseline in the worktree, `RateLimitFailOpenTest` failed ("service redis has no container to
+  start"): compose names its project after the folder. With `COMPOSE_PROJECT_NAME=flashmart` it passes.
+- Not covered: Hikari under real contention, a long run, the Gateway-side p99 (not on the dashboard by design), more
+  than one instance per service.
+

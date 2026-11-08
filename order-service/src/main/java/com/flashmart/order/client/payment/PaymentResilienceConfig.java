@@ -2,8 +2,11 @@ package com.flashmart.order.client.payment;
 
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics;
 import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
+import io.micrometer.core.instrument.binder.MeterBinder;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -19,6 +22,23 @@ import java.time.Duration;
 @Slf4j
 @Configuration
 public class PaymentResilienceConfig {
+
+    /**
+     * Holds the breaker only so its state can be exported to Micrometer
+     * ({@link #paymentBreakerMetrics()}); the breaker is the same class and
+     * configuration as {@code CircuitBreaker.of(name, config)} would give.
+     */
+    private final CircuitBreakerRegistry registry = CircuitBreakerRegistry.ofDefaults();
+
+    /**
+     * Exports {@code resilience4j_circuitbreaker_state} (and calls, failure
+     * rate, ...) to Prometheus, tagged {@code name="payment-gateway"}
+     * (decisions.md, Day 9, Part B). Observability only: no behaviour change.
+     */
+    @Bean
+    public MeterBinder paymentBreakerMetrics() {
+        return TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(registry);
+    }
 
     /**
      * COUNT_BASED over the last {@code window-size} calls, judged once at least
@@ -38,7 +58,7 @@ public class PaymentResilienceConfig {
                                                 @Value("${payment.breaker.failure-rate-percent}") float failureRate,
                                                 @Value("${payment.breaker.open-ms}") long openMs,
                                                 @Value("${payment.breaker.half-open-calls}") int halfOpenCalls) {
-        CircuitBreaker breaker = CircuitBreaker.of("payment-gateway", CircuitBreakerConfig.custom()
+        CircuitBreaker breaker = registry.circuitBreaker("payment-gateway", CircuitBreakerConfig.custom()
                 .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
                 .slidingWindowSize(windowSize)
                 .minimumNumberOfCalls(minimumCalls)

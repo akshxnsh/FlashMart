@@ -66,6 +66,23 @@ kafka:
 # service only registers. DEFAULT timings on purpose (heartbeat 30 s, lease
 # 90 s): none are set here. If Eureka is down this service still starts and
 # keeps retrying registration in the background (it logs, it does not fail).
+# Metrics (decisions.md, Day 9, Part B). Same port as the service, never routed
+# through the Gateway; NO authentication (local use only). Only these three
+# endpoints are exposed. /actuator/env masks values by default (Boot 4); do NOT
+# set show-values: ALWAYS. The latency histogram (buckets) lets Prometheus
+# compute p99 across instances; no client-side percentiles.
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,env
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+
 eureka:
   client:
     service-url:
