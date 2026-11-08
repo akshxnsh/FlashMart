@@ -5,6 +5,15 @@ server:
 spring:
   application:
     name: api-gateway
+  # Redis for the rate limiter (see gateway-ratelimit below). The limiter FAILS
+  # OPEN. The short timeouts keep a hung (not just stopped) Redis from stalling
+  # requests for Lettuce's 60 s default; 500 ms is PROVISIONAL and unmeasured.
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 500ms
+      connect-timeout: 500ms
   cloud:
     gateway:
       server:
@@ -22,6 +31,28 @@ spring:
               uri: lb://identity-service
               predicates:
                 - Path=/api/auth/**
+              filters:
+                - name: RequestRateLimiter
+                  args:
+                    key-resolver: "#{@ipKeyResolver}"
+                    redis-rate-limiter.replenishRate: ${gateway-ratelimit.auth.replenish-rate}
+                    redis-rate-limiter.burstCapacity: ${gateway-ratelimit.auth.burst}
+            # POST /api/orders only is rate limited, per authenticated buyer
+            # (decisions.md, "Day 8", point 7). Listed BEFORE the general order
+            # route so it wins for POST; GETs and the webhook are not limited.
+            # The limiter runs after AuthFilter (a global filter ordered first),
+            # which sets X-Buyer-Id: that is what the key is read from.
+            - id: order-create
+              uri: lb://order-service
+              predicates:
+                - Path=/api/orders,/api/orders/**
+                - Method=POST
+              filters:
+                - name: RequestRateLimiter
+                  args:
+                    key-resolver: "#{@buyerKeyResolver}"
+                    redis-rate-limiter.replenishRate: ${gateway-ratelimit.orders.replenish-rate}
+                    redis-rate-limiter.burstCapacity: ${gateway-ratelimit.orders.burst}
             - id: order
               uri: lb://order-service
               predicates:
@@ -30,6 +61,18 @@ spring:
               uri: lb://inventory-service
               predicates:
                 - Path=/api/flash-sales/**,/api/products/**
+
+# Rate limits: PROVISIONAL, unmeasured, recheck on Day 9 (decisions.md, "Day 8",
+# point 7). Token bucket: replenish-rate tokens/s, burst = bucket size. They
+# protect the Gateway's and Order's capacity; they do NOT prevent overselling
+# (Inventory's conditional UPDATE does).
+gateway-ratelimit:
+  orders:      # POST /api/orders, key = authenticated buyer id
+    replenish-rate: 5
+    burst: 10
+  auth:        # /api/auth/**, key = client IP (socket address, never X-Forwarded-For)
+    replenish-rate: 1
+    burst: 5
 
 eureka:
   client:

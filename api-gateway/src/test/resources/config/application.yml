@@ -12,3 +12,16 @@ gateway-auth:
 eureka:
   client:
     enabled: false
+
+# The contract tests make many auth and order calls from one IP and a few
+# buyers; their limits are far above anything they send, so they test routing
+# and identity, not the limiter. RateLimitTest sets its own low values. Redis
+# is the compose one on localhost:6379; the limiter fails open, so these tests
+# pass without it.
+gateway-ratelimit:
+  orders:
+    replenish-rate: 1000
+    burst: 1000
+  auth:
+    replenish-rate: 1000
+    burst: 1000
