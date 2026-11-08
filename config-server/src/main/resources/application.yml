@@ -1,0 +1,19 @@
+server:
+  port: 8888
+
+spring:
+  application:
+    name: config-server
+  cloud:
+    config:
+      server:
+        git:
+          # Public repo, so NO credentials anywhere (decisions.md, Day 9). The
+          # repo holds tunable numbers only, never a secret.
+          uri: ${CONFIG_REPO_URI:https://github.com/akshxnsh/flashmart-config}
+          default-label: main
+          # Cloned once when this server starts, so a first request does not
+          # pay for the clone and a bad URI fails at start-up, not later.
+          clone-on-start: true
+          # Where the clone lives. Local only, never committed.
+          basedir: ${CONFIG_BASEDIR:${java.io.tmpdir}/flashmart-config-server}
