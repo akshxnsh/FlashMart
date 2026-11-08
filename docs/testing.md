@@ -1276,3 +1276,32 @@ was not saved in the repo (it lived in a scratch folder); the steps are below.
   instead), Eureka/`lb://` in this run (smoke 1), more than one instance, load.
 - Cleanup: the smoke user was deleted by hand; the seed was re-run afterwards,
   which also emptied Order's tables.
+
+## Day 9 Part 0 smoke: config server (2026-11-08)
+
+**Label: run once each, one laptop, real processes. config-server against the real public GitHub repo
+(`akshxnsh/flashmart-config`), then identity-service (the observed service), then one boot each of inventory,
+order and api-gateway. No Eureka, no Kafka (order started with `OUTBOX_RELAY_ENABLED=false`,
+`KAFKA_CREATE_TOPICS=false`), no load. Throwaway start scripts, not saved in the repo.** Observed value:
+identity's `expiresIn` from `POST /api/auth/login` (seconds), driven by `identity.jwt.access-ttl`
+(local file `15m` = 900).
+
+| Step | Result |
+|---|---|
+| (a) repo `access-ttl: 16m`, pushed, restart identity only (config-server not restarted) | log `CONFIG SOURCE: config server`; `expiresIn` **960**. Change then reverted and the revert pushed (repo is back to `15m`). |
+| (b) config-server stopped, identity restarted | log `CONFIG SOURCE: local fallback`; boots; `expiresIn` **900** |
+| (c) config-server serving `15m`, identity started with env `IDENTITY_JWT_ACCESSTTL=20m` | log says config server; `expiresIn` **1200**: the env var beats the config server |
+| inventory, order, api-gateway, each started once with config-server up | each logs `CONFIG SOURCE: config server`; the repo file names resolved (`/{name}/default/main` returned each file). Their values were not individually checked. |
+| the same three started once with config-server down (first attempt, config-server had failed to start) | each logs `local fallback` and starts |
+
+**Surprises**
+- **config-server did not restart on Windows**: it deletes and re-clones its base directory on every start
+  and the delete failed on git's read-only pack files (`AccessDeniedException`). Fixed with a fresh base
+  directory per start; the restart then worked (restarted once more after the fix, served all three files).
+- My first kill command matched the wrong processes and did nothing, so my first "restart" test read the old
+  instance (`expiresIn` 900 again). Caught because the value did not change; redone with an exact process filter.
+- Not covered: a hung config server (accepts, never answers), more than one instance, config-server
+  behind a firewall/with no internet at start (the first clone would fail), the order, inventory and
+  gateway values actually changing, `@Value` values of the fallback copy drifting from the repo.
+- Tests: no test calls port 8888 (client switched off in each service's test config). Checked by searching
+  the test output and surefire reports for `8888`: no hits. Not a network capture.

@@ -33,6 +33,7 @@ radius, not by domain noun.
 |---|---|---|
 | **API Gateway** | Nothing (no DB) | Stateless routing, JWT at the edge, per-buyer / per-IP rate limiting (Redis), signs the buyer id it forwards. Spring Cloud Gateway, reactive (WebFlux); finds services through Eureka. **Built on Day 8, tested, smoke-run once** (§3, "Edge: Gateway"). |
 | **Eureka server** (`eureka-server`) | Nothing (in-memory registry) | Service discovery for the Gateway only; standalone, port `8761`. **Built on Day 8, tested, smoke-run once** (§3, "Gateway and discovery"). |
+| **Config server** (`config-server`) | Nothing (clones a public Git repo) | Serves tunable numbers (timeouts, breaker, fee, sweep, relay, rate limits) to order, inventory, identity and the Gateway; port `8888`. Each client keeps a local fallback copy; env vars beat both; restart to apply. **Implemented and tested; smoke-run once** (`decisions.md`, "Day 9, Part 0"). |
 | **Order Service** | `orders`, `order_items`, `refunds`, `outbox` | Sole authority on an order's fate (§6). Hot/bursty, isolated from cold traffic. |
 | **Inventory Service** | `flash_sales`, `flash_sale_items`, `stock_reservations`, `products` | The hottest, most contended row in the system (`flash_sale_items`). Isolated so contention can't lock-starve unrelated services. |
 | **Identity Service** | `brands`, `api_keys`, `users`, `outbox`, and `refresh_tokens` (V8, Day 8, implemented, MockMvc-tested) | Brands and buyers share one access pattern — cold, low-volume auth — not because they're the same kind of entity. |
@@ -596,6 +597,8 @@ below (490 total after Day 7) are superseded by the 2026-11-08 run: identity 117
 inventory 113, order 308, notification 29, payment-stub 22, api-gateway 46,
 eureka-server 2 = **637**, all passing, 0 failures (each run once, one laptop;
 the limiter tests need the compose Redis and Docker).
+
+**Day 9, Part 0 (config server): IMPLEMENTED and TESTED; smoke-run once.** `config-server` (port `8888`, Spring Cloud Config, Git backend on the public `flashmart-config` repo) serves the tunable numbers of order, inventory, identity and the Gateway; each client keeps a local fallback copy, env vars beat both, values apply on restart (`decisions.md`, "Day 9, Part 0"). Suites run 2026-11-08 after the change: identity 117, inventory 113, order 308, notification 29, payment-stub 22, api-gateway 46, eureka-server 2, config-server 1 = **638**, all passing, 0 failures (baseline before the change: 637; one laptop; the payment-stub suite failed once in the first baseline run and passed 22/22 on an immediate rerun, cause not diagnosed). Not built: a check that the repo and the local copies agree, a timeout for a hung (not stopped) config server, any config-server security.
 
 *Day 8 Identity implementation notes:*
 - Login also rejects any password over 72 bytes: bcrypt ignores everything past

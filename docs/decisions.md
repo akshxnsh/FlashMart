@@ -5658,3 +5658,89 @@ that says "designed, not built", this section wins.
   not-cancelled sales whose `end_time > now()` (scheduled and live, as designed);
   each carries `state`. Items expose `inStock` only: the existing item DTO has
   `totalStock`, so browse uses a new item DTO without it.
+
+---
+
+## Decision: Day 9, Part 0: config server (Spring Cloud Config, Git backend, public repo, local fallback)
+
+**Status: implemented and tested; smoke-run once on one laptop (`testing.md`,
+"Day 9 Part 0 smoke"). Values are the same provisional, unmeasured numbers as
+before. Nothing was tuned or re-derived.**
+
+### Decision
+
+Tunable numbers (timeouts, attempts, breaker, fee, sweep, outbox relay, rate
+limits, bcrypt strength, token lifetimes, consumer backoff) can be served from
+one Git repo by a new `config-server` module (port `8888`), instead of only
+from each service's own `application.yml`.
+
+### Context
+
+The Day 9 load test will change these numbers many times. Editing and
+rebuilding four jars for each try is slow. The numbers also feed derived
+deadlines (the `CREATED` deadline), so they should be visible in one place.
+
+### Chosen approach
+
+- **Repo:** `github.com/akshxnsh/flashmart-config`, branch `main`, one file per
+  service named `{spring.application.name}.yml` (`order-service.yml`,
+  `inventory-service.yml`, `identity-service.yml`, `api-gateway.yml`). The
+  server clones it at start and then pulls on each request.
+- **Public repo, no credentials.** So the repo holds numbers only: never a
+  secret, a password, a DB URL, a port or an address. The repo is scanned for
+  these before every push. `JWT_SECRET`, `GATEWAY_SIGNING_SECRET`,
+  `PAYMENT_WEBHOOK_SECRET`, `DB_*`, ports, `spring.application.name`, Kafka and
+  Eureka addresses, `inventory.base-url` and the import line stay local or in
+  env vars. (`inventory.base-url` is under `inventory.*` but is an address, like
+  the DB url, so it stayed local.)
+- **Clients:** order, inventory, identity, api-gateway. Notification,
+  payment-stub and eureka are untouched. Property **names are unchanged**, so
+  `CreateOrderSettings`, the Feign clients and the breaker config still read one
+  source, and the CREATED deadline is still derived from the values the clients
+  really use.
+- **Option A (chosen): every moved value also stays in the service's local
+  `application.yml` as a fallback.** The import is
+  `optional:configserver:http://localhost:8888`, so a service starts when the
+  config server is down, on its local copy. One start-up line says which one it
+  got (`CONFIG SOURCE: config server` / `local fallback`).
+- **Option B (rejected): remove the values from the services and make the
+  config server mandatory.** Then a down config server means no service can
+  start, and a load-test machine restart needs one more process healthy first.
+  For a one-laptop learning project the extra failure mode buys nothing.
+
+### Precedence (checked on real processes, identity-service, one run each)
+
+env var / system property  >  config server  >  local `application.yml`.
+
+- Config server (`access-ttl: 16m` in the repo) beat the local file (`15m`):
+  `expiresIn` 960 instead of 900.
+- An env var (`IDENTITY_JWT_ACCESSTTL=20m`) beat the config server (`15m`):
+  `expiresIn` 1200. So an env var is still the emergency override.
+- Config server down: local file (`expiresIn` 900), log line "local fallback".
+- Tests turn the client off (`spring.cloud.config.enabled: false` in each
+  service's test `config/application.yml`), so no test calls port 8888.
+
+### Trade-offs and consequences
+
+- **Restart to apply.** Values are read once at start-up (`@Value`, the
+  Resilience4j beans). There is no `@RefreshScope` and no `/actuator/refresh`:
+  hot reload of a breaker or a deadline mid-flight would be a new decision.
+- **Drift risk: two copies of every value.** If someone changes the repo and
+  not the local file (or the reverse), the services behave differently with
+  the config server up and down. Nothing checks this yet. The repo values equal
+  the local ones today (by hand); a test that compares them is not built.
+- **Public repo means anyone can read the tuning numbers.** Accepted: they are
+  not secrets. It also means anyone who can push to the repo can change
+  breaker and rate-limit values on the next restart. GitHub only lets owners/collaborators push (default; not checked here).
+- **No security on the config server itself** (port `8888`, no auth), local use
+  only, like Eureka.
+- **A hung (not stopped) config server is not covered.** A refused connection
+  fails at once and the service falls back. A server that accepts and never
+  answers could delay start-up; the client's connect/read timeouts were left at
+  the library defaults (no value was picked by feel). Open.
+- **Windows restart bug, found by the smoke run:** with a non-`file://` URI
+  Spring deletes and re-clones its base directory at every start, and on
+  Windows that delete fails on git's read-only pack files, so the second start
+  of config-server crashed. Fix: a fresh base directory per start
+  (`...-${random.uuid}` under the temp dir), at the cost of one small leftover
+  clone per start.

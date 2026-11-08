@@ -44,9 +44,15 @@
   unpublished until a relay runs.
 - The services run on the host (IDE or jar): identity 8081, inventory 8082,
   order 8083, notification 8084, payment stub 8085 (127.0.0.1 only).
-- **Start-up order once the Gateway and Eureka exist (Day 8, DESIGNED, not
-  built):** Eureka server (`8761`) first, then Identity / Inventory / Order, then
-  the API Gateway (`8080`) last. Reason: the Gateway finds services only through
+- **Start-up order (built; Day 9 added the config server):** Config server
+  (`8888`) first, then Eureka server (`8761`), then Identity / Inventory / Order,
+  then the API Gateway (`8080`) last. The config server is *optional* for every
+  client: if it is down a service starts on its own local `application.yml` and
+  logs `CONFIG SOURCE: local fallback`. Values apply only at a service's next
+  restart, never live. Precedence: env var > config server > local file. The
+  config server needs internet at start (it clones the public GitHub repo
+  `flashmart-config`; override with `CONFIG_REPO_URI`). Reason for the Eureka
+  part: the Gateway finds services only through
   Eureka; a Gateway started while Eureka is down has an empty registry and
   answers `503 SERVICE_UNAVAILABLE` on every discovered route until Eureka is
   back. A business service started before Eureka still starts (it warns and
