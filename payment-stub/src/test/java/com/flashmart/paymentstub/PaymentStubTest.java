@@ -257,7 +257,21 @@ class PaymentStubTest {
                 () -> post("/api/payments/initiate", "k1", valid(42, "49.00"), Duration.ofMillis(200)));
 
         assertEquals(0, store.size()); // still waiting, nothing created yet
+
+        // The server thread is still sleeping and WILL create k1 when it wakes,
+        // even though the client gave up. Wait for that, so the payment cannot
+        // land in the next test's store (it made the next test flaky).
+        long deadline = System.nanoTime() + Duration.ofMillis(LEFTOVER_PAYMENT_TIMEOUT_MS).toNanos();
+        while (store.find("k1").isEmpty()) {
+            assertTrue(System.nanoTime() < deadline,
+                    "the delayed payment k1 never appeared within " + LEFTOVER_PAYMENT_TIMEOUT_MS + " ms");
+            Thread.sleep(25);
+        }
     }
+
+    // The stub's SLOW_BEFORE delay is 1000 ms; about 800 ms of it is left after
+    // the client gives up. 5000 ms is that plus a wide margin for a slow machine.
+    private static final long LEFTOVER_PAYMENT_TIMEOUT_MS = 5000;
 
     @Test
     void anUnknownModeIs400AndTheModeIsUnchanged() throws Exception {
