@@ -15,5 +15,10 @@ spring:
           # Cloned once when this server starts, so a first request does not
           # pay for the clone and a bad URI fails at start-up, not later.
           clone-on-start: true
-          # Where the clone lives. Local only, never committed.
-          basedir: ${CONFIG_BASEDIR:${java.io.tmpdir}/flashmart-config-server}
+          # Where the clone lives. Local only, never committed. A NEW directory per
+          # start: with a non-file URI Spring deletes and re-clones its base dir at
+          # every start, and on Windows that delete fails (AccessDeniedException on
+          # git's read-only pack files), so a plain restart would not boot. Found in
+          # the Day 9 smoke run. Cost: one small leftover clone per start in the temp
+          # directory.
+          basedir: ${CONFIG_BASEDIR:${java.io.tmpdir}/flashmart-config-server-${random.uuid}}
