@@ -49,6 +49,10 @@
 		     registers itself (application.yml). Brings Spring Cloud LoadBalancer. -->
 		<dependency>
 			<groupId>org.springframework.cloud</groupId>
+			<artifactId>spring-cloud-starter-config</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.cloud</groupId>
 			<artifactId>spring-cloud-starter-netflix-eureka-client</artifactId>
 		</dependency>
 		<!-- Verifies Identity's HS256 access tokens. CPU only, no I/O, so it is

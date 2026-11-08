@@ -7,6 +7,13 @@ server:
 spring:
   application:
     name: order-service
+  config:
+    # Config server (decisions.md, Day 9). `optional:` = if it is down this service
+    # still starts, on the values in THIS file (the local fallback). When it is up,
+    # its values win over this file; env vars and system properties still win over
+    # both (see decisions.md for the checked precedence).
+    import: optional:configserver:http://localhost:8888
+
   datasource:
     url: jdbc:postgresql://localhost:5432/order-service
     username: ${DB_USERNAME}
@@ -29,6 +36,15 @@ spring:
       accept-float-as-int: false
 
   cloud:
+    config:
+      # Timeouts for the config import, in ms. Library defaults (5.0.4, from its
+      # bytecode): connect 10000, read 185000. A server that accepts and never answers
+      # is tried 3 times per start (seen in the smoke run), so the wait is 3 x read.
+      # Healthy local server: about 1 s per request, 2.5 s the slowest seen (each
+      # request does a git fetch), so read 3000 keeps a healthy one and makes a hung
+      # one cost about 9 s. Local only: they must work when the server is down.
+      request-connect-timeout: 1000
+      request-read-timeout: 3000
     openfeign:
       client:
         config:

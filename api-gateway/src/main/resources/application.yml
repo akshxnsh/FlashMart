@@ -5,6 +5,13 @@ server:
 spring:
   application:
     name: api-gateway
+  config:
+    # Config server (decisions.md, Day 9). `optional:` = if it is down this service
+    # still starts, on the values in THIS file (the local fallback). When it is up,
+    # its values win over this file; env vars and system properties still win over
+    # both (see decisions.md for the checked precedence).
+    import: optional:configserver:http://localhost:8888
+
   # Redis for the rate limiter (see gateway-ratelimit below). The limiter FAILS
   # OPEN. The short timeouts keep a hung (not just stopped) Redis from stalling
   # requests for Lettuce's 60 s default; 500 ms is PROVISIONAL and unmeasured.
@@ -15,6 +22,15 @@ spring:
       timeout: 500ms
       connect-timeout: 500ms
   cloud:
+    config:
+      # Timeouts for the config import, in ms. Library defaults (5.0.4, from its
+      # bytecode): connect 10000, read 185000. A server that accepts and never answers
+      # is tried 3 times per start (seen in the smoke run), so the wait is 3 x read.
+      # Healthy local server: about 1 s per request, 2.5 s the slowest seen (each
+      # request does a git fetch), so read 3000 keeps a healthy one and makes a hung
+      # one cost about 9 s. Local only: they must work when the server is down.
+      request-connect-timeout: 1000
+      request-read-timeout: 3000
     gateway:
       server:
         webflux:

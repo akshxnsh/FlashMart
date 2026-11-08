@@ -25,3 +25,10 @@ gateway-ratelimit:
   auth:
     replenish-rate: 1000
     burst: 1000
+
+# No config server in tests: nothing may call localhost:8888, so every test runs on
+# the local file values (decisions.md, Day 9).
+spring:
+  cloud:
+    config:
+      enabled: false

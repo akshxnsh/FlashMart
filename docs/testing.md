@@ -1299,3 +1299,70 @@ every run kept in a scratch folder (not in the repo). 10 of 10 passed 22/22. The
   payment-stub 22, api-gateway 46, eureka-server 2 = 637, 0 failures (config-server does not exist on `main`).
   `COMPOSE_PROJECT_NAME=flashmart` was set for the gateway's fail-open test, as the folder is not named that
   way in every checkout.
+
+## Day 9 Part 0 smoke: config server (2026-11-08)
+
+**Label: run once each, one laptop, real processes. config-server against the real public GitHub repo
+(`akshxnsh/flashmart-config`), then identity-service (the observed service), then one boot each of inventory,
+order and api-gateway. No Eureka, no Kafka (order started with `OUTBOX_RELAY_ENABLED=false`,
+`KAFKA_CREATE_TOPICS=false`), no load. Throwaway start scripts, not saved in the repo.** Observed value:
+identity's `expiresIn` from `POST /api/auth/login` (seconds), driven by `identity.jwt.access-ttl`
+(local file `15m` = 900).
+
+| Step | Result |
+|---|---|
+| (a) repo `access-ttl: 16m`, pushed, restart identity only (config-server not restarted) | log `CONFIG SOURCE: config server`; `expiresIn` **960**. Change then reverted and the revert pushed (repo is back to `15m`). |
+| (b) config-server stopped, identity restarted | log `CONFIG SOURCE: local fallback`; boots; `expiresIn` **900** |
+| (c) config-server serving `15m`, identity started with env `IDENTITY_JWT_ACCESSTTL=20m` | log says config server; `expiresIn` **1200**: the env var beats the config server |
+| inventory, order, api-gateway, each started once with config-server up | each logs `CONFIG SOURCE: config server`; the repo file names resolved (`/{name}/default/main` returned each file). Their values were not individually checked. |
+| the same three started once with config-server down (first attempt, config-server had failed to start) | each logs `local fallback` and starts |
+
+**Surprises**
+- **config-server did not restart on Windows**: it deletes and re-clones its base directory on every start
+  and the delete failed on git's read-only pack files (`AccessDeniedException`). Fixed with a fresh base
+  directory per start; the restart then worked (restarted once more after the fix, served all three files).
+- My first kill command matched the wrong processes and did nothing, so my first "restart" test read the old
+  instance (`expiresIn` 900 again). Caught because the value did not change; redone with an exact process filter.
+- Not covered: a hung config server (accepts, never answers), more than one instance, config-server
+  behind a firewall/with no internet at start (the first clone would fail), the order, inventory and
+  gateway values actually changing, `@Value` values of the fallback copy drifting from the repo.
+- Tests: no test calls port 8888 (client switched off in each service's test config). Checked by searching
+  the test output and surefire reports for `8888`: no hits. Not a network capture.
+
+### Hung config server (2026-11-08)
+
+**Label: run once each, one laptop, identity-service only. A throwaway Python script on `8888` accepted TCP
+connections and never replied (`curl` to it timed out), config import timeouts 1000 / 3000 ms.**
+
+| Run | Launch to "Started" line | Result |
+|---|---|---|
+| hung server on 8888 | **23.6 s** (Spring's own "Started in" 21.9 s) | 3 `Read timed out` (6 log lines), the fake server saw 3 connections, log `CONFIG SOURCE: local fallback`, service up |
+| nothing on 8888 (refused) | **13.9 s** | no timeouts, `local fallback`, service up |
+
+The hang added about 9.7 s, i.e. 3 attempts x 3 s. With the library defaults it would be 3 x 185 s read
+timeout by the documented/bytecode values; **that was not measured** (nobody waited). Early-start log lines
+are replayed with the time logging starts, so their own timestamps mislead; the fake server's accept times
+were used. Not run: inventory, order and the gateway against a hung server (same property names, same
+mechanism, not run), a slow-but-answering server. Nothing was left on 8888 afterwards.
+
+### payment-stub flaky test (2026-11-08)
+
+**Label: `./mvnw test` for payment-stub alone, run 5 times in a row, one laptop. Full output of every run
+kept in a scratch folder (not in the repo). It FAILED in 2 of the 5 (runs 2 and 4); runs 1, 3, 5 passed 22/22.**
+
+- **Failing test, both times, same line:** `PaymentStubTest.badInputIs400InvalidRequestAndCreatesNothing`,
+  `PaymentStubTest.java:195`, `expected: <0> but was: <1>` (`assertEquals(0, store.size())`).
+- **Cause (from the code, then checked by a throwaway experiment):** a test-isolation bug, not a stub bug.
+  `slowBeforeCreatesNothingUntilTheDelayHasPassed` gives up after 200 ms, but the server thread keeps
+  sleeping its 1000 ms (`SLOW_BEFORE`) and then creates payment `k1`, about 800 ms after the test has ended.
+  `@BeforeEach store.clear()` of the next test has already run, so a later test sees an extra payment.
+  Which test it hits depends on timing: `badInput...` runs about 0.55-0.65 s after `slowBefore...` and
+  fails when the ghost lands inside its 0.09 s window. **Experiment:** with that delay temporarily cut to
+  600 ms (reverted, file clean) the ghost landed in `concurrentRequestsWithTheSameKeyCreateExactlyOnePayment`
+  instead and that test failed 3 of 3 runs with `expected: <50> but was: <51>`.
+- **Not fixed.** Proposed fix (waiting for a decision): after its assertion, that test waits (polls with a
+  timeout, no fixed sleep) until the ghost payment appears, so nothing outlives the test.
+- **Earlier failures:** the first baseline run and the full-suite run after Fix 1 each had one payment-stub
+  failure and 22/22 on the immediate rerun. Their output was not kept, so that they were this same test is
+  consistent with the above but **not proven**.
+
