@@ -33,7 +33,7 @@ typical marketplace "should" have it.
 
 ### Buyer
 - FR-B1: The system shall let a buyer browse active and upcoming flash sales.
-  *Design note (Day 8, **designed, not built**, no endpoint exists):* "active
+  *Design note (Day 8, **built and tested**; `GET /api/flash-sales?page=N` in Inventory, via the Gateway with a Bearer token; not load-tested):* "active
   and upcoming" means not cancelled and not yet ended (`end_time > now()` on the
   database clock). Paged, 10 per page, ordered by start time; stock is shown only
   as a coarse `inStock` flag, never an exact count; uncached. Accepted: a sale
@@ -46,7 +46,7 @@ typical marketplace "should" have it.
   `decisions.md`, "Day 8", points 1 to 6. *Status:* Identity's signup, login,
   refresh and logout are **implemented and tested at MockMvc level only** (real
   Postgres, no real HTTP, no gateway). The "credential the buyer cannot forge"
-  half (gateway, signed header, Order's check) is **designed, not built**.
+  half (gateway, signed header, Order's check) is **built and tested** (api-gateway tests, Order signed-header tests; smoke-run once, not load-tested).
   `architecture.md` §8.
 - FR-B2: The system shall let a buyer attempt a purchase only while the
   relevant sale is within its active time window.
@@ -136,7 +136,7 @@ full metrics table.
 - NFR-R2: Held stock shall be reliably released when its order expires,
   even if the buyer never returns, the client crashes, or the service
   handling the purchase dies mid-flow.
-- NFR-R3 *(new, designed only, not built)*: The system shall limit how fast one
+- NFR-R3 *(new; built and tested, provisional limits)*: The system shall limit how fast one
   buyer (order endpoints) or one client address (login and signup) can send
   requests, so that one client cannot take the shared capacity. This is
   protection, not correctness: if the limiter is unavailable it fails open, and

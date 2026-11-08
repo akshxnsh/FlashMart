@@ -926,10 +926,11 @@ stop_order; stop_inventory; kill "$STUB_PID"; wait "$STUB_PID" 2>/dev/null
 echo "done"
 ```
 
-## Day 8 planned proofs (NOT run)
+## Day 8 planned proofs (original plan; most are now built, see the sections below)
 
-**Label: DESIGNED, not built, not run.** Nothing below has been written or
-executed. This is the list of what must be shown when Day 8 is built
+**Label: this is the PLAN as written before Day 8.** Most proofs now exist as tests
+(Identity, gateway, Order, rate limiter, browse); the results are in the Day 8
+sections below and `architecture.md` §8. Not every row was built as written. This is the list of what must be shown when Day 8 is built
 (`decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse"). No
 result, count or timing exists for any line. Per `CLAUDE.md`: a guard that
 carries correctness gets a break-and-restore, and a concurrency claim gets a test
@@ -1121,7 +1122,8 @@ start() { # name jar args...
 # The Windows PID of the java.exe running a jar. kill -9 from Git Bash only
 # kills the MSYS wrapper and leaves java running (seen in run 2), so a hard
 # kill is taskkill /F (TerminateProcess: no shutdown hooks, no deregistration).
-winpid_of() { powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*$1*' }).ProcessId" | tr -d ''; }
+winpid_of() { powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter \"Name='java.exe'\" | Where-Object { \$_.CommandLine -like '*$1*' }).ProcessId" | tr -d '
+'; }
 hardkill() { local v="JAR_$1"; [ -n "${!v:-}" ] || return 0; for pid in $(winpid_of "${!v}"); do taskkill //F //PID "$pid" > /dev/null; done; return 0; }
 # A fresh access token (they live 15 min, and the hard-kill wait can be longer).
 fresh_token() { status -X POST "$GW/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" > /dev/null; TOKEN=$(jsonget accessToken); }

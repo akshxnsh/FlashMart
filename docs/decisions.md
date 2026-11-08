@@ -5610,3 +5610,51 @@ switch to `lb://` routes, keeping the fixed addresses as a fallback profile.
   instance and "a `POST` is attempted exactly once".
 
 **DESIGNED, not built.**
+
+### Implementation notes (2026-11-08): what building Day 8 changed or showed
+
+**Status: BUILT and tested (suites run 2026-11-08: identity 117, inventory 113,
+order 308, notification 29, payment-stub 22, api-gateway 46, eureka-server 2).
+Gateway and Eureka smoke-run once on real processes (`testing.md`). Not
+load-tested; one laptop.** The design text above stays as written; this section
+records what differs or was learned. Where it conflicts with an earlier line
+that says "designed, not built", this section wins.
+
+- **Hostname bug (found by the smoke run).** Services registered under the
+  Windows host name `<host>.mshome.net`, which the Gateway's Netty resolver
+  cannot resolve: every `lb://` call was a 500. Services now register
+  `127.0.0.1` (`prefer-ip-address`, `ip-address`); a multi-host set-up needs the
+  real address. The Gateway now logs any error it turns into a 500.
+- **Dot-segment path guard.** A test showed `/api/products/../../internal/...`
+  being forwarded to Inventory, whose Tomcat would resolve it onto the
+  unauthenticated reserve endpoint. `PathGuard` answers `400 INVALID_PATH` for
+  dot segments (also encoded, or with `;params`) and encoded `/` or `\`.
+- **Measured, one run each, default Eureka timings:** graceful stop of
+  Inventory left the registry after **7.8 s**; a hard kill stayed listed for
+  **224.3 s**; with Eureka hard-killed, routes kept working for the **68 s**
+  measured (cached registry).
+- **`Authorization` header is still forwarded** to the services (not stripped).
+- **A refused connection returns 503 with the "no instance" message**, so a
+  dead-but-still-listed instance looks like "no instance" to the client.
+  Misleading; the status is right, the message is not. Not changed.
+- **Spring Cloud 2025.1.2** officially lists Boot 4.0.7 and 4.1.0; it works on
+  4.1.1 (every context-starting test passes).
+- **Rate limiter (point 7), as built:** `RequestRateLimiter` + `RedisRateLimiter`.
+  `POST /api/orders` keyed by the buyer id the JWT filter set (5/s, burst 10);
+  `/api/auth/**` keyed by the socket address (1/s, burst 5; `X-Forwarded-For` is
+  never trusted, and clients behind one NAT share a bucket). The JWT filter runs
+  first (proven by a test and a break-and-restore). A 429 carries
+  `{code: RATE_LIMITED, message}` and `Retry-After`. It **fails open**, proven by
+  really stopping Redis (500 ms Lettuce timeout so a hung Redis cannot stall
+  requests). Values are properties and **provisional, unmeasured**. The script
+  gets time in whole seconds, so a burst can allow one extra request.
+- **The limiter protects capacity, not oversell.** Inventory's conditional
+  `UPDATE` is what stops overselling.
+- **Day 9 load test must use many different buyers or a raised limit**, or it
+  measures `429`s from the limiter (5/s per buyer). Seeded users cannot log in.
+- **Browse (point 8), as built:** `GET /api/flash-sales?page=N`, size 10,
+  `ORDER BY start_time, id`, database clock, size+1 rows for `hasNext`, items in
+  one query (three statements per page: clock, sales, items), uncached. Shows
+  not-cancelled sales whose `end_time > now()` (scheduled and live, as designed);
+  each carries `state`. Items expose `inStock` only: the existing item DTO has
+  `totalStock`, so browse uses a new item DTO without it.

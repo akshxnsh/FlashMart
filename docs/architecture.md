@@ -6,12 +6,12 @@
 > code behind it (entities in every service; Inventory's `reserve` and its two
 > Kafka consumers; Order's create path, payment step, payment webhook, outbox
 > relay and expiry sweep; the payment stub), each with its own label there.
-> **Day 7 is the last piece fully built. Day 8 (auth, gateway identity, rate
-> limiting, browse) is DESIGNED; only Identity's signup/login/refresh/logout and
-> V8 are built (MockMvc-tested, §8); the Gateway, signed header, Order's check,
-> Redis limiter and browse are NOT built** (`decisions.md`, "Day 8: auth, gateway
-> identity, rate limiting, browse"); where this document describes the Gateway,
-> JWT, rate limiting or browse it is describing that design, not code.
+> **Day 8 (auth, gateway, discovery, rate limiting, browse) is BUILT and tested
+> (§8):** Identity auth + V8, the api-gateway (JWT check, signed buyer id, Redis
+> rate limiter), Order's signed-header check, the Eureka server and client
+> registration, and Inventory's browse endpoint. Smoke-run once on real
+> processes (gateway/Eureka part). Not load-tested, one laptop
+> (`decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse").
 > **First laptop load runs only (see §8); the 5,000-buyer / p99 target is not reached.**
 
 ## 1. System Overview
@@ -31,8 +31,8 @@ radius, not by domain noun.
 
 | Service | Owns | Why this boundary |
 |---|---|---|
-| **API Gateway** | Nothing (no DB) | Stateless routing, JWT at the edge, per-buyer / per-IP rate limiting (Redis), signs the buyer id it forwards. Spring Cloud Gateway, reactive (WebFlux); finds services through Eureka. **Designed on Day 8, not built** (§3, "Edge: Gateway"). |
-| **Eureka server** (`eureka-server`) | Nothing (in-memory registry) | Service discovery for the Gateway only; standalone, port `8761`. **Designed on Day 8, not built** (§3, "Gateway and discovery"). |
+| **API Gateway** | Nothing (no DB) | Stateless routing, JWT at the edge, per-buyer / per-IP rate limiting (Redis), signs the buyer id it forwards. Spring Cloud Gateway, reactive (WebFlux); finds services through Eureka. **Built on Day 8, tested, smoke-run once** (§3, "Edge: Gateway"). |
+| **Eureka server** (`eureka-server`) | Nothing (in-memory registry) | Service discovery for the Gateway only; standalone, port `8761`. **Built on Day 8, tested, smoke-run once** (§3, "Gateway and discovery"). |
 | **Order Service** | `orders`, `order_items`, `refunds`, `outbox` | Sole authority on an order's fate (§6). Hot/bursty, isolated from cold traffic. |
 | **Inventory Service** | `flash_sales`, `flash_sale_items`, `stock_reservations`, `products` | The hottest, most contended row in the system (`flash_sale_items`). Isolated so contention can't lock-starve unrelated services. |
 | **Identity Service** | `brands`, `api_keys`, `users`, `outbox`, and `refresh_tokens` (V8, Day 8, implemented, MockMvc-tested) | Brands and buyers share one access pattern — cold, low-volume auth — not because they're the same kind of entity. |
@@ -70,11 +70,11 @@ proceeding.
 **Asynchronous — inbound webhook:**
 - **Razorpay Clone → Order** — payment result, signature-verified (FR-P2). Carries **our order id**, by which Order loads the row (never by `payment_ref`, which may be `NULL`; §6). Applies the one-payment invariant (§6); returns 200 only after its transaction commits, so a pre-commit crash is replayed by the gateway's own retry. Wire contract (decisions.md, "Day 6", point 4): `POST /webhooks/payment`, body `{order_id, payment_ref, status, amount}` (amount a string), HMAC-SHA256 hex of the raw body in `X-Signature`; `401` / `400` / `404` / `409` (order still `CREATED`) / `200`. Implemented and tested; sent only by the payment-stub so far (§8).
 
-**Edge: Gateway, identity and rate limiting (Day 8: DESIGNED; Identity's endpoints and V8 are built and MockMvc-tested, the rest is not built).** Design: `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse". Only the Identity part of the flow below exists in code (§8); the Gateway, the signed header, Order's check, rate limiting and browse do not. Order today still trusts the temporary, forgeable `X-Buyer-Id` header (§8, Day 4).
+**Edge: Gateway, identity and rate limiting (Day 8: BUILT and tested; smoke-run once, not load-tested).** Design: `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse". Only the Identity part of the flow below exists in code (§8); the Gateway, the signed header, Order's check, rate limiting and browse do not. Order today still trusts the temporary, forgeable `X-Buyer-Id` header (§8, Day 4).
 - **Identity flow.** A buyer signs up or logs in at Identity (`/api/auth/**`) and gets an HS256 access JWT (15 min; claims `sub`, `typ` = `user`|`brand`, `iat`, `exp` only) and an opaque refresh token (7 days, stored as a hash in Identity's `refresh_tokens`, Postgres). Only `user` tokens are issued. `JWT_SECRET` is held by Identity and the Gateway only; both refuse a blank value.
 - **Refresh.** Each refresh is a compare-and-set on `refresh_tokens` (`revoked_at IS NULL AND expires_at > clock_timestamp()`, both stamped by the database clock): one winner gets a new pair; a revoked token seen again revokes every refresh token of that user (no grace window; a two-tab race logs the buyer out everywhere, accepted). Endpoints: signup, login, refresh, logout. Access tokens are not revocable before they expire.
 - **Gateway to Order.** The Gateway validates the JWT once (rejecting `typ != user` on `/api/orders/**`), strips any client `X-Buyer-Id`, and forwards `X-Buyer-Id` plus an HMAC over the buyer id and a timestamp, keyed by `GATEWAY_SIGNING_SECRET` (Gateway and Order only; separate from the JWT secret). Order answers `401` for a missing, bad or more-than-60 s-old signature and refuses a blank secret. The payment webhook keeps its own HMAC; `/internal/**` is never routed. **Limit:** `:8082` and `:8083` are reachable directly, and Inventory has no auth, so this guards the front door only.
-- **Gateway and discovery (DESIGNED, not built; `decisions.md`, "Day 8", addendum "Gateway and discovery").** Spring Cloud Gateway, **reactive** (WebFlux): it mostly waits on downstream services, and it must never run a blocking call (its only own work is the JWT check and the HMAC). **Eureka is used by the Gateway only**: routes are `lb://identity-service`, `lb://inventory-service`, `lb://order-service`, with the fixed addresses kept as a fallback profile. **Order's Feign clients keep fixed URLs**, because the Day 5 derived timeouts assume one attempt per call and no load-balancer retries. Eureka server: separate module, port `8761`, standalone (no self-registration, no fetch), self-preservation **off** for the demo (on in production), no security locally (anyone reaching `8761` could register a fake service). **Default Eureka timings** (heartbeat 30 s, lease 90 s, which Eureka's own code says really expires after about 2 × 90 s, eviction check 60 s, server response cache 30 s, Gateway fetch 30 s, LoadBalancer cache 35 s): a hard-killed instance can stay in use for minutes (estimate, not measured); discovery is eventually consistent. No instance → `503 SERVICE_UNAVAILABLE` `{code, message}`; Eureka down → the Gateway keeps its cached registry, but a Gateway restarted while Eureka is down has none and answers `503`. **No automatic Gateway retries** (retry safety is the client reusing its `Idempotency-Key`). One instance per service; an optional demo runs two Inventory instances behind `GET /api/flash-sales`; **never two Order instances** (multi-instance races untested; the outbox relay would publish twice). Identity, Inventory and Order register; Notification and the payment-stub do not.
+- **Gateway and discovery (BUILT and tested; smoke-run once; `decisions.md`, "Day 8", addendum "Gateway and discovery").** Spring Cloud Gateway, **reactive** (WebFlux): it mostly waits on downstream services, and it must never run a blocking call (its only own work is the JWT check and the HMAC). **Eureka is used by the Gateway only**: routes are `lb://identity-service`, `lb://inventory-service`, `lb://order-service`, with the fixed addresses kept as a fallback profile. **Order's Feign clients keep fixed URLs**, because the Day 5 derived timeouts assume one attempt per call and no load-balancer retries. Eureka server: separate module, port `8761`, standalone (no self-registration, no fetch), self-preservation **off** for the demo (on in production), no security locally (anyone reaching `8761` could register a fake service). **Default Eureka timings** (heartbeat 30 s, lease 90 s, which Eureka's own code says really expires after about 2 × 90 s, eviction check 60 s, server response cache 30 s, Gateway fetch 30 s, LoadBalancer cache 35 s): a hard-killed instance can stay in use for minutes (estimate, not measured); discovery is eventually consistent. No instance → `503 SERVICE_UNAVAILABLE` `{code, message}`; Eureka down → the Gateway keeps its cached registry, but a Gateway restarted while Eureka is down has none and answers `503`. **No automatic Gateway retries** (retry safety is the client reusing its `Idempotency-Key`). One instance per service; an optional demo runs two Inventory instances behind `GET /api/flash-sales`; **never two Order instances** (multi-instance races untested; the outbox relay would publish twice). Identity, Inventory and Order register; Notification and the payment-stub do not.
 - **Rate limiting.** Spring Cloud Gateway `RedisRateLimiter` (token bucket), provisional values, recheck Day 9: `/api/orders/**` per buyer id 5/s burst 10; `/api/auth/**` per client IP 1/s burst 5; browse unlimited. The JWT filter runs before the limiter. The limiter **fails open** if Redis is down: it is protection, not correctness, and does not prevent overselling (the conditional `UPDATE` does). Day 9 trap: the oversell load test needs many buyers or a raised limit, or it measures `429`s.
 - **Browse (FR-B1).** `GET /api/flash-sales?page=N` in Inventory: 0-based, fixed page size 10, not `CANCELLED` and `end_time > now()` (database clock), ordered by `start_time, id`; an `inStock` flag, never an exact count; `hasNext` from an 11-row fetch, no `COUNT`; items in one extra query; a bad page is `400 INVALID_REQUEST`; uncached. Offset paging can skip a sale that ends between two pages (accepted; a cursor is the fix at scale).
 
@@ -581,14 +581,21 @@ See `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse" and
 §3, "Edge: Gateway". **Implemented and tested, at MockMvc level only
 (branch `feat/day8-identity-auth`, not merged):** Identity's `POST
 /api/auth/signup`, `login`, `refresh` and `logout` and migration V8
-(`refresh_tokens`). **Still NOT built (designed only):** the Gateway module, the
-signed `X-Buyer-Id` header, Order's check of it, the Redis rate limiter and the
-browse endpoint; Order still trusts the forgeable `X-Buyer-Id`. Test count:
+(`refresh_tokens`). **Since built and tested too (2026-11-08):** the api-gateway
+(JWT check, signed `X-Buyer-Id` header, `lb://` routes, Redis rate limiter that
+fails open), Order's check of the signed header (the forgeable bare header is
+gone), the Eureka server, client registration in Identity/Inventory/Order, and
+Inventory's `GET /api/flash-sales?page=N`. Gateway/Eureka were smoke-run once
+on real processes (`testing.md`); the limiter and browse were not smoke-run
+until the final step of that piece (see `testing.md`). Test count:
 the Identity suite ran **116** tests, all passing, in a Claude Code session
 after the three pieces were built, and **117** after a start-up test for a
 space-only `JWT_SECRET` was added (run in the same session, 0 failures, 0
 errors, 0 skipped). Identity was 47 on 2026-11-06; the other services' counts
-below (490 total after Day 7) were not re-run and are unchanged.
+below (490 total after Day 7) are superseded by the 2026-11-08 run: identity 117,
+inventory 113, order 308, notification 29, payment-stub 22, api-gateway 46,
+eureka-server 2 = **637**, all passing, 0 failures (each run once, one laptop;
+the limiter tests need the compose Redis and Docker).
 
 *Day 8 Identity implementation notes:*
 - Login also rejects any password over 72 bytes: bcrypt ignores everything past
@@ -678,7 +685,7 @@ below (490 total after Day 7) were not re-run and are unchanged.
   column. Implemented and **run on 2026-11-03**; break-and-restore done: 5 of
   the 6 original guards were killed, `@DynamicUpdate` was the survivor and was
   removed, and each of the six set-once columns is killed by a named test.
-  **Test totals:** see "Tested" below (490 on 2026-11-06, after Day 7).
+  **Test totals:** see "Tested" below (637 on 2026-11-08; 490 on 2026-11-06 was after Day 7).
   **Day-1 repositories:** `OrderRepository` has one native compare-and-set per
   transition (set amount, `CREATED` to `RESERVATION_FAILED` / `PAYMENT_UNAVAILABLE`,
   `CREATED` or `PENDING_PAYMENT` to `ORDER_EXPIRED` with no time condition,
@@ -708,9 +715,9 @@ below (490 total after Day 7) were not re-run and are unchanged.
 - **Order create path (Day 4, branch `feat/day4-order-create`, 2026-11-05):
   implemented, tested, raced; not run against a real Inventory, not load-tested.**
   Design: `decisions.md`, "Order creation: retries, conflicts, deadlines and Inventory failures".
-  - `POST /api/orders` (gateway not built): `Idempotency-Key` (non-blank, max 255)
-    and a temporary, forgeable `X-Buyer-Id` header (TODO Day 8: gateway-signed
-    identity; **designed, not built**, see §3, "Edge: Gateway"). Bean Validation added to Order. Quantity 1..5 per line and on the
+  - `POST /api/orders` (via the Gateway; Order verifies the signed identity): `Idempotency-Key` (non-blank, max 255)
+    and the buyer from the Gateway-signed identity headers (Day 8, built; was a
+    forgeable `X-Buyer-Id` until then, see §3, "Edge: Gateway"). Bean Validation added to Order. Quantity 1..5 per line and on the
     merged total of a duplicated product; at most `maxLines` = floor((60 s - 6.5 s) / 3 s) =
     17 distinct products (Day 5: derived in `CreateOrderSettings` from config, not
     typed in; tested: 17 accepted, 18 is a `400`). A bad request is a `400` and Inventory is never called
@@ -1115,7 +1122,7 @@ below (490 total after Day 7) were not re-run and are unchanged.
   All four services share one local Postgres credential pair but each owns a
   separate database.
 
-**Tested on `main` after Day 7: 490 tests, all passing, 0 failures, 0 errors,
+**Tested after Day 7 (superseded by 637 on 2026-11-08, see Day 8 above): 490 tests, all passing, 0 failures, 0 errors,
 0 skipped** - all five suites run on 2026-11-06 (branch `docs/day7-status`, no code
 change against `main` `b3dc125`), no Docker needed (the relay and consumer tests
 use an embedded broker): Order 290, Inventory 102, Identity 47, Notification 29,
@@ -1360,7 +1367,7 @@ verified under failure.
 
 **Ports:** identity `8081`, inventory `8082`, order `8083`, notification
 `8084`; `8080` is reserved for the API Gateway and `8761` for the Eureka server
-(both designed on Day 8, not built). `8085` is the payment
+(both built on Day 8). `8085` is the payment
 stub, on 127.0.0.1 only (built and tested; run against Order in the Day 5
 failure demo and the Day 6 end-to-end run; see §8). Kafka (docker-compose) on
 `localhost:9092`.
