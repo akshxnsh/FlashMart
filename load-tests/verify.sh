@@ -6,8 +6,12 @@
 #
 # Prints the item's stock and its reservations, then exits non-zero unless ALL hold:
 #   available_stock >= 0
-#   sum(reserved quantity) <= total_stock
-#   available_stock = total_stock - sum(reserved quantity)
+#   sum(held quantity) <= total_stock
+#   available_stock = total_stock - sum(held quantity)
+# "Held" = RESERVED + CONFIRMED. A RELEASED row has given its stock back
+# (Order cancelled, Inventory's consumer released it), so it is not subtracted.
+# With no RELEASED rows (every reserve-only run) this is the same as counting
+# all reservations, which is what this script did before PlaceOrders existed.
 set -euo pipefail
 
 : "${DB_USERNAME:?DB_USERNAME is not set}"
@@ -19,11 +23,15 @@ INVENTORY_DB="inventory-service"
 
 export PGPASSWORD="$DB_PASSWORD"
 
-# One row: total_stock|available_stock|version|reservations|reserved_qty
+# One row: total_stock|available_stock|version|reservations|held_qty|released_count|released_qty
 row="$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USERNAME" -d "$INVENTORY_DB" -At -v ON_ERROR_STOP=1 -c "
 select i.total_stock, i.available_stock, i.version,
        (select count(*) from stock_reservations r where r.flash_sale_item_id = i.id),
-       (select coalesce(sum(r.quantity), 0) from stock_reservations r where r.flash_sale_item_id = i.id)
+       (select coalesce(sum(r.quantity), 0) from stock_reservations r
+         where r.flash_sale_item_id = i.id and r.status in ('RESERVED', 'CONFIRMED')),
+       (select count(*) from stock_reservations r where r.flash_sale_item_id = i.id and r.status = 'RELEASED'),
+       (select coalesce(sum(r.quantity), 0) from stock_reservations r
+         where r.flash_sale_item_id = i.id and r.status = 'RELEASED')
 from flash_sale_items i where i.id = ${ITEM_ID}")"
 
 if [ -z "$row" ]; then
@@ -31,13 +39,13 @@ if [ -z "$row" ]; then
   exit 2
 fi
 
-IFS='|' read -r total available version res_count res_qty <<<"$row"
+IFS='|' read -r total available version res_count res_qty rel_count rel_qty <<<"$row"
 
 echo "item_id=${ITEM_ID}"
 echo "total_stock=${total}"
 echo "available_stock=${available}"
 echo "version=${version}"
-echo "stock_reservations count=${res_count} sum(quantity)=${res_qty}"
+echo "stock_reservations count=${res_count} held(RESERVED+CONFIRMED) sum(quantity)=${res_qty} RELEASED count=${rel_count} sum(quantity)=${rel_qty}"
 
 fail=0
 if [ "$available" -lt 0 ]; then
