@@ -7,6 +7,13 @@ server:
 spring:
   application:
     name: inventory-service
+  config:
+    # Config server (decisions.md, Day 9). `optional:` = if it is down this service
+    # still starts, on the values in THIS file (the local fallback). When it is up,
+    # its values win over this file; env vars and system properties still win over
+    # both (see decisions.md for the checked precedence).
+    import: optional:configserver:http://localhost:8888
+
   datasource:
     url: jdbc:postgresql://localhost:5432/inventory-service
     username: ${DB_USERNAME}

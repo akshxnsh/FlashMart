@@ -11,3 +11,10 @@ identity:
 eureka:
   client:
     enabled: false
+
+# No config server in tests: nothing may call localhost:8888, so every test runs on
+# the local file values (decisions.md, Day 9).
+spring:
+  cloud:
+    config:
+      enabled: false

@@ -33,6 +33,10 @@ spring:
   datasource:
     hikari:
       maximum-pool-size: 4
+  # No config server in tests: nothing may call localhost:8888 (decisions.md, Day 9).
+  cloud:
+    config:
+      enabled: false
 
 # No Eureka client in tests: no suite needs a running Eureka server, and no
 # test context registers anything.
