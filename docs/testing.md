@@ -1322,3 +1322,24 @@ are replayed with the time logging starts, so their own timestamps mislead; the 
 were used. Not run: inventory, order and the gateway against a hung server (same property names, same
 mechanism, not run), a slow-but-answering server. Nothing was left on 8888 afterwards.
 
+### payment-stub flaky test (2026-11-08)
+
+**Label: `./mvnw test` for payment-stub alone, run 5 times in a row, one laptop. Full output of every run
+kept in a scratch folder (not in the repo). It FAILED in 2 of the 5 (runs 2 and 4); runs 1, 3, 5 passed 22/22.**
+
+- **Failing test, both times, same line:** `PaymentStubTest.badInputIs400InvalidRequestAndCreatesNothing`,
+  `PaymentStubTest.java:195`, `expected: <0> but was: <1>` (`assertEquals(0, store.size())`).
+- **Cause (from the code, then checked by a throwaway experiment):** a test-isolation bug, not a stub bug.
+  `slowBeforeCreatesNothingUntilTheDelayHasPassed` gives up after 200 ms, but the server thread keeps
+  sleeping its 1000 ms (`SLOW_BEFORE`) and then creates payment `k1`, about 800 ms after the test has ended.
+  `@BeforeEach store.clear()` of the next test has already run, so a later test sees an extra payment.
+  Which test it hits depends on timing: `badInput...` runs about 0.55-0.65 s after `slowBefore...` and
+  fails when the ghost lands inside its 0.09 s window. **Experiment:** with that delay temporarily cut to
+  600 ms (reverted, file clean) the ghost landed in `concurrentRequestsWithTheSameKeyCreateExactlyOnePayment`
+  instead and that test failed 3 of 3 runs with `expected: <50> but was: <51>`.
+- **Not fixed.** Proposed fix (waiting for a decision): after its assertion, that test waits (polls with a
+  timeout, no fixed sleep) until the ghost payment appears, so nothing outlives the test.
+- **Earlier failures:** the first baseline run and the full-suite run after Fix 1 each had one payment-stub
+  failure and 22/22 on the immediate rerun. Their output was not kept, so that they were this same test is
+  consistent with the above but **not proven**.
+
