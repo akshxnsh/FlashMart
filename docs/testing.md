@@ -1398,3 +1398,38 @@ returned, run through Grafana's HTTP API (`/api/ds/query`) against the provision
 - Not covered: Hikari under real contention, a long run, the Gateway-side p99 (not on the dashboard by design), more
   than one instance per service.
 
+
+## Day 9 Part C smoke: order load-test setup (2026-11-08)
+
+**Label: run once, about 50 measured buyers (plus the 200-buyer warm-up), one laptop, stub gateway (payment-stub, auto
+webhook SUCCESS). Real processes from `main`'s jars: config-server, Eureka, identity, inventory, order, payment-stub,
+api-gateway; Redis, Kafka, Prometheus, Grafana from compose; local Postgres. Not a load test and no performance claim:
+the full run is Part D.** The stack start script was throwaway (scratch folder); the steps are in `development.md`,
+"Running the order load test".
+
+**Step 0, merged `main` before any change:** signup + login via `:8080` gave `201`, `200`. One `POST /api/orders` (sale 1,
+product 1) gave `201 PENDING_PAYMENT` and reached `PAID` within 4 s, with its reservation `CONFIRMED`. Grafana: after one
+order the rate panels still read 0 (a counter that first appears at 1 shows no increase to `rate()`). After two more
+orders, the rate was 0.08 req/s and both p99 series had values; breaker `closed`. The 3 smoke users were deleted afterwards.
+
+| Step | Result |
+|---|---|
+| `create-users.sh`, 5,000 + 200, concurrency 8 | **110.9 s**, 5,200 created (all `201`) |
+| same again | 110.9 s, 0 created, 5,200 skipped (`409`). It costs as long as creating them; the cause was not checked (likely the hash runs before the email check) |
+| `make-tokens.sh`, 5,200 logins, concurrency 8 | **145.5 s**; token lifetime 900 s; **754 s (12.6 min) left** when it finished |
+| Simulation start | budget left **265 s**: about 8 minutes passed between the token step and the run (the session paused between the two), not Gatling start-up |
+| Status counts, `place-order` (50 buyers, 10 s ramp) | `{201=50}` |
+| Status counts, `warmup` (200 buyers, item 2, 50 units) | `{201=50, 409=150}` |
+| `place-order` response times (50 requests, Gatling) | p50 57, p95 88, p99 = max 95 ms. Too few requests to mean anything under load |
+| `verify.sh` item 1 / item 2 | OK / OK: 450 and 0 available, 50 reservations each, all `CONFIRMED` |
+| `check-orders.sh` item 1 / item 2 | OK / OK: 100 `PAID`, 150 `RESERVATION_FAILED`, 0 `CREATED`, 0 buyers with two live-or-paid orders, order units = Inventory units (50 = 50 each) |
+| Grafana panels (each panel's own query via `/api/ds/query`, last 3 min) | order rate max 7.1 req/s, reserve max 9.1 req/s; server-side p99 max 0.53 s (orders) / 0.81 s (reserve) at the start, 0.07 s / 0.01 s by the end; breaker `closed` throughout; gateway 429: no values; Hikari active max 2 (inventory, order), pending 0 |
+
+**Not covered:** 5,000 buyers (Part D), whether the full run fits the token budget (it has to fit in whatever is left
+after the token step; the logins alone use 2.4 of the 15 min), contention of any kind, the 429 and 503 paths through
+this scenario (none occurred), a run after the 6-minute payment window. The seed was reset after the run. The 5,200
+test buyers stay in Identity on purpose (re-runs skip them).
+
+**Full suite on `feat/load-test-setup`, same day, stack stopped, seed fresh:** identity 119, inventory 115, order 310,
+notification 29, payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **650, 0 failures, 0 errors**
+(no service code changed in this piece; the load-tests module has no unit tests).

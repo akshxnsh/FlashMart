@@ -82,3 +82,33 @@
   local Postgres.
 - Manual multi-process runs (Day 5 failure demo, Day 6 end to end) and their
   scripts are in `docs/testing.md`.
+
+## Running the order load test (`PlaceOrders`, Day 9 Part C)
+
+Buyers place orders through the Gateway (`POST /api/orders` on `:8080`): one buyer, one token, one order, quantity 1.
+`ReserveOneItem` (Inventory only, `:8082`) is unchanged. All commands from Git Bash, repo root, with the `.env` values
+exported (`set -a; . ./.env; set +a`).
+
+1. **Stack up**, in the start-up order above: config server, Eureka, Identity, Inventory, Order, payment-stub, then
+   the Gateway. Compose: `redis`, `kafka`, and optionally `prometheus grafana`. Identity and the Gateway need the same
+   `JWT_SECRET`; the Gateway and Order need the same `GATEWAY_SIGNING_SECRET`.
+2. **Payments end PAID:** `curl -X POST http://127.0.0.1:8085/admin/auto-webhook -H 'Content-Type: application/json' -d '{"status":"SUCCESS"}'`.
+   The stub starts with auto-webhooks `OFF` and forgets the setting when it restarts. Without it, every order waits
+   in `PENDING_PAYMENT` until the sweep expires it.
+3. **Reset:** `bash scripts/seed/seed.sh` (item 1: 500 units, item 2: 50 units, Order's tables emptied).
+4. **Buyers, once per database:** `bash load-tests/create-users.sh` (default 5,000 measured + 200 warm-up; `BUYERS`,
+   `WARMUP`, `CONCURRENCY` to change). These are real signups straight on Identity `:8081`, never through the Gateway,
+   because its auth limiter allows 1 request/s per IP. A second run skips existing buyers (409). Emails and the shared
+   password are fixed and test-only (`load-tests/buyers.py`).
+5. **Tokens, right before the run:** `bash load-tests/make-tokens.sh` writes `load-tests/tokens/` (git-ignored).
+   Access tokens live **15 min**. The script prints how much of that is left, and the simulation prints it at the start
+   and end and refuses to start if the tokens have expired. For 5,200 buyers the logins took 145.5 s once (12.6 min left).
+6. **Run:** `cd load-tests && ../order-service/mvnw gatling:test -Dgatling.simulationClass=com.flashmart.load.PlaceOrders -Dbuyers=5000 -DrampSeconds=10`.
+   A 200-buyer warm-up on item 2 runs first. Read the `place-order` request, not the global line. The run prints
+   `STATUS place-order ...` with a count per HTTP status. 200/201/409/429/503 count as answered; anything else is KO.
+7. **Check, within 6 minutes of the last order** (the payment window; after it the expiry sweep releases stock):
+   `bash load-tests/verify.sh` (Inventory: stock arithmetic, item 1) and `bash load-tests/check-orders.sh`
+   (Order: no buyer has two live-or-paid orders, none stuck `CREATED`, order units = Inventory's held units).
+   Use `ITEM_ID=2` / `PRODUCT_ID=2 ITEM_ID=2` for the warm-up item.
+8. **Reset again** with `seed.sh`. It does not delete the test buyers. Their refresh tokens pile up in Identity,
+   one row per login.

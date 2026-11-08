@@ -19,6 +19,7 @@
         <gatling.version>3.16.0</gatling.version>
         <gatling-maven-plugin.version>4.21.12</gatling-maven-plugin.version>
         <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
+        <gatling.simulationClass>com.flashmart.load.ReserveOneItem</gatling.simulationClass>
     </properties>
 
     <dependencies>
@@ -42,7 +43,9 @@
                 <artifactId>gatling-maven-plugin</artifactId>
                 <version>${gatling-maven-plugin.version}</version>
                 <configuration>
-                    <simulationClass>com.flashmart.load.ReserveOneItem</simulationClass>
+                    <!-- Default stays ReserveOneItem; pick another with
+                         -Dgatling.simulationClass=com.flashmart.load.PlaceOrders -->
+                    <simulationClass>${gatling.simulationClass}</simulationClass>
                 </configuration>
             </plugin>
         </plugins>
