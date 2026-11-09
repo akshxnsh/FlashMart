@@ -1560,3 +1560,102 @@ bash load-tests/count-gap.sh
 **Full suite on `feat/load-runs` after the runs, stack stopped, seed fresh:** identity 119, inventory 115, order 310,
 notification 29, payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **650, 0 failures, 0 errors**
 (no service code changed).
+
+## Day 9 Part F step 2: open-in-view off, 1 s pool wait in the deadline, R2 and R3 again (2026-11-09)
+
+**Label: run once each, one laptop (load tool, all services, Postgres, Docker on the same machine), stub gateway
+(auto webhook SUCCESS, AFTER_REPLY), one Kafka broker, one partition. Branch `fix/open-in-view-off` (decisions.md,
+"Day 9, Part F"). Changes: `spring.jpa.open-in-view: false` in Order, Inventory and Identity; Order's Hikari
+`connection-timeout: 1000` ms, counted in the `CREATED` deadline; a pool timeout answers `503 SERVICE_BUSY`. Pool
+SIZE, every other timeout and the Redis values unchanged. The stack was restarted on this branch's jars, so R2F hit
+FRESH JVMs (the Part D R2 ran on JVMs warmed by R1); R3F ran on the JVMs R2F had warmed. Every service logged
+`CONFIG SOURCE: config server`; the 1 s pool timeout came from Order's local file (the config-repo commit is not
+pushed) and every order's deadline was 20.5 s, so the running Order read it. Targets are targets.**
+
+### Tests added (before the runs)
+
+- `OpenInViewOffHttpTest`: a real HTTP `POST /api/orders` with a slow (300 ms) Inventory and a slow payment call
+  (both mocks); the pool's active count during each call is 0. **Break-and-restore:** with `open-in-view: true` it
+  failed ("a pooled connection was held while Inventory was called", active 1); restored, it passes.
+- `OrderInsertTest`: the derivation (one item 20.5 s, was 14.5 s; `maxLines` 9, was 17; 9 lines 60.5 s), its
+  inputs, the start-up rejection, and that the running pool's timeout is the one the deadline uses.
+  **Break-and-restore:** dropping the pool-wait term failed 5 of 9; restored, 9 of 9 pass.
+- `PoolTimeoutHttpTest` (pool of 2, both held by the test; Flyway needs two at start-up): a timeout after reserve
+  answers exactly `{"code":"SERVICE_BUSY","message":"the service is busy; retry with the same Idempotency-Key"}`
+  with 503, the order stays `CREATED` with its item unpriced, and the sweep then expires it with an
+  `OrderCancelled{ORDER_EXPIRED}` outbox row; a timeout before the insert answers 503 and leaves no order.
+  `PoolTimeoutHandlerTest`: any other failure of the same Spring types keeps the default 500.
+- **Not tested:** Inventory actually releasing in that test (Inventory is a mock there; its consumer has its own
+  tests), and the accepted residual case of stacked waits (a wait past the deadline, the sweep expiring the order,
+  a late reserve committing, then a failed borrow before the Version A republish).
+
+### Before and after
+
+| | R2 before (Part D) | **R2F after** | R3 before (Part D) | **R3F after** |
+|---|---|---|---|---|
+| Buyers, ramp | 5,000, 10 s | 5,000, 10 s | 5,000, at once | 5,000, at once |
+| JVMs | warmed by R1 | **fresh** | warmed by R1, R2 | warmed by R2F |
+| `place-order` statuses | 201 × 500, 409 × 1,555, 503 × 46, refused × 2,899 | **201 × 0**, 409 × 1,234, 503 × 505, refused × 3,261 | 201 × 500, 409 × 872, refused × 3,628 | 201 × 500, 409 × 755, refused × 3,745 |
+| Warm-up statuses | 201 × 50, 409 × 150 | **503 × 200** | 201 × 50, 409 × 150 | 201 × 50, 409 × 121, 503 × 29 |
+| Gatling p99, answered only (ms) | 12,374 | 20,301 | 6,539 | 8,384 |
+| Grafana p99 `POST /api/orders` (Order, max) | 12.66 s | 7.94 s | 2.76 s | **0.51 s** |
+| Grafana p99 reserve (Inventory, max) | 0.11 s | 0.88 s | 0.05 s | 0.43 s |
+| Order pool active / waiting max | 10 / 191 | 10 / 23 | 10 / 156 | 10 / 17 |
+| Order borrows; mean hold; max hold | 2,896; 50.1 ms; 8.1 s | 6,801; 18.2 ms; 9.6 s | 2,212; 33.2 ms; 3.0 s | 7,288; **7.4 ms**; 4.6 s |
+| Order wait for a connection, mean / max | 735 ms / 12.95 s | 54 ms / 1.21 s | 234 ms / 3.26 s | **12 ms / 0.50 s** |
+| Order pool timeouts (`SERVICE_BUSY`) | 0 | 7 | 0 | 0 |
+| Inventory pool active / waiting max | 4 / 0 | **10 / 177** | 2 / 0 | 5 / 0 |
+| Inventory mean hold; max hold; max wait | 6.5 ms; 0.33 s; 5 ms | 29.8 ms; 3.4 s; 9.6 s | 3.4 ms; 0.1 s; 12 ms | 10.4 ms; 0.48 s; 0.44 s |
+| Gateway Redis timeouts (fail open, 500 ms) | 918 | 987 | 14 | 218 |
+| `verify.sh` both items (oversell) | OK | OK | OK | OK |
+| `check-orders.sh` right after the run | OK | **FAIL** (1 order `CREATED`; units still being released) | OK | OK |
+| Gap (`count-gap.sh`, after drain) | 0 | 0 | 0 | 0 |
+
+Prometheus windows: counters from 30 s before Gatling started to 40 s after it ended; "max" values are the
+gauges' maxima in that window (5 s scrapes). Grafana p99 is server side and not the headline.
+
+### What it shows (and what is inference)
+
+- **Order's pool stopped being the queue.** Same pool size: the longest wait for a connection fell from 12.95 s /
+  3.26 s to 1.21 s / 0.50 s and the mean hold from 50 / 33 ms to 18 / 7.4 ms, at 2.3 to 3.3 times as many borrows
+  (about 7 per create, as counted). In R3F Order's own p99 was 0.51 s. **The buyer's p99 (Gatling) was not**:
+  8.4 s in R3F, with most of the 5,000 still refused at the Gateway's port, so the time is spent before Order
+  (connection queueing, the Gateway, the rate limiter's Redis timeouts) as much as in it. Not traced.
+- **R2F sold nothing.** The sequence, from timestamps in Order's database and log: on fresh JVMs every warm-up
+  order failed at reserve (186 Inventory read timeouts at Order's 2 s limit, 12 Feign "no suitable
+  HttpMessageConverter" errors, the cold-start error seen in Part D's R1), so the payment client was never used
+  before the burst. In the burst its first 3 calls hit the same Feign error; with retries that was 5 failures in 8
+  calls, over the breaker's 50 %, so it opened at 11:38:32. For the next 4 s every order that had reserved stock got
+  "breaker is open" (262 + the 3), became `PAYMENT_UNAVAILABLE`, and released its stock; later buyers got
+  `OUT_OF_STOCK`. The fresh JVMs confound the comparison with the Part D R2; why Inventory's pool filled
+  (10 / 177) during a 200-request warm-up is **not proven** (with open-in-view off each reserve now borrows
+  separately for its replay check, the liveness query and the reserve transaction; a cold JVM; Order no longer
+  throttling Inventory through its own full pool: all candidates, none measured alone).
+- **Late reservations (Version B) happened at scale in R2F, and the gap was still 0.** 235 reserve calls for item 1
+  and 50 for item 2 timed out in Order and still committed in Inventory (item 1 ended with exactly 265 + 235 = 500
+  reservations). All were released after the drain, because each late commit landed before Inventory processed
+  that order's `OrderCancelled`. **That is timing, not a guarantee**: the gap stays open (decisions.md, Day 7,
+  point 5).
+- **The breaker carried over between runs.** It stayed OPEN from R2F (no payment calls in between) until R3F's
+  warm-up; 29 warm-up orders were rejected in the 0.27 s of HALF_OPEN (3 calls allowed), then it closed. The
+  measured part of R3F was not affected.
+- **One order stayed `CREATED` after R2F** (a `SERVICE_BUSY` after its insert); `check-orders.sh` failed on it right
+  after the run, as it should, and the sweep expired it later (`ORDER_EXPIRED`), as designed.
+- Token steps: 99.7 s and 107.3 s; budgets about 13 min left at start. Drain within 30 s and 20 s.
+
+### Not covered
+
+A second run of either (no retries), R2F on warmed JVMs (the clean comparison), a run with a pre-warmed payment
+client, the stacked double-wait case, separate machines, more than one instance, why Inventory's pool filled, what
+refuses connections at `:8080`, why Redis times out.
+
+### Commands
+
+Same driver and steps as Part D (`bash run.sh R2F 5000 10`, `bash run.sh R3F 5000 0`; reset-run, make-tokens, Gatling
+immediately, `verify.sh` and `check-orders.sh` on both items, drain, `count-gap.sh`, Grafana panels). The stack was
+restarted once on this branch's jars for both runs. Prometheus numbers came from the Hikari counters and gauges
+(`hikaricp_connections_usage_seconds_{sum,count,max}`, `_acquire_seconds_*`, `_pending`, `_active`,
+`_timeout_total`) over the windows above.
+
+**Full suite on `fix/open-in-view-off`, before the runs:** identity 119, inventory 115, order 317, notification 29,
+payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **657, 0 failures, 0 errors**.

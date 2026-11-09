@@ -31,6 +31,12 @@ spring:
     driver-class-name: org.postgresql.Driver
 
   jpa:
+    # OFF (decisions.md, "Day 9, Part F"). Boot's default (on) keeps one pooled
+    # connection for the whole web request; in Order that meant through the
+    # Inventory and payment calls, which filled the pool in the Day 9 load runs.
+    # Off: a connection is held only inside each short transaction. Structural,
+    # not a tunable, so it is NOT in the config repo. Same in all three services.
+    open-in-view: false
     hibernate:
       # Flyway (see db/migration/) owns the schema. Hibernate only validates
       # that @Entity mappings match what Flyway has already created — it

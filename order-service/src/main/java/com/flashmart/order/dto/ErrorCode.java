@@ -27,5 +27,11 @@ public enum ErrorCode {
     /** 500: the payment gateway refused the request (4xx); the order is PAYMENT_UNAVAILABLE. Not retryable. */
     PAYMENT_REJECTED,
     /** 409: the order expired while its payment was being started. */
-    ORDER_EXPIRED
+    ORDER_EXPIRED,
+    /**
+     * 503: no database connection was free within the pool's connection-timeout.
+     * Retryable with the SAME key: an order already inserted is still CREATED and
+     * a retry resumes it before its deadline; after it, the sweep expires it.
+     */
+    SERVICE_BUSY
 }

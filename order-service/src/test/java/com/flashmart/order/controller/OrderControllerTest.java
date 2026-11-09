@@ -118,7 +118,8 @@ class OrderControllerTest {
 
     @Test
     void moreThanMaxLinesIsA400() throws Exception {
-        String items = IntStream.rangeClosed(1, 18).mapToObj(p -> item(p, 1)).collect(Collectors.joining(","));
+        // maxLines is 9 since the pool wait joined the CREATED deadline (was 17).
+        String items = IntStream.rangeClosed(1, 10).mapToObj(p -> item(p, 1)).collect(Collectors.joining(","));
 
         create("k1", BUYER, body(items))
                 .andExpect(status().isBadRequest())
@@ -131,9 +132,9 @@ class OrderControllerTest {
     void exactlyMaxLinesIsAccepted() throws Exception {
         given(inventory.reserve(any())).willReturn(new ReserveResponse(
                 ReserveOutcome.RESERVED, 1L, new BigDecimal("1.00"), 3L, "Suede"));
-        String items = IntStream.rangeClosed(1, 17).mapToObj(p -> item(p, 1)).collect(Collectors.joining(","));
+        String items = IntStream.rangeClosed(1, 9).mapToObj(p -> item(p, 1)).collect(Collectors.joining(","));
 
-        create("k17", BUYER + 2, body(items)).andExpect(status().isCreated());
+        create("k9", BUYER + 2, body(items)).andExpect(status().isCreated());
     }
 
     @Test

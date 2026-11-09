@@ -5817,3 +5817,85 @@ the Day 9 load test, not to replace the load tool.
   a worktree.
 - Notification and payment-stub have no metrics (out of scope; the brief named four services).
 - The gateway's "429" series counts every 429 it returns (the `/api/auth/**` limiter and the order limiter together).
+
+## Decision: Day 9, Part F: open-in-view off and the pool wait in the CREATED deadline
+
+**Status: implemented and tested (derivation tests with a break-and-restore, an HTTP test with a break-and-restore,
+a forced pool-timeout test); load-run once each (R2F, R3F) on one laptop, stub gateway (`testing.md`, "Day 9 Part F
+step 2").
+The 1 s pool timeout is POLICY, provisional and unmeasured as a choice. Pool SIZE is unchanged and still open.**
+
+### Context
+
+In the Day 9 Part D runs Order's Hikari pool sat at 10 of 10 with up to 191 requests waiting, while Inventory never
+waited, and Order's longest wait for a connection matched its server-side p99 (5.86 vs 5.69 s, 12.95 vs 12.66 s,
+3.26 vs 2.76 s). The cause was not the pool size. `spring.jpa.open-in-view` was never set, so Boot's default (on)
+applied: the web request keeps the JPA session open, and Spring's Hibernate setup
+(`hibernate.connection.handling_mode = DELAYED_ACQUISITION_AND_HOLD`, read from `spring-orm` 7.0.9) keeps the
+connection the session first borrowed until the request ends. Order's create path borrowed once at the insert and
+then HELD that connection through the Inventory reserve call and the payment initiate call, which need no connection.
+Measured fit: Order made one borrow per HTTP request (R1: 1,829 = 1,200 creates + 542 webhooks + about 87 relay
+ticks), not one per short transaction. `OrderTransactionBoundaryTest` claimed "no connection held during the calls"
+but calls the service directly, so it could not see this (its own comment said so).
+
+### Options considered
+
+1. Raise Order's pool size. Leaves the connection idle across two network calls; more connections do the same waste.
+2. Turn open-in-view off. A connection is held only inside each short transaction, so about 7 borrows per create
+   instead of 1. New risk: a borrow can now WAIT in the middle of the flow (after the order exists, after Inventory
+   reserved), and the `CREATED` deadline did not count that wait.
+3. Restructure the create path. New code, not needed for the problem seen.
+
+### Chosen approach
+
+- **`spring.jpa.open-in-view: false` in Order, Inventory and Identity** (services of the same shape stay identical;
+  Inventory and Identity gain little). In each local `application.yml` only, not the config repo: it is structural,
+  not a tunable. The grep found nothing that lazy-loads outside a transaction (no JPA associations, no
+  `getReference`, no entity returned by a controller; the create path is `JdbcTemplate`).
+- **Order only: `spring.datasource.hikari.connection-timeout: 1000`** (ms), in the local file AND the config repo,
+  same value. POLICY: short enough that a stuck pool answers fast, long enough for a normal wait; not measured.
+  Inventory and Identity keep Hikari's default (30 s): no deadline is derived from their pools.
+- **The `CREATED` deadline now counts the worst-case pool wait** (`CreateOrderSettings`, which READS the same Hikari
+  property, so the deadline and the real timeout have one source; a test checks the running pool's value). Borrows
+  counted from `OrderCreationService` between the insert (which stamps `expires_at`) and the `PENDING_PAYMENT` CAS:
+  1 before the lines (`unpricedItems`), 2 per line (`priceItem`, plus the `read` when another loop priced it and the
+  loop goes on), 3 after (`setAmountFromItems`, `read`, `markPendingPayment`). The insert's own wait happens before
+  the stamp; the reads after the CAS no longer race it.
+  - `perLine = (connect + read) + 2 x poolWait = 3 + 2 = 5 s`; `fixed = paymentBudget + 4 x poolWait = 6.5 + 4 = 10.5 s`.
+  - `expires_at = clock_timestamp() + perLine x lines + fixed + margin`: **one item 20.5 s (was 14.5 s)**.
+  - `maxLines = floor((60 s policy - fixed) / perLine) = floor(49.5 / 5) =` **9 (was 17)**. An order with 10 or more
+    distinct products is now `400 TOO_MANY_LINES`. Start-up fails if the pool wait leaves no room for one line.
+  - A happy one-item create borrows 7 times in all (insert, `unpricedItems`, `priceItem`, `setAmountFromItems`,
+    `read`, `markPendingPayment`, `read`).
+- **A pool timeout answers `503 SERVICE_BUSY`** on every Order endpoint (`PoolTimeoutHandler`, a global advice; only
+  when `SQLTransientConnectionException` is in the cause chain, anything else keeps the default 500). Body is the
+  usual `{code, message}`, no internals. Retryable with the same key. Nothing is rolled back beyond the failed
+  transaction: an order already inserted stays `CREATED`, a same-key retry resumes it before its deadline, and the
+  expiry sweep ends it after (with `OrderCancelled`, so Inventory releases the stock). The payment gateway retries a
+  503 webhook like any non-2xx.
+
+### Accepted residual risk (NOT solved)
+
+A borrow that FAILS is not covered by the deadline. If waits stack up so long that the sweep expires the order
+BEFORE a late reserve commits, and the next borrow (`priceItem`, `read` or `republishCancelled`) then times out, the
+Version A republish never runs: the stock stays `RESERVED` for an expired order until the stale-reservation
+reconciler exists (designed, not built). It looks like Version B to Inventory and `count-gap.sh` counts it. It needs
+a wait past the deadline AND a failed borrow right after; how often is not measured beyond the runs below. Before
+this change the same orphan needed a database error (open-in-view held the connection); the pool timeout is a new,
+load-driven trigger.
+
+### Trade-offs and consequences
+
+- One-item orders get 6 s more before the sweep may expire them; a crashed request blocks its buyer's next order
+  for up to 20.5 s + one sweep interval instead of 14.5 s + one.
+- `maxLines` halves (17 to 9).
+- Under a full pool, buyers now see fast 503s instead of long waits (the old wait had no bound short of 30 s).
+- Inventory and Identity now also borrow per short transaction (Inventory's reserve: replay check, liveness
+  query, reserve transaction). In R2F Inventory's pool filled (10 / 177 waiting) during the warm-up; cause not
+  proven (cold JVM, more borrows, Order no longer throttling Inventory are all candidates).
+- **Measured once each (testing.md, "Day 9 Part F step 2"):** Order's longest wait for a connection fell from
+  12.95 s / 3.26 s to 1.21 s / 0.50 s (R2 / R3), mean hold from 50 / 33 ms to 18 / 7.4 ms, and Order's server-side
+  p99 in R3F was 0.51 s. The buyer's p99 (Gatling) was still 8.4 s in R3F and most of the 5,000 were still refused at
+  the Gateway, so **p99 < 500 ms is still not met**. R2F, on fresh JVMs, sold nothing: a Feign cold-start error
+  opened the payment breaker during the burst. Zero oversell held and the gap count was 0 in both runs, although
+  R2F had 285 late reservations (Version B) that were released only because each commit beat its `OrderCancelled`.

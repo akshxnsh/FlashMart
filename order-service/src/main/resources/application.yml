@@ -19,8 +19,24 @@ spring:
     username: ${DB_USERNAME}
     password: ${DB_PASSWORD}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      # How long one borrow may wait for a pooled connection, in ms. Order ONLY
+      # (decisions.md, "Day 9, Part F"): CreateOrderSettings reads this same
+      # property and adds the worst-case wait (borrows x this) to the CREATED
+      # deadline, so the deadline and the real timeout have one source. A borrow
+      # that times out answers 503 SERVICE_BUSY. POLICY, provisional, unmeasured;
+      # recheck from the load runs. Pool SIZE stays the Hikari default (10, open).
+      # Inventory and Identity keep Hikari's 30 s default: no deadline depends on it.
+      # Mirrored in the config repo (order-service.yml); keep the two equal.
+      connection-timeout: 1000
 
   jpa:
+    # OFF (decisions.md, "Day 9, Part F"). Boot's default (on) keeps one pooled
+    # connection for the whole web request; in Order that meant through the
+    # Inventory and payment calls, which filled the pool in the Day 9 load runs.
+    # Off: a connection is held only inside each short transaction. Structural,
+    # not a tunable, so it is NOT in the config repo. Same in all three services.
+    open-in-view: false
     hibernate:
       # Flyway (see db/migration/) owns the schema. Hibernate only validates
       # that @Entity mappings match what Flyway has already created — it
