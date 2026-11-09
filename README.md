@@ -23,6 +23,8 @@ Each row says where the idea lives and how far it has been checked. The decision
 | Config server (Git backend, local fallback) | config-server | Implemented, tested, smoke-run once | [decisions.md](docs/decisions.md#decision-day-9-part-0-config-server-spring-cloud-config-git-backend-public-repo-local-fallback) |
 | Metrics (Prometheus, Grafana, one dashboard) | each service's own port | Implemented, tested, smoke-run once | [decisions.md](docs/decisions.md#decision-day-9-part-b-observability-prometheus-grafana-one-dashboard-as-files) |
 
+API docs: Identity, Inventory and Order serve Swagger UI and `/v3/api-docs` on their own ports, not through the Gateway ([docs/development.md](docs/development.md#api-docs-openapi--swagger-ui)).
+
 Also in the repo: open-in-view off with the pool wait counted in the order deadline ([decisions.md](docs/decisions.md#decision-day-9-part-f-open-in-view-off-and-the-pool-wait-in-the-created-deadline)), the Feign upgrade and the Inventory start-up warm-up ([decisions.md](docs/decisions.md#decision-day-9-cold-start-fixes-feign-upgrade-inventory-warm-up-before-the-port)), and the Gateway's own lock-free rate-limiter script ([decisions.md](docs/decisions.md#decision-day-9-the-gateways-own-rate-limiter-script-lock-free)).
 
 ---

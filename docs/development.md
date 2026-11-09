@@ -90,6 +90,20 @@
   run (`docs/testing.md`, "Run 1 (18:29)"). Even `netstat -ano` took 4 to 7 s during
   a ramp, so expect few samples.
 
+## API docs (OpenAPI / Swagger UI)
+
+Identity, Inventory and Order serve their own docs on their own port. **Not routed through the Gateway.**
+
+| Service | Swagger UI | OpenAPI JSON |
+|---|---|---|
+| Identity | `http://localhost:8081/swagger-ui/index.html` | `http://localhost:8081/v3/api-docs` |
+| Inventory | `http://localhost:8082/swagger-ui/index.html` | `http://localhost:8082/v3/api-docs` |
+| Order | `http://localhost:8083/swagger-ui/index.html` | `http://localhost:8083/v3/api-docs` |
+
+- `/internal/**` and `/webhooks/payment` are `@Hidden`, so they are not listed.
+- Order's `POST /api/orders` needs a Gateway-signed `X-Buyer-Id` (with `X-Auth-Timestamp` and `X-Auth-Signature`). "Try it out" on Order returns `401` unless you send validly signed headers; the check was not relaxed for the docs. Identity's routes are public.
+- Library: springdoc `3.1.1` (built on Boot 4.1.0; our poms use 4.1.1). Added and unit/integration suites run; the Swagger pages themselves have **not** been opened on running services yet.
+
 ## Running the tests
 
 - `bash load-tests/reset-run.sh` first (with `.env` exported and the services' databases

@@ -1,5 +1,7 @@
 package com.flashmart.order.controller;
 
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import com.flashmart.order.auth.GatewayIdentityFilter;
 import com.flashmart.order.dto.CreateOrderRequest;
 import com.flashmart.order.dto.CreateOrderResponse;
@@ -17,6 +19,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 
+@Tag(name = "Orders", description = "Needs a Gateway-signed X-Buyer-Id.")
 @RestController
 @RequiredArgsConstructor
 public class OrderController {
@@ -30,6 +33,9 @@ public class OrderController {
      * <p>{@code Idempotency-Key} is capped at 255, the column's width, so an
      * over-long key is a 400 and not a database error.
      */
+    @Operation(summary = "Place an order (idempotent on Idempotency-Key).",
+            description = "Requires X-Buyer-Id, X-Auth-Timestamp and X-Auth-Signature, signed by the Gateway. "
+                    + "Without a valid signature the answer is 401.")
     @PostMapping("/api/orders")
     public ResponseEntity<CreateOrderResponse> create(
             @RequestHeader("Idempotency-Key") @NotBlank @Size(max = 255) String idempotencyKey,

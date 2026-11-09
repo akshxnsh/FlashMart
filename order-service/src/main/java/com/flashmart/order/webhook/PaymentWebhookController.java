@@ -1,5 +1,6 @@
 package com.flashmart.order.webhook;
 
+import io.swagger.v3.oas.annotations.Hidden;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -24,6 +25,8 @@ import java.util.Optional;
  * exception rolls back and falls through to Spring's default {@code 500}, which
  * the gateway retries.
  */
+/** Hidden from the OpenAPI docs: called by the payment gateway, HMAC-signed. */
+@Hidden
 @RestController
 @RequiredArgsConstructor
 public class PaymentWebhookController {

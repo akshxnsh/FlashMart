@@ -104,6 +104,14 @@
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webmvc</artifactId>
 		</dependency>
+		<!-- OpenAPI docs + Swagger UI on this service's own port. 3.1.1 is built on
+		     Boot 4.1.0 (3.0.x is Boot 4.0; 3.2.0 is built on 4.1.2, a patch ahead of
+		     ours). Boot's BOM does not manage it, so the version is explicit. -->
+		<dependency>
+			<groupId>org.springdoc</groupId>
+			<artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+			<version>3.1.1</version>
+		</dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-validation</artifactId>
