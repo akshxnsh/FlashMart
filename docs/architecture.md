@@ -577,18 +577,17 @@ Full context and trade-offs live in `docs/decisions.md`.
 machine, every communication pattern, every decision in `docs/decisions.md`
 (Revision 3 and the implementation-phase entries after it).
 
-**Day 8 (auth, gateway identity, rate limiting, browse): PARTLY BUILT.**
+**Day 8 (auth, gateway identity, rate limiting, browse): IMPLEMENTED AND TESTED, merged to `main`.**
 See `decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse" and
-§3, "Edge: Gateway". **Implemented and tested, at MockMvc level only
-(branch `feat/day8-identity-auth`, not merged):** Identity's `POST
-/api/auth/signup`, `login`, `refresh` and `logout` and migration V8
-(`refresh_tokens`). **Since built and tested too (2026-11-08):** the api-gateway
-(JWT check, signed `X-Buyer-Id` header, `lb://` routes, Redis rate limiter that
-fails open), Order's check of the signed header (the forgeable bare header is
-gone), the Eureka server, client registration in Identity/Inventory/Order, and
-Inventory's `GET /api/flash-sales?page=N`. Gateway/Eureka were smoke-run once
-on real processes (`testing.md`); the limiter and browse were not smoke-run
-until the final step of that piece (see `testing.md`). Test count:
+§3, "Edge: Gateway". Built: Identity's `POST /api/auth/signup`, `login`,
+`refresh` and `logout` and migration V8 (`refresh_tokens`), tested at MockMvc
+level on real Postgres (`testing.md`, "Day 8 Identity"); the api-gateway (JWT
+check, signed `X-Buyer-Id` header, `lb://` routes, Redis rate limiter that fails
+open); Order's check of the signed header (the forgeable bare header is gone);
+the Eureka server and client registration in Identity, Inventory and Order; and
+Inventory's `GET /api/flash-sales?page=N`. Gateway and Eureka were smoke-run once
+on real processes, and the Gateway was load-run in Day 9 (`testing.md`).
+Test count:
 the Identity suite ran **116** tests, all passing, in a Claude Code session
 after the three pieces were built, and **117** after a start-up test for a
 space-only `JWT_SECRET` was added (run in the same session, 0 failures, 0

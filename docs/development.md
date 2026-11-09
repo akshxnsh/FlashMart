@@ -3,8 +3,8 @@
 ## Environment
 
 - Copy `.env.example` to a repo-root `.env` (gitignored) and fill in
-  `DB_USERNAME`, `DB_PASSWORD` and `PAYMENT_WEBHOOK_SECRET`. Day 8 adds two more
-  (`JWT_SECRET`, `GATEWAY_SIGNING_SECRET`), below. Optional:
+  `DB_USERNAME`, `DB_PASSWORD`, `PAYMENT_WEBHOOK_SECRET`, `JWT_SECRET`,
+  `GATEWAY_SIGNING_SECRET` and `GRAFANA_ADMIN_PASSWORD`. Optional:
   `KAFKA_BOOTSTRAP` (default `localhost:9092`) and `ORDER_WEBHOOK_URL` (default
   `http://localhost:8083/webhooks/payment`). Never commit `.env`.
 - **Spring does not read `.env`.** Export the values into the shell that starts
@@ -14,25 +14,21 @@
   own `${...}` values.)
 - **Day 8 secrets.** `JWT_SECRET` (Identity and the Gateway only) and
   `GATEWAY_SIGNING_SECRET` (the Gateway and Order only) have **no defaults**, and
-  a service that needs one **refuses to start** if it is blank, the same rule as
-  `PAYMENT_WEBHOOK_SECRET`. **Identity reads `JWT_SECRET` now** (it signs access
-  tokens) and refuses to start if it is blank or shorter than 32 bytes, so
-  Identity needs it exported before it starts. The Gateway and Order's signed-header
-  check are designed, not built, so nothing reads `GATEWAY_SIGNING_SECRET` yet. They must be two different values, and each pair must
-  match across its services. Use a random value of your own locally; never commit
+  a service that needs one **refuses to start** if it is blank or shorter than
+  32 bytes, the same rule as `PAYMENT_WEBHOOK_SECRET` for blank. They must be two
+  different values, and each pair must match across its services. Use a random value of your own locally; never commit
   one. (`decisions.md`, "Day 8: auth, gateway identity, rate limiting, browse".)
 
 ## Local infra
 
 - **Postgres is a local install** (PostgreSQL 18 on port 5432), one database per
-  service. Do **not** start `postgres` (or `redis`) from `docker-compose.yml`:
-  it publishes 5432 too and clashes with the local one. The compose `postgres`
-  and `redis` services have never been started or tested. **Redis is first used
-  on Day 8** (the Gateway's rate limiter; designed, not built), so until then
-  nothing needs it. When Day 8 is built, `docker compose up -d redis` is the
-  likely way to start it (the compose service is untested; check port 6379 is
-  free first).
-- **Kafka is the only compose service in use:** `docker compose up -d kafka`
+  service. Do **not** start `postgres` from `docker-compose.yml`: it publishes
+  5432 too and clashes with the local one, and it has never been started or
+  tested. Create the four databases with `psql` (README, step 2).
+- **Redis** is the compose one: `docker compose up -d redis`. The Gateway's rate
+  limiter uses it (and fails open without it), and the Gateway's rate-limiter
+  tests need it.
+- **Kafka:** `docker compose up -d kafka`
   (Docker Desktop running; wait for `healthy`). It is needed only to run Order
   with its outbox relay against a real broker, not for the test suites.
   Auto-creation is off on the broker; Order creates `payment-confirmed` and
@@ -71,15 +67,43 @@
   Gateway's view; stop services gracefully (not a hard kill) in a demo.
   `decisions.md`, "Day 8", addendum "Gateway and discovery".
 
+## Things that have gone wrong before
+
+- **Rebuild all jars before a load run** (`./mvnw -q -DskipTests package` in every
+  module). Stale jars in `*/target` once bundled openfeign 5.0.2 and a pre-warm-up
+  Inventory; a run on them would have been invalid (`docs/testing.md`, "Day 9: R2
+  re-run on the final build").
+- **Start-up order and the Eureka wait.** Config server, Eureka, Identity /
+  Inventory / Order, then the Gateway. After a business service starts, the Gateway
+  can take about 30 s (Eureka's default fetch interval; up to about a minute with the 35 s load-balancer cache, and longer after a hard kill) to see it; until then it answers
+  `503` on that route. Stop services gracefully in a demo.
+- **Leftover load rows fail tests.** Run `bash load-tests/reset-run.sh` (with `.env`
+  exported) **and have Redis up** before the full suite. Four Order tests failed on
+  1,550 orders left by load runs, and without `.env` the four database modules fail
+  with connection errors.
+- **`GRAFANA_ADMIN_PASSWORD` must be set for every `docker compose` command**, not
+  only for Grafana (compose checks required variables for the whole file).
+- **On Windows, sample connections with `netstat -ano` and read the TCP
+  failed-connection counters** (`Get-Counter '\TCPv4\Connection Failures'` and the
+  `TCPv6` one). **Never `netstat -s` without `-n`**: it looks up a host name for
+  every connection, took about 2 minutes under load, and made a sampler miss a whole
+  run (`docs/testing.md`, "Run 1 (18:29)"). Even `netstat -ano` took 4 to 7 s during
+  a ramp, so expect few samples.
+
 ## Running the tests
 
-- `bash scripts/seed/seed.sh` first (with `DB_USERNAME`/`DB_PASSWORD` exported).
-  It also empties Order's tables, and 4 Order entity tests count absolute rows
-  in the shared dev database, so they fail after a manual run leaves rows behind.
-- Then `./mvnw test` in each service. No Docker is needed: the relay tests use
+- `bash load-tests/reset-run.sh` first (with `.env` exported and the services' databases
+  created). It re-seeds, empties Order's tables and checks they are empty. (`bash
+  scripts/seed/seed.sh` does the reseed without the check.) 4 Order entity tests count
+  absolute rows in the shared dev database, so they fail after a manual or load run leaves
+  rows behind.
+- `docker compose up -d redis` (the Gateway's tests also need Docker).
+- Then `./mvnw test` in each module. No Kafka container is needed: the relay tests use
   an in-JVM embedded broker (`@EmbeddedKafka`), and the test config turns the
   scheduled relay off and skips topic creation. The tests run against the
   local Postgres.
+- Last full run: 686 tests, 0 failures (`docs/testing.md`, "Day 9: the Gateway's own
+  rate-limiter script").
 - Manual multi-process runs (Day 5 failure demo, Day 6 end to end) and their
   scripts are in `docs/testing.md`.
 
