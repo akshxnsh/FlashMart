@@ -268,41 +268,60 @@ Config server 8888, Eureka 8761, Gateway 8080, Identity 8081, Inventory 8082, Or
 
 ## Load test results (measured, not targets)
 
-One run each, one laptop (load tool, all services, Postgres and Docker on the same machine), stub payment gateway, one Kafka broker. Details and commands: [`docs/testing.md`](docs/testing.md). The targets are zero oversell under 5,000 concurrent requests and p99 under 500 ms; they are **not** met on this setup.
+Each row is **one run on one laptop** (load tool, all services, Postgres and Docker on the same machine), stub payment gateway, one Kafka broker. 5,000 buyers over 10 s against 500 units. Details and commands: [`docs/testing.md`](docs/testing.md). The targets were zero oversell under 5,000 concurrent requests and p99 under 500 ms.
 
-| Run (5,000 buyers over 10 s, 500 units) | Sold | Oversell | Gatling p99, answered only | Order p99, server side | Refused at the port |
-|---|---|---|---|---|---|
-| Part D R2 (warmed JVMs) | 500 | none | 12,374 ms | 12.66 s | 2,899 |
-| R2F (fresh JVMs, before the cold-start fixes) | 0 | none | 20,301 ms | 7.94 s | 3,261 |
-| R2 re-run (final build, fresh JVMs plus a 51-order gate) | 500 | none | 6,022 ms | 0.90 s | 3,978 |
-| R2fix (Gateway's lock-free rate-limiter script; fresh JVMs plus the gate) | 500 | none | 31,339 ms | 9.77 s | 947 |
+| Run | Sold | Oversell | Gatling p99, answered only | Order p99, server side | No response (refused) | Other errors |
+|---|---|---|---|---|---|---|
+| Part D R2 (warmed JVMs) | 500 | none | 12,374 ms | 12.66 s | 2,899 (58 %) | 503 × 46 |
+| R2F (fresh JVMs, before the cold-start fixes) | 0 | none | 20,301 ms | 7.94 s | 3,261 (65 %) | 503 × 505 |
+| R2 re-run, run 1 (final build before the limiter fix; fresh JVMs plus a 51-order gate) | 500 | none | 6,022 ms | 0.90 s | 3,978 (80 %) | none |
+| R2 re-run, run 2 (same build) | 500 | none | 8,046 ms | 3.20 s | 3,082 (62 %) | none |
+| R2fix (Gateway's lock-free rate-limiter script) | 500 | none | 31,339 ms | 9.77 s | 947 (19 %) | 503 × 118 |
 
-**Runs vary a lot** (Redis timeouts 28 against 758 between two runs of the same build), so one run per row proves
-little.
-
-**Refused buyers.** Diagnosis in part: the Gateway's event loops were seen held on a lock in the rate limiter's
-script. With that lock removed, fewer buyers were refused in one run, but the ones let in waited far longer. That the
-lock caused the refusals is not proven.
-
-**p99 gap.** Why the buyer-side p99 is far above the server-side one is not explained.
+**Against the targets, per measured number:** zero oversell: held in every run. p99 under 500 ms: **not met** in any run. 5,000 concurrent: **not reached** (between 947 and 3,978 of the 5,000 got no response). The "Gatling p99, answered only" column leaves out the buyers who got no response, so read it together with the last two columns.
 
 ## Known limitations
 
-- **The payment gateway is a stub.** The real Razorpay Clone is a separate project. Its required behaviours (idempotent initiate and refund, status lookup, signed webhooks) are specified here but not verified against it.
-- **Brands, flash sales and stock are seeded.** There is no brand-side API. Sale creation and editing, the "frozen once live" rules, and API-key auth exist only in the design (the `api_keys` schema exists, but no code path uses it).
-- **Design-only components:** payment reconciliation sweep, Identity outbox events and the contact-cache backfill, outbox cleanup job.
-- **No dead-letter topic.** A malformed Kafka message is skipped with an ERROR log. A temporary failure is retried and never skipped.
-- **A late reservation after a timed-out reserve call** (Version B) is released by Inventory's stale-reservation reconciler, but only after about 10 minutes at best (threshold 570.5 s + one 60 s pass), and later when many stale rows it cannot act on are waiting (its cursor wraps around about every N / 50 passes) or an order it asks about keeps failing (retried after the wrap); until then that unit cannot be sold. The reconciler is tested and was demonstrated once on one laptop with the ordering forced; how often this happens under real overload is not measured (285 late commits in one 5,000-buyer run, all released by timing).
-- **A cold Inventory is warmed only in part.** A start-up warm-up runs the reserve path before the port opens. It removed the calls over Order's 2 s limit in 3 of 3 cold test runs, but the first requests are still slower than on a warm service (cold p99 1.25 to 1.62 s against 0.80 to 0.85 s), because the web layer cannot be warmed before the port is open. Why a cold JVM is slow is not profiled. Each start skips 20 ids of the reservation id sequence. Measured on one laptop only.
+Stated once, with the numbers. Everything is one run each on one laptop with a stub payment gateway unless it says otherwise.
+
+### Performance and load
+
+- **p99 under 500 ms is not met and 5,000 concurrent buyers are not reached** (table above). Runs vary a lot: the Gateway's Redis timeouts were 28, 758 and 2,938 in three R2-shaped runs, and refusals ranged from 947 to 3,978. One run per row proves little.
+- **Why buyers are refused at the Gateway's port is only partly explained.** Found by thread dump: up to 5 of the Gateway's 8 event loops waited on a lock in `DefaultRedisScript.getSha1` (the rate limiter's script). Fixed with our own limiter bean and a preloaded script (a benchmark inside the boot jar went from about one exception per call to none). **That this lock caused the refusals is NOT proven:** refused was 3,978, 3,082 and then 947 after the fix, but runs vary, and the fixed run's answered p99 was far worse (31.3 s).
+- **Control runs show it is not a limit of the laptop, Windows or Gatling:** a trivial local server refused 0, the Gateway answering a 401 itself refused 0, and a server that accepts slowly refused 4,002 with the same error text. The Gateway's accept queue is Netty's Windows default of 200. Windows' failed-connection counter rose by the refused count. **The queue filling was not directly seen.**
+- **A p99 over answered requests hides refused ones, so report the error rate with it.** With fewer buyers getting through the Gateway, the buyers who did get answered saw a better p99 (6.0 s with 3,978 refused, against 31.3 s with 947 refused). Today's refusals are accidental. A deliberate limit on in-flight requests that answers `429` or `503` with `Retry-After` is an idea, **not built**, and not yet written up as a decision.
+- **Order's p99 on the server side differs a lot from Gatling's** (for example 0.90 s against 6.0 s). Why is not explained.
+- **A cold Inventory is warmed only in part.** A start-up warm-up runs the reserve path before the port opens. It removed the calls over Order's 2 s limit in 3 of 3 cold runs, but the first requests are still slower than on a warm service (cold p99 1.25 to 1.62 s against 0.80 to 0.85 s). Why a cold JVM is slow is not profiled. Each start skips 20 ids of the reservation id sequence.
+- **A late reservation after a timed-out reserve call** (Version B) is released by Inventory's stale-reservation reconciler, but only after about 10 minutes at best (threshold 570.5 s plus one 60 s pass), and later when many stale rows it cannot act on are waiting (its cursor wraps about every N / 50 passes) or an order it asks about keeps failing. Until then that unit cannot be sold. How often this happens under real overload is not measured (285 late commits in one 5,000-buyer run, before the reconciler existed; all were released only because each commit happened before its `OrderCancelled` was handled).
+
+### Evidence gaps
+
+- **Failure demos ran on earlier builds and were not repeated on the final one:** the payment-step breaker demo (Day 5), the webhook and outbox end-to-end run (Day 6) and the consumer, expiry-sweep and Kafka-pause run (Day 7). The reconciler was demonstrated once on its own branch with the late reservation forced; in the later R2 re-run on the final build it ran with 0 actions and 0 alerts.
+- **Config drift is unchecked.** The `flashmart-config` repo and each service's local fallback copy are not compared by any test; the reconciler's threshold copies three of Order's values by hand; and the Spring Cloud `2025.1.x` BOMs name Boot 4.0.x while the repo runs Boot 4.1.1 (it works, and the suites pass, but it is outside the stated compatibility).
+- **The payment gateway is a stub.** The real Razorpay Clone is a separate project. Its required behaviours (idempotent initiate and refund, status lookup, signed webhooks that carry our order id) are designed, not verified against it.
+
+### Not built, on purpose or not yet
+
+- **Refund worker** (the `refunds` table exists; the worker and its claim rules are designed, not built, so nothing sends refunds).
+- **Payment reconciliation sweep** (designed in `decisions.md`).
+- **Notification consumers** (the service and its schema exist; nothing consumes Kafka there) and the contact-cache backfill.
+- **Identity outbox events** (signup writes no `UserUpserted` row), an outbox cleanup job, and a **brand-side API** (brands, sales and stock are seeded; `api_keys` has a schema but no code path uses it; brand login is not built).
+- **Browse caching** (browse is not cached and not rate limited).
+- **Razorpay Clone** (the real payment gateway).
+- **No dead-letter topic.** A malformed Kafka message is skipped with an ERROR log naming the order if it has one; a temporary failure is retried and never skipped.
+
+### Smaller behaviours to know
+
 - **One accepted exception to the one-payment invariant:** a second captured payment can escape correction only if initiate idempotency fails to dedupe, a webhook is separately lost, *and* the order reaches `PAID`. Three rare failures must stack.
-- **An early webhook** (arriving while the order is still `CREATED`) is answered non-2xx so the gateway retries. This depends on the gateway retrying long enough.
-- **Rate limiting fails open if Redis is down**, and the browse endpoint is not rate limited.
-- **Metrics and `/actuator/env` are exposed on each service's own port with no authentication** (never routed through the Gateway, but anyone who can reach a service port can read them). Secrets show as `******`; this is for local use only.
-- **Throughput is not where the targets are.** In the latest 5,000-buyer run (after the rate limiter's lock was removed), 947 buyers were refused at the Gateway's port, 118 got a 503 and the answered p99 was 31.3 s (target 500 ms). The previous run had 3,978 refused and a p99 of 6.0 s. One run each, one laptop. Neither the refusals nor the long waits are fully explained.
+- **An early webhook** (the order is still `CREATED`) is answered `409` so the gateway retries. This depends on the gateway retrying long enough.
+- **Rate limiting fails open if Redis is down.**
+- **Metrics and `/actuator/env` are on each service's own port with no authentication** (never routed through the Gateway, but anyone who can reach a service port can read them). Secrets show as `******`. For local use only.
 - **A buyer cannot start a new order** while an unpaid one is open, until it pays or expires.
 
 ## Documentation
 
-- [`docs/architecture.md`](docs/architecture.md): current design (source of truth)
+- [`docs/architecture.md`](docs/architecture.md): current design and the status of what is built and tested (section 8)
 - [`docs/decisions.md`](docs/decisions.md): every architectural decision with context, options and trade-offs
 - [`docs/requirements.md`](docs/requirements.md): functional and non-functional requirements
+- [`docs/development.md`](docs/development.md): local setup details, pitfalls and the load-test steps
+- [`docs/testing.md`](docs/testing.md): the evidence, every manual and load run with its numbers
