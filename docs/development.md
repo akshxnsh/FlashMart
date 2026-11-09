@@ -75,7 +75,7 @@
   re-run on the final build").
 - **Start-up order and the Eureka wait.** Config server, Eureka, Identity /
   Inventory / Order, then the Gateway. After a business service starts, the Gateway
-  can take about 30 s (more after a hard kill) to see it; until then it answers
+  can take about 30 s (Eureka's default fetch interval; up to about a minute with the 35 s load-balancer cache, and longer after a hard kill) to see it; until then it answers
   `503` on that route. Stop services gracefully in a demo.
 - **Leftover load rows fail tests.** Run `bash load-tests/reset-run.sh` (with `.env`
   exported) **and have Redis up** before the full suite. Four Order tests failed on

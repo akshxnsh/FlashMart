@@ -205,7 +205,7 @@ Each in its own shell (with the `.env` values exported, step 1), from the repo r
 Each business service takes about 25 to 35 s to start (cold, with Flyway on its first run). (`notification-service`, port 8084, is not needed: its consumers are not built.)
 
 - The **config server is optional** for every client: if it is down a service starts on its own local `application.yml` and logs `CONFIG SOURCE: local fallback`.
-- The **Gateway finds services only through Eureka**. It needs about **30 s after Order starts** before it can route to it; until then it answers `503 SERVICE_UNAVAILABLE`. Stop services gracefully (not a hard kill) in a demo, because Eureka can take a while to drop a dead one.
+- The **Gateway finds services only through Eureka**. It needs **about 30 s after Order starts** (Eureka's default fetch interval is 30 s, plus a 35 s load-balancer cache, so up to about a minute; not timed in the 2026-11-09 follow-through) before it can route to it; until then it answers `503`. Stop services gracefully (not a hard kill) in a demo, because Eureka can take a while to drop a dead one.
 - Start the Gateway **last**.
 
 ### 6. Seed
