@@ -610,6 +610,31 @@ the limiter tests need the compose Redis and Docker).
 
 **Day 9, R2 re-run on the final build: LOAD-RUN ONCE, ONE LAPTOP, STUB GATEWAY; targets NOT met** (`docs/testing.md`, "Day 9: R2 re-run on the final build"). 5,000 buyers over 10 s through the Gateway on freshly started JVMs (after a 51-order gate), the Feign 5.0.3 and Inventory warm-up fixes and the reconciler in. Measured, one run: 500 of 500 units sold, zero oversell, Version B gap 0, reconciler 0 actions and 0 alerts, payment breaker closed throughout, Order's pool max 3 active and 0 waiting, Inventory's 2 and 0. **Not met:** Gatling p99 6,022 ms (answered only) and 5,349 ms (all 5,000); Order's server-side p99 0.90 s (max of 30 s windows); 3,978 of 5,000 buyers got `Connection refused` at `:8080`, so 5,000 concurrent is not reached. Inventory's reserve p99 0.32 s (server side). Unexplained: the refused connections, the gap between buyer-side and server-side p99, 28 Redis timeouts (all in one second). The jars in `target/` were stale and were rebuilt first. Not repeated; no variance known.
 
+**Day 9, refused connections: DIAGNOSED IN PART (one laptop, one run each)** (`docs/testing.md`, "Day 9: why buyers are refused at `:8080`" and "Day 9: the decisive R2 run").
+- **Controls:** the same 5,000-buyer ramp refused 0 against a trivial local server and 0 against the Gateway's own 401 path.
+- **Mechanism, reproduced on this laptop:** a server with a queue of 200 that accepts slowly produced R2's exact error.
+- **The Gateway's queue (backlog):** 200, Netty's fixed Windows default.
+- **In an R2 run:** Windows' IPv6 Failed Connection Attempts rose by exactly the refused count, with no resets.
+- **Thread dumps:** up to 5 of the Gateway's 8 event loops were held on one lock in `DefaultRedisScript.getSha1` (the rate limiter's script). The accept thread is one of those 8.
+- **Not seen:** the accept queue itself.
+
+**Day 9, the Gateway's own rate-limiter script: IMPLEMENTED AND TESTED; LOAD-RUN ONCE, ONE LAPTOP, STUB GATEWAY** (`decisions.md`, "Day 9: the Gateway's own rate-limiter script"; `docs/testing.md`, same title).
+- **The change:** `PreloadedRedisScript` (text read once, SHA1 computed once, no lock, no file check) is wired through our own `redisRateLimiter` bean (same class and constructor as the library). The library's script bean cannot back off: it has no `@ConditionalOnMissingBean`.
+- **Unchanged:** rates, burst, keys and fail-open.
+- **Tests:**
+  - A drift test pins our copy of the Lua script to the library's.
+  - A context test proves ours is the only limiter.
+  - The drift guard, the context test and fail-open (Redis really stopped) were each broken once and restored.
+  - Suites 686.
+- **Bench, inside the boot jar:** 8 threads went from 9,942 calls per second with about one exception per call to no lock and no exceptions.
+- **One R2 run (R2fix):**
+  - 500 of 500 sold, zero oversell, gap 0, breaker closed, reconciler 0 / 0.
+  - Refused 947 (was 2,899 to 3,978).
+  - But Gatling p99 31.3 s (was 6.0 to 8.0 s), Order p99 9.8 s, Inventory p99 2.2 s.
+  - 118 × 503: 63 Inventory read timeouts, 55 Order pool timeouts.
+  - 2,938 Redis timeouts.
+- **Not proven:** that the lock caused the refusals (runs vary a lot), or that the delay moved downstream. Not repeated.
+
 **Day 9, Part B (observability): IMPLEMENTED and TESTED; smoke-run once.** Order, Inventory, Identity and the Gateway expose `/actuator/prometheus` (plus `health` and `env`, nothing else) on their own ports, with HTTP latency histogram buckets so Prometheus computes p99; Order's payment breaker state is exported (`resilience4j_circuitbreaker_state`). Prometheus and Grafana run from `docker-compose.yml`; the datasource and the single dashboard are files in `monitoring/` (`decisions.md`, "Day 9, Part B"). **Headline p99 is Gatling's (buyer view); Grafana's is server-side and explains where the time goes.** Not authenticated, local only. No outbox gauge. Suites 2026-11-08 after the change: identity 119, inventory 115, order 310, notification 29, payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **650**, all passing (baseline 638 + 12 new; one laptop; the payment-stub flake did not occur in this run). Not measured: anything under load.
 
 **Day 9, Part 0 (config server): IMPLEMENTED and TESTED; smoke-run once.** `config-server` (port `8888`, Spring Cloud Config, Git backend on the public `flashmart-config` repo) serves the tunable numbers of order, inventory, identity and the Gateway; each client keeps a local fallback copy, env vars beat both, values apply on restart (`decisions.md`, "Day 9, Part 0"). Suites run 2026-11-08 after the change: identity 117, inventory 113, order 308, notification 29, payment-stub 22, api-gateway 46, eureka-server 2, config-server 1 = **638**, all passing, 0 failures (baseline before the change: 637; one laptop; the payment-stub suite failed in some runs: 2 of 5 reruns, same test each time; cause diagnosed as a test-isolation bug, where `slowBeforeCreatesNothingUntilTheDelayHasPassed` left a delayed payment `k1` that landed in the next test's store; fix: that test now polls until `k1` appears (5000 ms timeout). Tested: payment-stub alone 10 of 10 runs passed 22/22, one laptop, flake not reproduced in 10, not proven fixed; `docs/testing.md`). Not built: a check that the repo and the local copies agree, a timeout for a hung (not stopped) config server, any config-server security.

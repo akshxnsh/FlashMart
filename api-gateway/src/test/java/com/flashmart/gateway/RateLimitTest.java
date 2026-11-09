@@ -5,8 +5,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import com.flashmart.gateway.ratelimit.PreloadedRedisScript;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.cloud.gateway.filter.ratelimit.RateLimiter;
+import org.springframework.cloud.gateway.filter.ratelimit.RedisRateLimiter;
+import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Import;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -126,6 +131,22 @@ class RateLimitTest {
         assertThat(r.headers().firstValue("Content-Type")).hasValueSatisfying(ct -> assertThat(ct).startsWith("application/json"));
         assertThat(r.body()).contains("\"code\":\"RATE_LIMITED\"").contains("\"message\":");
         assertThat(r.headers().firstValue("Retry-After")).hasValue("1");
+    }
+
+    @Autowired
+    ApplicationContext context;
+
+    /**
+     * The library's limiter backed off and ours is the only one, holding OUR
+     * lock-free script, not the library's DefaultRedisScript (which its
+     * setApplicationContext would fetch by name if the constructor had not
+     * marked it initialized).
+     */
+    @Test
+    void theOnlyRateLimiterIsOursAndHoldsThePreloadedScript() {
+        assertThat(context.getBeansOfType(RateLimiter.class)).containsOnlyKeys("redisRateLimiter");
+        Object script = ReflectionTestUtils.getField(context.getBean(RedisRateLimiter.class), "script");
+        assertThat(script).isInstanceOf(PreloadedRedisScript.class);
     }
 
     @Test

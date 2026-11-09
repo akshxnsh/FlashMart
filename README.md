@@ -122,8 +122,16 @@ One run each, one laptop (load tool, all services, Postgres and Docker on the sa
 | Part D R2 (warmed JVMs) | 500 | none | 12,374 ms | 12.66 s | 2,899 |
 | R2F (fresh JVMs, before the cold-start fixes) | 0 | none | 20,301 ms | 7.94 s | 3,261 |
 | R2 re-run (final build, fresh JVMs plus a 51-order gate) | 500 | none | 6,022 ms | 0.90 s | 3,978 |
+| R2fix (Gateway's lock-free rate-limiter script; fresh JVMs plus the gate) | 500 | none | 31,339 ms | 9.77 s | 947 |
 
-Why buyers are refused at the port, and why the buyer-side p99 is far above the server-side one, is not explained.
+**Runs vary a lot** (Redis timeouts 28 against 758 between two runs of the same build), so one run per row proves
+little.
+
+**Refused buyers.** Diagnosis in part: the Gateway's event loops were seen held on a lock in the rate limiter's
+script. With that lock removed, fewer buyers were refused in one run, but the ones let in waited far longer. That the
+lock caused the refusals is not proven.
+
+**p99 gap.** Why the buyer-side p99 is far above the server-side one is not explained.
 
 ## Known limitations
 
@@ -137,7 +145,7 @@ Why buyers are refused at the port, and why the buyer-side p99 is far above the 
 - **An early webhook** (arriving while the order is still `CREATED`) is answered non-2xx so the gateway retries. This depends on the gateway retrying long enough.
 - **Rate limiting fails open if Redis is down**, and the browse endpoint is not rate limited.
 - **Metrics and `/actuator/env` are exposed on each service's own port with no authentication** (never routed through the Gateway, but anyone who can reach a service port can read them). Secrets show as `******`; this is for local use only.
-- **Throughput is not where the targets are.** In the latest 5,000-buyer run, 3,978 buyers were refused at the Gateway's port and the p99 was 6.0 s (target 500 ms); one run, one laptop, cause not investigated.
+- **Throughput is not where the targets are.** In the latest 5,000-buyer run (after the rate limiter's lock was removed), 947 buyers were refused at the Gateway's port, 118 got a 503 and the answered p99 was 31.3 s (target 500 ms). The previous run had 3,978 refused and a p99 of 6.0 s. One run each, one laptop. Neither the refusals nor the long waits are fully explained.
 - **A buyer cannot start a new order** while an unpaid one is open, until it pays or expires.
 
 ## Documentation
