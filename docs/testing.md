@@ -2041,3 +2041,103 @@ STARTUP_WARMUP_ENABLED=true java -jar inventory-service/target/inventory-service
 java -cp "$CP" com.flashmart.inventory.diagnosis.ReserveColdStartProbe burst 200 100000   # or: warm 1 900000
 # stop the jar before the next run
 ```
+
+## Day 9: R2 re-run on the final build (2026-11-09)
+
+**Label: ONE run, one laptop (Gatling, all services, Postgres, Docker on the same machine), stub gateway
+(payment-stub, auto webhook SUCCESS, AFTER_REPLY), one Kafka broker, one partition per topic. Measure only: no code,
+config, pool size or timeout was changed. p99 < 500 ms and 5,000 concurrent buyers are TARGETS.** Branch
+`perf/r2-rerun`, built from `main` (merge `3f58705`). Gatling 3.16.0, `PlaceOrders`.
+
+### Setup, and one thing found on the way
+
+- **The jars in `*/target` were stale.** Order's jar still bundled openfeign 5.0.2 (the version with the Feign
+  first-burst race) and Inventory's jar was built before the warm-up commit. The modules were rebuilt with
+  `./mvnw -q -DskipTests package` before anything started (no source change; payment-stub's jar timestamp did not change).
+  After the rebuild Order, Inventory and Identity bundle `spring-cloud-starter-openfeign-5.0.3`, the Gateway
+  `spring-cloud-gateway-server-webflux-5.0.3`. A run on the old jars would have been invalid.
+- Stack started once, in the documented order, by the throwaway `recon-tools/stack3.sh` (config server, Eureka,
+  Identity/Inventory/Order/payment-stub, Gateway), all JVMs fresh. Inventory's warm-up ran before its port opened
+  ("20 reserve calls, all rolled back, 2375 ms"). Reconciler ON at its real threshold (570.5 s). Compose: Redis, Kafka,
+  Prometheus, Grafana.
+- **Order's first config fetch timed out** ("Read timed out" on `http://localhost:8888/order-service/default`, one
+  WARN at start-up) and it fetched a second time; the log does not say which source won. Not investigated. The local
+  fallback copy is meant to hold the same values (drift is unchecked).
+
+### Warm-up gate (passed, so the 5,000 ran)
+
+`BUYERS=1 WARMUP=50 make-tokens.sh`, then `PlaceOrders -Dbuyers=1 -DwarmupBuyers=50 -DrampSeconds=1` through the
+Gateway. Result: `201 x 50` (warm-up, item 2) and `201 x 1`; Order: 51 PAID, 0 failed; breaker `closed`, 51 successful
+calls, 0 failed; no Feign or converter error in Order's log (its two WARNs are the config fetch above and the load
+balancer cache notice); Inventory pool 10 total, 0 active, 0 pending, 10 idle afterwards.
+
+### Reset between the gate and the run
+
+`reset-run.sh` (the first step of `run.sh`) re-seeded both databases and proved them empty (orders, order_items,
+outbox, refunds = 0; reservations = 0; all items at full stock), so the gate used no stock or tokens meant for the
+run. `make-tokens.sh` then overwrote the gate's 51 tokens with 5,200 (5,000 measured + 200 warm-up), 102.0 s. Budget
+left at Gatling start / end: **789 / 767 s** (no expiry). JVMs were NOT restarted between the gate and the run (the
+51 gate orders had warmed them). The Gatling run itself warms item 2 with 200 buyers first, as in Part D.
+
+### Commands
+
+```bash
+cd "C:/Coding Shuttle/FlashMart"; set -a; . ./.env; set +a          # .env has GRAFANA_ADMIN_PASSWORD
+for m in config-server eureka-server identity-service inventory-service order-service payment-stub api-gateway; do
+  (cd $m && ./mvnw -q -DskipTests package); done
+docker compose up -d prometheus grafana                               # redis and kafka were already up
+LOGDIR=logs-r2rerun bash load-tests/target/recon-tools/stack3.sh &    # throwaway, git-ignored
+bash load-tests/reset-run.sh
+curl -X POST http://127.0.0.1:8085/admin/auto-webhook -H 'Content-Type: application/json' -d '{"status":"SUCCESS"}'
+BUYERS=1 WARMUP=50 bash load-tests/make-tokens.sh
+(cd load-tests && ../order-service/mvnw -q gatling:test -Dgatling.simulationClass=com.flashmart.load.PlaceOrders \
+   -Dbuyers=1 -DwarmupBuyers=50 -DrampSeconds=1)                      # the gate
+bash load-tests/target/recon-tools/run.sh R2rerun-run 5000 10         # reset, auto-webhook, 5,200 tokens, Gatling, checks, drain, count-gap, Grafana
+python load-tests/target/recon-tools/hikari2.py 2026-11-09 R2rerun 17:07:25 17:07:57
+```
+
+### Result (Gatling 17:07:25 to 17:07:57 IST, wall time 32 s including Maven start-up and the 200-buyer warm-up)
+
+| | This run (R2 re-run) | Part D R2 | R2F |
+|---|---|---|---|
+| JVMs | fresh, plus a 51-order gate | warmed by R1 | fresh |
+| Orders sold / expected (item 1) | **500 / 500** | 500 / 500 | **0** / 500 |
+| `place-order` statuses | 201 x 500, 409 x 522, **no response x 3,978** | 201 x 500, 409 x 1,555, 503 x 46, no response x 2,899 | 201 x 0, 409 x 1,234, 503 x 505, no response x 3,261 |
+| Warm-up statuses | 201 x 50, 409 x 150 | 201 x 50, 409 x 150 | 503 x 200 |
+| Oversell (`verify.sh`, `check-orders.sh`, both items) | none | none | none (`check-orders` FAIL: 1 order `CREATED`) |
+| Gap, Version B (`count-gap.sh` after drain) | 0 (drain 20 s, outbox 0, lag 0) | 0 | 0 |
+| Gatling p50 / p95 / p99, answered only (ms) | 3,553 / 5,337 / 6,022 | 3,487 / 9,989 / 12,374 | 9,747 / 18,253 / 20,301 |
+| Gatling p50 / p95 / p99, all 5,000 incl. refused (ms) | 943 / 4,173 / 5,349 | 53 / 6,313 / 11,798 (from the old log; not in the Part D table) | 3,410 / 15,992 / 19,288 |
+| Requests per second (mean, all) | 238.1 (answered 48.7) | 263.2 | 156.3 (answered 54.3) |
+| Refused at `:8080` (`ConnectException: Connection refused`) | 3,978 of 5,000 | 2,899 | 3,261 |
+| Order server-side p99, `POST /api/orders` (Grafana, max of 30 s windows) | 0.90 s | 12.66 s | 7.94 s |
+| Inventory server-side p99, reserve (same) | 0.32 s | 0.11 s | 0.88 s |
+| Order pool: max active / waiting; connection timeouts | 3 / 0; 0 | 10 / 191; 0 | 10 / 23; 7 |
+| Order borrows; mean hold; mean acquire | 6,507; 7.0 ms; 0.4 ms | 2,896; 50.1 ms; (wait mean 735 ms) | 6,801; 18.2 ms; (wait mean 54 ms) |
+| Inventory pool: max active / waiting; timeouts | 2 / 0; 0 | 4 / 0 | 10 / 177 |
+| Gateway Redis timeouts (fail open, 500 ms) | **28** (all in the second 17:07:55) | 918 | 987 |
+| Payment breaker | `closed` all run, no transition logged | not recorded here | opened (Feign error), stayed OPEN |
+| Reconciler actions / alerts | 0 confirmed, 0 released / 0 (all four reasons) | n/a (not built) | n/a (not built) |
+
+**Against the targets, per measured number:** Gatling p99 answered-only 6,022 ms and including refused 5,349 ms:
+**p99 < 500 ms not met.** Order's own server-side p99 (max of 30 s windows) 0.90 s: not met. Inventory's reserve
+server-side p99 0.32 s: under 500 ms (server side, not the buyer's number). 5,000 concurrent buyers: 5,000 were
+offered over 10 s, 3,978 got no response: **not reached**. Zero oversell: held in this run (one run).
+
+### Unexplained (no causes claimed)
+
+- **Refused connections.** 3,978 of 5,000 (79.6 %) got `Connection refused`, more than Part D R2 (2,899). Why the
+  port refuses was not investigated here.
+- **Buyer-side p99 against server-side p99.** Answered-only p99 6.0 s while Order's server-side p99 was 0.90 s and
+  Order's pool never waited. The gap is time before Order (or outside it); not traced.
+- **Redis timeouts.** 28 EVALSHA calls timed out at 500 ms, all within one second near the end of the run (17:07:55).
+  The limiter failed open for them. Not explained. Far fewer than Part D R2 (918) and R2F (987), but one run each.
+- **Why this run sold 500 where R2F sold 0.** The two fixes target R2F's two causes; this run did not test each fix
+  alone, and the gate warmed the JVMs. Not separated.
+- **Order's config fetch** (above): which source its values came from was not checked.
+
+### What this run does not show
+
+One run. The Part D comparison is against runs on other JVM states and other builds. Nothing was tuned, so the
+numbers say nothing about what a different pool or timeout would do. Not a real payment gateway. Not a 5,000-concurrent
+run. Not repeated, so no variance is known.
