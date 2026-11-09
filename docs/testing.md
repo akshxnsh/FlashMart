@@ -1762,5 +1762,29 @@ bash load-tests/verify.sh; bash load-tests/check-orders.sh; bash load-tests/coun
 curl -s http://localhost:8082/actuator/prometheus | grep ^inventory_reconciler
 ```
 
+### Addendum: keyset cursor (review fix)
+
+- `releasableRowsBehindAFullBatchOfLiveOnesAreReachedWithinTwoPasses`: 55 stale rows answered `PENDING_PAYMENT`
+  and one `ORDER_EXPIRED` row behind them. **On the old code it failed** ("expected RELEASED but was RESERVED" after
+  2 passes); with the cursor it passes (released in the second pass, the 55 untouched).
+- `afterTheEndIsReachedTheNextPassStartsFromTheOldestAgain`: 51 live rows: 50, then 1 (end), then the oldest has
+  become `ORDER_EXPIRED` and the wrapped pass (50 rows from the oldest) releases it.
+- `aPoisonOrderInTheMiddleDoesNotBlockTheRowsBehindIt`: 5 orders, the middle one always unreachable: pass 1 releases
+  the two before it and stops; pass 2 starts after it and releases the two behind it; pass 3 (wrapped) asks the
+  poison order again and stops there. 4 of 5 units back.
+- `ReconcilerCountersTest`: right after the reconciler is built, the six counters exist at 0 in the registry and no
+  other meter does.
+- Changed: `anUnreachableOrderStopsThePassAndIsRetriedAfterTheWrap` (was "...AndTheNextPassRetries"): the next pass
+  now starts after the failed order, so it is released one pass later (after the wrap). Its old expectation failed
+  on the new code (as the settled design intends). The class now also runs passes in `@BeforeEach` until one reaches
+  the end, so every test starts from the oldest row (the reconciler is one bean with an in-memory cursor; one test
+  that stopped early once broke the next). The race test and the other tests are unchanged.
+- Full suite after the fix: identity 119, inventory 130, order 319, notification 29, payment-stub 22, eureka-server 2,
+  config-server 1, api-gateway 52 with **1 failure** (`PrometheusEndpointTest`: `/actuator/health` 503). All four
+  compose containers had been stopped from outside the session at 14:15:55, so Redis was down when it ran; the
+  Gateway's health includes Redis. With Redis back (started by `RateLimitFailOpenTest`) the api-gateway module was
+  run once more: 52, 0 failures. Total **674**.
+
+
 **Full suite on `feat/reconciler`, before the demo:** identity 119, inventory 126, order 319, notification 29,
 payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **670, 0 failures, 0 errors**.

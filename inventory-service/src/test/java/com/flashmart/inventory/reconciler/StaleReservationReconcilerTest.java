@@ -72,6 +72,16 @@ class StaleReservationReconcilerTest {
     void everyOtherOrderIsUnknown() {
         // Rows of other tests or of the dev data are "not found": never acted on.
         given(order.statusOf(anyLong())).willReturn(new OrderStatusClient.Answer.NotFound());
+        // The reconciler is one bean for the whole class and keeps its cursor in
+        // memory. Run passes until one reaches the end, so every test starts from
+        // the oldest row. These passes act on nothing: every order is "not found".
+        for (int i = 0; i < 20; i++) {
+            StaleReservationReconciler.Result r = reconciler.runOnce();
+            if (r.stoppedAt() == null && r.rows() < settings.batchSize()) {
+                break;
+            }
+        }
+        org.mockito.Mockito.clearInvocations(order);
     }
 
     @AfterEach
@@ -152,7 +162,7 @@ class StaleReservationReconcilerTest {
     }
 
     @Test
-    void anUnreachableOrderStopsThePassAndTheNextPassRetries() {
+    void anUnreachableOrderStopsThePassAndIsRetriedAfterTheWrap() {
         long item = item(100), first = order(), second = order();
         stale(first, item, 1);   // older, asked first
         stale(second, item, 1);
@@ -169,11 +179,14 @@ class StaleReservationReconcilerTest {
         assertEquals(98, stock(item));
         assertEquals(1.0, alerts("order_unreachable") - unreachable);
 
-        // Order is back: the next pass handles both.
+        // Order is back. The next pass starts AFTER the failed order (cursor), so it
+        // handles `second` and reaches the end; the one after that wraps around.
         answer(first, "PAYMENT_UNAVAILABLE");
         reconciler.runOnce();
-        assertEquals("RELEASED", status(first, item));
+        assertEquals("RESERVED", status(first, item), "skipped until the wrap-around");
         assertEquals("RELEASED", status(second, item));
+        reconciler.runOnce();
+        assertEquals("RELEASED", status(first, item));
         assertEquals(100, stock(item));
     }
 
@@ -222,6 +235,88 @@ class StaleReservationReconcilerTest {
         verify(order, times(1)).statusOf(multi);
         assertEquals(10, stock(a));
         assertEquals(10, stock(b));
+    }
+
+    /**
+     * Starvation: more stale rows than one batch whose orders are still "live"
+     * (never acted on, so they stay RESERVED and stay oldest), and one
+     * releasable row behind them. It must be released within a bounded number
+     * of passes (here 2: 55 live rows, batch 50).
+     */
+    @Test
+    void releasableRowsBehindAFullBatchOfLiveOnesAreReachedWithinTwoPasses() {
+        long item = item(1000);
+        for (int i = 0; i < 55; i++) {
+            long live = order();
+            stale(live, item, 1);
+            answer(live, "PENDING_PAYMENT");
+        }
+        long behind = order();
+        stale(behind, item, 1);
+        answer(behind, "ORDER_EXPIRED");
+
+        reconciler.runOnce();
+        reconciler.runOnce();
+
+        assertEquals("RELEASED", status(behind, item), "the releasable row behind 55 live ones");
+        assertEquals(1000 - 55, stock(item));
+    }
+
+    @Test
+    void afterTheEndIsReachedTheNextPassStartsFromTheOldestAgain() {
+        long item = item(1000);
+        List<Long> live = new ArrayList<>();
+        for (int i = 0; i < 51; i++) {
+            long o = order();
+            live.add(o);
+            stale(o, item, 1);
+            answer(o, "CREATED");
+        }
+
+        assertEquals(50, reconciler.runOnce().rows(), "a full batch: the cursor moves on");
+        assertEquals(1, reconciler.runOnce().rows(), "the last row; the end is reached");
+        verify(order, times(1)).statusOf(live.get(0));
+
+        // The oldest order has ended meanwhile; the next pass wraps and finds it.
+        answer(live.get(0), "ORDER_EXPIRED");
+        StaleReservationReconciler.Result wrapped = reconciler.runOnce();
+
+        assertEquals(50, wrapped.rows(), "starts from the oldest again");
+        verify(order, times(2)).statusOf(live.get(0));
+        assertEquals("RELEASED", status(live.get(0), item));
+        assertEquals("RESERVED", status(live.get(1), item));
+        reconciler.runOnce(); // back to the end, so later tests start from the oldest
+    }
+
+    @Test
+    void aPoisonOrderInTheMiddleDoesNotBlockTheRowsBehindIt() {
+        long item = item(100);
+        long a = order(), b = order(), poison = order(), c = order(), d = order();
+        for (long o : List.of(a, b, poison, c, d)) {
+            stale(o, item, 1);
+            answer(o, "RESERVATION_FAILED");
+        }
+        given(order.statusOf(poison)).willReturn(new OrderStatusClient.Answer.Unreachable("HTTP 500"));
+
+        StaleReservationReconciler.Result first = reconciler.runOnce();
+        assertEquals(poison, first.stoppedAt());
+        assertEquals("RELEASED", status(a, item));
+        assertEquals("RELEASED", status(b, item));
+        assertEquals("RESERVED", status(c, item), "the pass stopped at the poison order");
+        verify(order, never()).statusOf(c);
+
+        StaleReservationReconciler.Result second = reconciler.runOnce();
+        assertNull(second.stoppedAt(), "started after the poison order");
+        assertEquals("RELEASED", status(c, item));
+        assertEquals("RELEASED", status(d, item));
+        verify(order, times(1)).statusOf(poison);
+
+        StaleReservationReconciler.Result third = reconciler.runOnce();
+        assertEquals(poison, third.stoppedAt(), "after the wrap the poison order is asked again");
+        verify(order, times(2)).statusOf(poison);
+        assertEquals("RESERVED", status(poison, item));
+        assertEquals(99, stock(item), "4 of the 5 units back, the poison one still held");
+        reconciler.runOnce(); // the cursor is past the poison order; this pass reaches the end
     }
 
     /**

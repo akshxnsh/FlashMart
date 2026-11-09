@@ -5971,3 +5971,30 @@ already written (architecture.md §3, "Inventory → Order"): Inventory asks Ord
   acts on a live order).
 - Unproven: the frequency of Version B under real overload, a pass against a large backlog, more than one Inventory
   instance (passes may overlap; the guards keep that correct, untested).
+
+### Addendum: keyset cursor and counters at zero (found in review)
+
+- **Problem.** Each pass read "the 50 oldest stale rows". Rows answered live, `404` or an unknown status are never
+  acted on, so they stay `RESERVED` and stay the oldest: 50 of them hid every releasable row behind them, for ever.
+  And one order that always answered 5xx stopped every pass at the same place. A test with 55 "live" rows and one
+  releasable row behind them failed on that code (the row was still `RESERVED` after 2 passes).
+- **Chosen.** An in-memory keyset cursor `(reserved_at, id)` (`stock_reservations.id` is the `BIGSERIAL` primary
+  key). Each pass reads stale rows (same threshold, database clock) with `(reserved_at, id)` after the cursor,
+  `ORDER BY reserved_at, id LIMIT batch`. A full batch moves the cursor to its last row; fewer rows than the batch
+  means the end was reached and the cursor goes back to the start (the next pass wraps around). On an unreachable
+  Order the pass still stops, and the cursor moves PAST that order's rows in the batch, so the next pass starts after
+  it. No schema change, no new config; lost on restart (it starts again from the oldest row).
+- **Trade-off.** An order that failed only once, and any row read before that order's last row but not yet asked
+  about, waits until the next wrap-around. With N stale rows the reconciler cannot act on, a wrap-around takes
+  about N / 50 passes (60 s each), so a releasable row can wait that much longer than threshold + one interval. It
+  only delays: nothing is acted on without a terminal answer.
+- **Unchanged.** What is acted on (`PAID` → confirm, the four failure states → release, anything else → alert), the
+  status-guarded release/confirm, and no Order call inside a transaction. The cursor decides only which rows are
+  looked at, never what is done to them, so it cannot make the reconciler act on a row it should not.
+- **Counters at zero.** The four `inventory.reconciler.alerts{reason}` and two `inventory.reconciler.actions{action}`
+  counters are registered at zero when the reconciler is built, so Prometheus shows them from the first scrape.
+- **Tests.** Starvation (failed on the old code; now released within 2 passes), wrap-around (a row that became
+  releasable is found after the end), a poison order in the middle (the pass stops there, the next starts after it,
+  rows behind it are released, it is asked again after the wrap), and the six counters at zero. One existing test
+  changed because its expectation was the old behaviour: after an unreachable order, the next pass no longer
+  retries that order first; it is retried after the wrap.

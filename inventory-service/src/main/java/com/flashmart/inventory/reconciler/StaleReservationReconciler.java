@@ -41,6 +41,26 @@ import java.util.Set;
  *       answer, not a failure, so the pass goes on.</li>
  * </ol>
  *
+ * <p><b>Cursor (addendum, decisions.md).</b> Rows answered "live", 404 or an
+ * unknown status are not acted on, so they stay {@code RESERVED} and stay the
+ * oldest; reading "the 50 oldest" every pass would let 50 of them hide every
+ * releasable row behind them, and one order that always fails would stop every
+ * pass at the same place. So each pass reads the next stale rows AFTER an
+ * in-memory keyset cursor {@code (reserved_at, id)}, oldest first:
+ * <ul>
+ *   <li>a full batch with every order answered: the cursor moves to the batch's
+ *       last row;</li>
+ *   <li>fewer rows than the batch (the end was reached): the cursor goes back to
+ *       the start, so the next pass wraps around to the oldest rows again;</li>
+ *   <li>Order unreachable: the pass stops, and the cursor moves PAST the failed
+ *       order's rows in this batch, so the next pass starts after it. Trade-off:
+ *       an order that failed only once (and any row read before its last row and
+ *       not yet asked about) waits until the next wrap-around. That only delays;
+ *       nothing is acted on without a terminal answer.</li>
+ * </ul>
+ * Memory only: a restart starts again from the oldest row. The cursor decides
+ * only which rows are LOOKED AT, never what is done to them.
+ *
  * <p>No lock is needed. Order's states {@code PAID} and the four failures have
  * no way out (every Order status write requires {@code CREATED} or
  * {@code PENDING_PAYMENT}), so an answer acted on cannot change after it was
@@ -55,6 +75,32 @@ public class StaleReservationReconciler {
     static final Set<String> FAILED = Set.of("RESERVATION_FAILED", "PAYMENT_UNAVAILABLE", "ORDER_EXPIRED",
             "PAYMENT_FAILED");
     static final Set<String> LIVE = Set.of("CREATED", "PENDING_PAYMENT");
+    static final List<String> ALERT_REASONS = List.of("order_live", "unknown_status", "order_not_found",
+            "order_unreachable");
+    static final List<String> ACTIONS = List.of("confirmed", "released");
+
+    /** A row's position in the scan order. */
+    record Key(java.time.OffsetDateTime reservedAt, long id) implements Comparable<Key> {
+        @Override
+        public int compareTo(Key o) {
+            int c = reservedAt.compareTo(o.reservedAt);
+            return c != 0 ? c : Long.compare(id, o.id);
+        }
+    }
+
+    private record Row(long orderId, Key key) {
+    }
+
+    /** Stale RESERVED rows; the threshold is measured on the database clock. Index (status, reserved_at). */
+    private static final String STALE = """
+            SELECT order_id, reserved_at, id
+              FROM stock_reservations
+             WHERE status = 'RESERVED'
+               AND reserved_at < now() - make_interval(secs => ?)
+            """;
+
+    private static final org.springframework.jdbc.core.RowMapper<Row> ROW = (rs, i) -> new Row(rs.getLong("order_id"),
+            new Key(rs.getObject("reserved_at", java.time.OffsetDateTime.class), rs.getLong("id")));
 
     /** What one pass did. {@code stoppedAt} is the order whose call failed, or null. */
     public record Result(int rows, int ordersAsked, int confirmed, int released, int alerts, Long stoppedAt) {
@@ -66,6 +112,9 @@ public class StaleReservationReconciler {
     private final ReconcilerSettings settings;
     private final MeterRegistry meters;
 
+    /** Where the next pass starts (exclusive); null = from the oldest stale row. One pass at a time. */
+    private Key cursor;
+
     public StaleReservationReconciler(JdbcTemplate jdbc, OrderStatusClient order, ReservationEventService events,
                                       ReconcilerSettings settings, MeterRegistry meters) {
         this.jdbc = jdbc;
@@ -73,18 +122,19 @@ public class StaleReservationReconciler {
         this.events = events;
         this.settings = settings;
         this.meters = meters;
+        // Registered at zero, so Prometheus shows every series from the first scrape.
+        ALERT_REASONS.forEach(r -> count("inventory.reconciler.alerts", "reason", r, 0));
+        ACTIONS.forEach(a -> count("inventory.reconciler.actions", "action", a, 0));
     }
 
-    public Result runOnce() {
-        List<Long> rows = jdbc.queryForList("""
-                SELECT order_id
-                  FROM stock_reservations
-                 WHERE status = 'RESERVED'
-                   AND reserved_at < now() - make_interval(secs => ?)
-                 ORDER BY reserved_at
-                 LIMIT ?
-                """, Long.class, settings.thresholdMs() / 1000.0, settings.batchSize());
-        List<Long> orderIds = new ArrayList<>(new LinkedHashSet<>(rows));
+    public synchronized Result runOnce() {
+        Key after = cursor;
+        double thresholdSeconds = settings.thresholdMs() / 1000.0;
+        List<Row> rows = after == null
+                ? jdbc.query(STALE + "ORDER BY reserved_at, id LIMIT ?", ROW, thresholdSeconds, settings.batchSize())
+                : jdbc.query(STALE + "AND (reserved_at, id) > (?, ?) ORDER BY reserved_at, id LIMIT ?", ROW,
+                        thresholdSeconds, after.reservedAt(), after.id(), settings.batchSize());
+        List<Long> orderIds = new ArrayList<>(new LinkedHashSet<>(rows.stream().map(Row::orderId).toList()));
 
         int asked = 0, confirmed = 0, released = 0, alerts = 0;
         for (long orderId : orderIds) {
@@ -120,11 +170,15 @@ public class StaleReservationReconciler {
                 case OrderStatusClient.Answer.Unreachable u -> {
                     alerts++;
                     alert("order_unreachable", orderId, "could not ask Order (" + u.why()
-                            + "). Nothing changed; this pass stops, the next one retries.");
+                            + "). Nothing changed; this pass stops, the next one starts after this order.");
+                    cursor = rows.stream().filter(r -> r.orderId() == orderId).map(Row::key)
+                            .max(Key::compareTo).orElseThrow();
                     return new Result(rows.size(), asked, confirmed, released, alerts, orderId);
                 }
             }
         }
+        // End reached: wrap around next pass. Otherwise continue after this batch.
+        cursor = rows.size() < settings.batchSize() ? null : rows.getLast().key();
         return new Result(rows.size(), asked, confirmed, released, alerts, null);
     }
 
