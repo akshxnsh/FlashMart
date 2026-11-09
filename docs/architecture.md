@@ -1160,6 +1160,7 @@ the limiter tests need the compose Redis and Docker).
   consumers (nothing consumes `BrandUpserted` / `UserUpserted`), Redis, the
   signed-header check and any security in Order or Inventory. (Identity's four
   `/api/auth/**` controllers and V8 exist since Day 8; the Gateway does not.)
+  *Historical snapshot. Since built (Days 7 to 9, see §8): the expiry sweep, Inventory's two consumers, the API Gateway, Redis rate limiting, the signed-header check, Order's internal status endpoint and the stale-reservation reconciler. Still not built: the reconciliation sweep, the refund worker, Identity's relay, Notification's consumers.*
   All four services share one local Postgres credential pair but each owns a
   separate database.
 
@@ -1518,7 +1519,7 @@ or "recorded, not decided" still need a design decision.
   derived deadlines"). An `amount > 0` assertion before `initiate` is a bug
   guard only. The fee and the guard are tested (§8); since Day 5 the guard
   (`requirePayable`) runs right before the `initiate` call.
-- **FR-B1 (buyer browse): designed on Day 8, not built; no endpoint exists.**
+- **FR-B1 (buyer browse): designed on Day 8, not built; no endpoint exists.** *Built on Day 8 (`GET /api/flash-sales`, uncached, paged, `inStock` flag; see §8).*
   Moved out of the open list: the design (uncached, paged, an `inStock` flag,
   never an exact count) is in §3, "Edge: Gateway" and `decisions.md`, "Day 8".
   It no longer waits for caching.
@@ -1526,7 +1527,7 @@ or "recorded, not decided" still need a design decision.
   `RESERVATION_RELEASED` mid-loop Order stops the loop, writes no CAS and no
   event, re-reads the real status and reports it; if still `CREATED`, it logs
   ERROR and answers `500 INCONSISTENT_STATE`, and does not guess. Repairing that
-  state is the stale-reservation reconciler's case (designed, not built; Day 7 did not build it), not fixed here.
+  state is the stale-reservation reconciler's case (designed, not built; Day 7 did not build it; *built on Day 9, see §8*), not fixed here.
 - **Decided; implemented and tested (Day 4):** all three reserve "no" outcomes
   (`OUT_OF_STOCK`, `SALE_NOT_LIVE`, `ITEM_NOT_IN_SALE`) end the order as
   `RESERVATION_FAILED`.
@@ -1560,7 +1561,7 @@ or "recorded, not decided" still need a design decision.
   with Inventory mocked; not exercised against a real Inventory or the sweep. Also: same key with a
   different request is `409 IDEMPOTENCY_KEY_REUSED`, checked before replay.
   See the conditional rule on `order_items` (§4).
-- **Identity, API phase: designed on Day 8, not built.** The lost signup race
+- **Identity, API phase: designed on Day 8, not built.** *(Built on Day 8: signup, login, refresh, logout, the `409` signup race and the `typ` claim are implemented and tested, see §8. The cleanup jobs below are still not built.)* The lost signup race
   (`409`, never a `500`) and the JWT subject type (`typ`, because brand 7 and
   user 7 share an id) are decided in `decisions.md`, "Day 8", and are no longer
   open decisions. Still open: published `outbox` rows need a cleanup job, and
@@ -1569,6 +1570,7 @@ or "recorded, not decided" still need a design decision.
   need (noted, not decided).
 - **New with Day 8 (see `decisions.md`, "Day 8"; DESIGNED, NOT BUILT; every
   value provisional and unmeasured):**
+  - **Update (Days 8 and 9):** the Gateway, signed header, rate limiter (fail-open tested with Redis stopped), browse and the load-test buyers (`create-users.sh`, `make-tokens.sh`) are built, see §8. Still not built: the cleanup jobs and brand login.
   - **Limits the design accepts:** `:8082` and `:8083` stay reachable directly
     (Inventory has no auth); a signed header can be replayed for 60 s; HS256
     means the Gateway can mint tokens; the per-IP key on `/api/auth/**` is
@@ -1628,7 +1630,7 @@ or "recorded, not decided" still need a design decision.
   INVENTORY_UNAVAILABLE`. **Known gap (Version B, documented, not fixed):** a timed-out call can commit after the
   release and orphan a reservation. Day 7's republish (Version A) is implemented
   and tested but cannot see this case; only the reconciler would, and it is
-  designed, not built. The HTTP client is Spring Cloud OpenFeign 2025.1.2 on Boot 4.1.1:
+  designed, not built (*built on Day 9, see §8*). The HTTP client is Spring Cloud OpenFeign 2025.1.2 on Boot 4.1.1:
   it resolves and the context starts; its behaviour is tested against a stub,
   not against Inventory. Values: connect timeout 1 s, reserve (read) timeout 2 s, max-blocking policy 60 s, deadline margin 5 s, all **provisional**, taken from Inventory load runs on one laptop that were not repeated; recheck on Day 9. The deadline
   was re-derived on Day 5 with retry attempts: **implemented and tested** (3 s per
@@ -1663,7 +1665,7 @@ or "recorded, not decided" still need a design decision.
     released by Inventory's stale-reservation reconciler (§8).
   - **No dead-letter topic.** A skipped malformed message leaves that order's
     stock `RESERVED` until fixed by hand; the stale-reservation reconciler that
-    would catch it is designed only.
+    would catch it is designed only (*built on Day 9, see §8*).
   - **`expires_at < clock_timestamp()` is a filter, not an index condition**
     (`clock_timestamp()` changes per call, so the planner cannot use it as a range
     bound). The partial index gives the live-only set and the `expires_at`
