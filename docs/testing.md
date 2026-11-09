@@ -1659,3 +1659,108 @@ restarted once on this branch's jars for both runs. Prometheus numbers came from
 
 **Full suite on `fix/open-in-view-off`, before the runs:** identity 119, inventory 115, order 317, notification 29,
 payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **657, 0 failures, 0 errors**.
+
+## Day 9: stale-reservation reconciler (2026-11-09)
+
+**Label: implemented and tested; demonstrated ONCE on real processes on one laptop with a FORCED late reservation
+(one order, ordering forced by a row lock); a 50-buyer no-false-positive run once. Stub gateway, one Kafka broker,
+one partition. Branch `feat/reconciler` (stacked on `fix/open-in-view-off`). How often Version B happens under real
+overload is NOT measured here.**
+
+### Tests
+
+- `StaleReservationReconcilerTest` (real Postgres, Order mocked, 8 tests): `PAID` → `CONFIRMED`, stock stays taken;
+  each of the four failure states → `RELEASED`, only that order's units come back; `CREATED`, `PENDING_PAYMENT`, an
+  unknown status and `404` change nothing, each counted under its reason, and the pass goes on; an unreachable
+  Order stops the pass (the next order is not asked) and the next pass handles both; a row just under the threshold
+  is never asked about; 60 stale orders → 50 in the first pass, 10 in the second; a two-row order is asked once.
+  **Race:** the reconciler and the consumer's `release` on the same reservation, two threads, 20 rounds: stock back
+  exactly once each round. **Break-and-restore:** without `AND status = 'RESERVED'` in `release` it failed in
+  round 0 (93 instead of 90: the units came back twice); restored, it passes.
+- `OrderStatusClientTest` (JDK HTTP server as Order, 3 tests): a status, a 404, and as "unreachable": a 500, a
+  1 s answer against a 300 ms read timeout (cut short), a body about another order, a closed port.
+- `InternalOrderStatusControllerTest` (Order, real HTTP, 2 tests): all seven statuses as stored, 404 for an unknown
+  id, no Gateway signature needed.
+- `ActuatorNotRoutedTest` (+ its `fixed`-profile subclass): no route matches `/internal`, `/internal/orders/1/status`
+  or `/internal/flash-sale-items/reserve`. **Break-and-restore:** adding `/internal/**` to the inventory route made it
+  fail ("route inventory, GET /internal"); restored, it passes.
+
+### Demo: a forced Version B, stuck, then released (real processes, run once)
+
+Stack from this branch's jars; Inventory started with a SHORT threshold through command-line arguments only (no code
+hook): `--reconciler.interval-ms=5000 --reconciler.threshold.order-payment-window-ms=0
+--reconciler.threshold.order-max-created-deadline-ms=0 --reconciler.threshold.order-sweep-interval-ms=0
+--reconciler.threshold.kafka-drain-margin-ms=60000` (threshold 60 s, a pass every 5 s). A first attempt never
+reached FlashMart: the Gateway answered `503 "no instance of the target service is available"` 13 s after it
+started (Order not yet discovered through Eureka); no order was created. The script then waited until an empty
+order body came back `400` from Order, and ran:
+
+| Time | What happened |
+|---|---|
+| 13:47:01 | A `psql` session takes `SELECT ... FROM flash_sale_items WHERE id = 1 FOR UPDATE` and holds it 15 s. |
+| 13:47:02 | One order (`lt-buyer-00001`, product 1, quantity 1) through the Gateway. Inventory's reserve inserts its row and blocks on the item's stock `UPDATE`. |
+| +2.33 s | Order's 2 s read timeout fires: `503 INVENTORY_UNAVAILABLE`, order 164567 `RESERVATION_FAILED`, `OrderCancelled` in the outbox (published). |
+| 13:47:06 | Inventory's consumer: "OrderCancelled for order 164567: nothing to release". Reservations visible: 0. |
+| 13:47:16 | The lock ends; the blocked reserve commits: order 164567, item 1, `RESERVED`, `reserved_at` 13:47:04. |
+| 13:47:18 | `verify.sh` OK (available 499 = 500 - 1 held); `check-orders.sh` **FAIL: orders hold 0 units but Inventory holds 1**; `count-gap.sh` **gap 1** (`RESERVATION_FAILED`), exit 1. |
+| 13:48:09 | Reconciler pass: "order 164567 is RESERVATION_FAILED; released 1 stale reservation(s)" (about 65 s after `reserved_at`: 60 s threshold + up to one 5 s interval). |
+| 13:48:12 | `verify.sh` OK (available 500, 1 `RELEASED`); `check-orders.sh` OK; `count-gap.sh` gap 0, exit 0; `inventory_reconciler_actions_total{action="released"} 1` on Inventory and in Prometheus. |
+
+**What it proves:** on real processes, the forced ordering produces exactly the Version B row, nothing else frees
+it, and the reconciler asks Order and releases it, restoring the stock. **What it does not:** how often this happens
+under real overload, a pass with many stale rows or a slow Order, more than one Inventory instance, and the real
+570.5 s threshold (the demo used 60 s).
+
+### No-false-positive run (real processes, run once, Inventory on its REAL reconciler config)
+
+Inventory restarted with no arguments (threshold 570.5 s, a pass every 60 s; `CONFIG SOURCE: config server`). The
+auto-webhook was turned OFF, so every order that got stock stayed `PENDING_PAYMENT` with its stock `RESERVED` for the
+6-minute payment window: live orders, the case the reconciler must never act on. 50 buyers over 10 s after the
+200-buyer warm-up.
+
+- Gatling: `place-order` 201 × 50; warm-up 201 × 1, 409 × 13, **503 × 186** (the just-restarted Inventory again
+  timed out at Order's 2 s during the warm-up, as in Part F's R2F; item 2 then showed 50 `RELEASED` rows, i.e. late
+  commits released by the consumer in time).
+- Right after: 51 `PENDING_PAYMENT`, 199 `RESERVATION_FAILED`; 51 `RESERVED`, 50 `RELEASED`.
+- Watched every 60 s for 11 min: unchanged until 13:56, then Order's sweep expired all 51 (`ORDER_EXPIRED`) and the
+  consumer released them by 13:57; at 14:01:15 (past the point where every row would have crossed 570.5 s): 101
+  `RELEASED`, 0 `RESERVED`, `verify.sh` OK on both items, gap 0.
+- **The reconciler logged nothing, and no reconciler counter existed** on Inventory or in Prometheus (no actions,
+  no alerts).
+- Because "nothing counted" would also be true if no pass ran, one synthetic stale row for an order that does not
+  exist (id 999999999, `reserved_at` a day ago, stock taken by hand) was then inserted: the next pass (49 s later)
+  asked the real Order, got `404`, changed nothing, logged the ERROR and counted
+  `inventory_reconciler_alerts_total{reason="order_not_found"} 1`. The row was removed by hand and the unit put back
+  (`verify.sh` OK, gap 0).
+
+**What it shows:** with the derived threshold, Order's own sweep and the consumer settled every live order before
+the reconciler would look, so the reconciler took no action and raised no alert on them; and the 404 path works on
+real processes. **What it does not:** a live order older than the threshold (Order's sweep dead), which is covered
+only by the unit test (`order_live`: nothing changed, alert).
+
+
+### Commands
+
+```bash
+# unit and race tests
+(cd inventory-service && ./mvnw test -Dtest='StaleReservationReconcilerTest,OrderStatusClientTest')
+(cd order-service && ./mvnw test -Dtest=InternalOrderStatusControllerTest)
+(cd api-gateway && ./mvnw test -Dtest='ActuatorNotRoutedTest,ActuatorNotRoutedFixedProfileTest')
+
+# demo: start Inventory with a short threshold (arguments only), the rest as usual
+java -jar inventory-service/target/inventory-service-0.0.1-SNAPSHOT.jar --reconciler.interval-ms=5000 \
+  --reconciler.threshold.order-payment-window-ms=0 --reconciler.threshold.order-max-created-deadline-ms=0 \
+  --reconciler.threshold.order-sweep-interval-ms=0 --reconciler.threshold.kafka-drain-margin-ms=60000
+bash load-tests/reset-run.sh
+# session 1: hold the item's row lock for 15 s
+psql -d inventory-service -c "BEGIN; SELECT id FROM flash_sale_items WHERE id = 1 FOR UPDATE; SELECT pg_sleep(15); COMMIT;" &
+# session 2, within that second: one order through the Gateway with a buyer's access token
+curl -X POST http://localhost:8080/api/orders -H "Authorization: Bearer $TOKEN" -H 'Idempotency-Key: demo-version-b-1' \
+  -H 'Content-Type: application/json' -d '{"flashSaleId":1,"items":[{"productId":1,"quantity":1}]}'
+# after the lock ends: the stuck row, then again after about a minute
+bash load-tests/verify.sh; bash load-tests/check-orders.sh; bash load-tests/count-gap.sh
+curl -s http://localhost:8082/actuator/prometheus | grep ^inventory_reconciler
+```
+
+**Full suite on `feat/reconciler`, before the demo:** identity 119, inventory 126, order 319, notification 29,
+payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **670, 0 failures, 0 errors**.
