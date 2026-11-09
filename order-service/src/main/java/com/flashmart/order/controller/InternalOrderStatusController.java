@@ -1,5 +1,6 @@
 package com.flashmart.order.controller;
 
+import io.swagger.v3.oas.annotations.Hidden;
 import com.flashmart.order.entity.Order;
 import com.flashmart.order.repository.OrderRepository;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +22,8 @@ import org.springframework.web.bind.annotation.RestController;
  * Inventory's internal reserve it has no authentication of its own, and is
  * reachable only on the service's own port.
  */
+/** Hidden from the OpenAPI docs: internal, called by Inventory only. */
+@Hidden
 @RestController
 @RequiredArgsConstructor
 public class InternalOrderStatusController {

@@ -1,5 +1,6 @@
 package com.flashmart.inventory.controller;
 
+import io.swagger.v3.oas.annotations.Hidden;
 import com.flashmart.inventory.dto.reserve.ReserveRequest;
 import com.flashmart.inventory.dto.reserve.ReserveResponse;
 import com.flashmart.inventory.service.ReservationService;
@@ -14,6 +15,8 @@ import org.springframework.web.bind.annotation.RestController;
  * It takes an order id with no ownership check and mutates stock; the
  * {@code /internal/} prefix is a convention, the Gateway's routes are the control.
  */
+/** Hidden from the OpenAPI docs: internal, called by Order only. */
+@Hidden
 @RestController
 @RequiredArgsConstructor
 public class ReservationController {
