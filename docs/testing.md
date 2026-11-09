@@ -2235,3 +2235,166 @@ read from bytecode. Whether it happened in R2 was **not measured**.
 its event loops busy.
 **What it would change:** buyers who are now refused would wait in the queue or be accepted, so they turn into
 (slower) answered requests. It would not make Order or Inventory faster, so the answered p99 may rise. Not measured.
+
+## Day 9: the decisive R2 run, sampled and thread-dumped (2026-11-09)
+
+**Label: two R2-shaped runs on one laptop, stub gateway (payment-stub, auto-webhook SUCCESS, AFTER_REPLY), one Kafka
+broker. Run 1 was disturbed by my own measuring and is NOT a result. Run 2 is the one reported: ONE run. Measure only:
+no code, config or setting was changed. p99 < 500 ms and 5,000 concurrent buyers are TARGETS.** Branch
+`perf/refused-diagnosis`.
+
+**Question.** During an R2-shaped run, does the Gateway's accept queue really fill, and what are its event-loop
+threads doing?
+
+### Setup
+
+- All jars rebuilt (`./mvnw -q -DskipTests package` in the seven modules, all exit 0). The stack from the earlier
+  R2 re-run was stopped, then started fresh in the documented order by `recon-tools/stack3.sh` (config 18:24:59,
+  Eureka 18:25:11, services 18:25:57, Gateway 18:26:12). Inventory warm-up ran ("20 reserve calls, all rolled back,
+  2078 ms"). Reconciler ON at its real threshold. Redis, Kafka, Prometheus and Grafana from compose.
+- Warm-up gate (`BUYERS=1 WARMUP=50`, as in the R2 re-run): `201 x 50` and `201 x 1`. Order 51 PAID, breaker
+  `closed` with 51 successful calls and 0 failed, no Feign or converter error in Order's log.
+- Each run: `recon-tools/run.sh NAME 5000 10` (reset and proof of empty tables, auto-webhook, 5,200 fresh tokens,
+  Gatling `PlaceOrders`, checks, drain, `count-gap.sh`, Grafana panels). The same JVMs served both runs, so run 2
+  ran on JVMs that run 1 had warmed. The R2 re-run instead had fresh JVMs plus the gate.
+- Instruments (throwaway, outside the repo):
+  - **Connection sampler**, run outside Claude Code's sandbox with your approval. About every 250 ms it runs
+    `netstat -ano` (IPv4 and IPv6) and counts rows on :8080 by state, separately for the server side (local port
+    8080) and the client side (remote port 8080). It also reads the Gateway's CPU time.
+  - **Windows TCP counters** before and after the run (`Get-Counter '\TCPv4\Connection Failures'` and the same for
+    TCPv6, resets, passive opens), taken outside the sandbox.
+  - **Gateway thread dumps** with `jcmd <pid> Thread.print -l -e`. `-l` names lock owners, and each dump shows each
+    thread's CPU time.
+
+### Run 1 (18:29): disturbed, not a result
+
+- **The sampler missed the whole run, and that was my bug.** I read the before-counters with `netstat -s` without
+  `-n`. That also lists every connection and looks up a host name for each one. Under load it took about 2
+  minutes, so sampling began after Gatling had ended (18:30:38).
+- **The dumps took 6.4, 6.1 and 0.9 s each** (the `jcmd` attach was slow on the loaded laptop), and two of them
+  fell while requests were still in flight.
+- **The numbers moved far from every earlier R2:** 1,870 refused plus 2 x 60 s timeouts, Gatling p99 21.9 s,
+  Order server-side p99 8.5 s, Order pool up to 6 active and 41 waiting, 1,742 Redis timeouts.
+- Still true for run 1: 500 / 500 sold, `verify` and `check-orders` OK, Version B gap 0, breaker closed.
+- Its three dumps are used below only as extra snapshots of the same Gateway JVM (process 33220).
+- After this run the sampler was fixed: counters from `Get-Counter` (1.5 s) instead of `netstat -s`, a 2 s dry run
+  before arming, and two dumps instead of three, with `-l`.
+
+### Run 2 (Gatling 18:38:42 to 18:39:18, 36 s): results
+
+| | Run 2 (this) | R2 re-run | Part D R2 | R2F |
+|---|---|---|---|---|
+| JVMs | warmed by gate + run 1 | fresh + gate | warmed by R1 | fresh |
+| Orders sold / expected (item 1) | **500 / 500** | 500 / 500 | 500 / 500 | 0 / 500 |
+| `place-order` statuses | 201 x 500, 409 x 1,418, **no response x 3,082** | 201 x 500, 409 x 522, no response x 3,978 | 201 x 500, 409 x 1,555, 503 x 46, no response x 2,899 | 201 x 0, 409 x 1,234, 503 x 505, no response x 3,261 |
+| Errors | `j.n.ConnectException: Connection refused: getsockopt` x 3,082 (100 %); no timeouts | same text x 3,978 | same | same |
+| Warm-up statuses | 201 x 50, 409 x 150 | same | same | 503 x 200 |
+| Oversell (`verify.sh`, `check-orders.sh`, both items) | none | none | none | none |
+| Gap, Version B (after drain) | 0 (drain 30 s) | 0 | 0 | 0 |
+| Gatling p50 / p95 / p99, answered only (ms) | 3,396 / 6,910 / 8,046 | 3,553 / 5,337 / 6,022 | 3,487 / 9,989 / 12,374 | 9,747 / 18,253 / 20,301 |
+| Gatling p50 / p95 / p99, all 5,000 (ms) | 1,525 / 5,866 / 7,388 | 943 / 4,173 / 5,349 | 53 / 6,313 / 11,798 | 3,410 / 15,992 / 19,288 |
+| Refused requests: min / p99 / max (ms) | 1 / 3,379 / 3,679 | 1 / 3,902 / 5,148 | n/a | n/a |
+| Order server-side p99, `POST /api/orders` (Grafana, max of windows) | 3.20 s | 0.90 s | 12.66 s | 7.94 s |
+| Inventory server-side p99, reserve (same) | 0.32 s | 0.32 s | 0.11 s | 0.88 s |
+| Order pool: max active / pending (Grafana) | 3 / 0 | 3 / 0 | 10 / 191 | 10 / 23 |
+| Inventory pool: max active / pending (Grafana) | 1 / 0 | 2 / 0 | 4 / 0 | 10 / 177 |
+| Gateway Redis timeouts (EVALSHA, 500 ms, fail open) | **758** (18:39:05 to 18:39:15) | 28 | 918 | 987 |
+| Payment breaker | `closed` all run | `closed` | not recorded | opened |
+| Reconciler actions / alerts | 0 / 0 (all four reasons) | 0 / 0 | n/a | n/a |
+
+**Against the targets:** Gatling p99 8.0 s answered-only and 7.4 s for all requests, so **p99 < 500 ms not met**.
+5,000 were offered over 10 s and 3,082 refused, so **5,000 concurrent not reached**. Zero oversell held (one run).
+This run carried a sampler and a mid-ramp thread dump (5.7 s to take), so it is not a clean repeat of the R2 re-run.
+The two runs differ in refusals (3,082 against 3,978) and in Redis timeouts (758 against 28). Not explained.
+
+### Did the queue fill?
+
+**What the counters show (taken 18:38:42.6 and 18:40:24.4):**
+
+| Windows counter | Before | After | Change |
+|---|---|---|---|
+| TCPv6 Connection Failures | 33,673 | 36,755 | **+3,082** |
+| TCPv4 Connection Failures | 70,731 | 74,243 | +3,512 |
+| TCPv4 / TCPv6 Connections Reset | 21,925 / 9,558 | 21,929 / 9,579 | +4 / +21 |
+| TCPv4 / TCPv6 Connections Passive | 73,923 / 66,688 | 76,758 / 67,138 | +2,835 / +450 |
+
+- **The IPv6 failures rose by exactly the refused count (3,082).** IPv4 rose by 3,512 over the same 100 s, which
+  also covers every other service's traffic. One reading fits both: each refused buyer was refused once on `::1`
+  and once on `127.0.0.1` (Gatling tries both addresses of `localhost`; run 1's timeouts name both). That reading
+  is **not proven**.
+- Resets hardly moved. So the refusals are failed connection attempts on a port that was listening, because
+  2,118 buyers in the same seconds did get through.
+- On this machine, the earlier slow-accept probe produced exactly this signature: same error, failures rising one
+  for one with refusals. That probe's cause was a full accept queue.
+
+**What the sampler showed:**
+
+| Sample (clock) | netstat took | Server-side ESTABLISHED / SYN_RECEIVED / CLOSE_WAIT on :8080 | Client-side TIME_WAIT |
+|---|---|---|---|
+| 18:39:04.3 (before the burst) | 0.6 s | 1 / 0 / 0 | 200 |
+| 18:39:04.8 | **6.9 s** | **485** / 0 / 10 | 562 |
+| 18:39:11.8 | **4.3 s** | **788** / 0 / 45 | 993 |
+| 18:39:16.1 | 1.7 s | 214 / 0 / 30 | 1,847 |
+| 18:39:17.8 (after) | 0.5 s | 1 / 0 / 0 | 2,089 |
+
+**What the sampler could not see:**
+- **Too few samples.** During the measured ramp a single `netstat` took 4 to 7 s, so the 13 s of the ramp have
+  only 3 samples, each smeared over seconds instead of a snapshot at one moment.
+- **Queued and accepted look the same.** `netstat` shows a connection waiting in the accept queue and a connection
+  the Gateway has already accepted both as ESTABLISHED. So 485 and 788 are queued plus in-flight connections, and
+  the queued share (the "about 200") **cannot be read off**.
+- **No SYN_RECEIVED pile-up.** It stayed 0, as in the probe, so on this Windows that state is not the sign.
+- No accepted-connection count from the Gateway (Reactor Netty metrics are not exported).
+
+**Verdict:** refusals on a live listener, with failures rising exactly with refusals and no resets, match the
+full-accept-queue signature reproduced earlier on this laptop. **The queue itself (about 200 waiting, not yet
+accepted) was not directly seen.** Other causes of a refused connection on a listening Windows port are not ruled
+out.
+
+### What the Gateway's event-loop threads were doing
+
+The Gateway has 8 `reactor-http-nio` threads and no separate accept thread (the library default, read earlier).
+Five dumps exist, all from the same Gateway JVM.
+
+| Dump (time the JVM printed it) | Busy event loops: what the frames show | Idle in `select` |
+|---|---|---|
+| Run 2, 18:39:04, at the ramp's start (took 0.45 s) | none | 8 |
+| Run 2, 18:39:14, mid-ramp (took 5.7 s) | `nio-1`: in `sun.nio.ch.Net.accept`, owns the server socket's accept lock, **accepting**. `nio-2`: **owns** the `ReentrantLock` of `DefaultRedisScript.getSha1` and is inside `ResourceScriptSource.retrieveLastModifiedTime` → `AbstractFileResolvingResource.lastModified` → `customizeConnection`. `nio-5`, `nio-6`: **parked on that same lock** (`getSha1`, line 86) | 4 |
+| Run 1, 18:29:43, end of the ramp (took 6.4 s) | `nio-2`, `nio-3`, `nio-5`, `nio-6`: **parked on the `getSha1` lock**. `nio-7`: inside `getSha1` (line 89), `ResourceScriptSource.isModified` → `ResourceUtils.getFile` building a `FileNotFoundException`. `nio-1`: `AuthFilter.filter` → `JwtVerifier.verify` → jjwt HMAC-SHA256 (`Mac.init`). `nio-4`: reading a downstream response (`HttpClientOperations`) | 1 |
+| Run 1, 18:29:49 | 5 in socket read/write (`SocketDispatcher`), `nio-6` parked on the `getSha1` lock | 2 |
+| Run 1, 18:29:54 | none | 8 |
+
+**What the code does,** read from the jars:
+- **The lock (spring-data-redis 4.1.1).** `DefaultRedisScript.getSha1()` takes one shared lock (line 86) on
+  **every** call. Inside it, it asks `scriptSource.isModified()` (line 89), then unlocks.
+- **The script (Spring Cloud Gateway 5.0.3).** It builds the rate limiter's script as
+  `new ResourceScriptSource(new ClassPathResource("META-INF/scripts/request_rate_limiter.lua"))`. That file sits
+  inside a nested jar.
+- **The cost.** Every rate-limited `POST /api/orders` therefore checks the script file's last-modified time while
+  holding the shared lock. In the dumps that check goes through `ResourceUtils.getFile`, which throws
+  `FileNotFoundException`, and through a URL connection into the jar.
+
+**What the dumps show:**
+- **The acceptor is `nio-1`,** the only thread ever seen in `Net.accept`.
+- **`nio-1` also handles requests.** In run 1's dump it was verifying a JWT. That is the shared-loop design.
+- **Event loops lose time to the rate limiter's script lock.** Up to 5 of 8 at once were held there: 4 parked and
+  1 inside.
+
+**What they do not show:**
+- The acceptor (`nio-1`) parked on that lock. In the five snapshots it never was.
+- That accepts were delayed at the moments buyers were refused. Five snapshots cannot show timing.
+- Whether the 758 Redis timeouts come from the same stall. Lettuce times the command after it is sent; not traced.
+
+**Gateway CPU:** 11.0 s of CPU from 18:39:04.3 to 18:39:17.8 (13.5 s), about 0.8 of one core out of 8. The
+laptop as a whole was saturated (one `netstat` took 7 s). The Gateway was not.
+
+### Still unproven
+
+- That the accept queue held about 200 waiting connections at the moments of refusal.
+- That the acceptor thread was the slow part, rather than the operating system on a saturated laptop. The Gateway
+  used under one core while the machine was saturated.
+- Why run 2 had 758 Redis timeouts and the R2 re-run 28.
+
+**Likely fix (not applied):** a separate accept thread (`reactor.netty.ioSelectCount=1`) plus a rate-limiter script
+that does no per-call lock and file check. It would stop request work from delaying accepts, so buyers now refused
+would wait or be answered instead (slower). Unmeasured.
