@@ -49,8 +49,10 @@ flowchart LR
     PAY -- "signed webhook" --> ORD
     ORD -- "outbox -> Kafka<br/>PaymentConfirmed / OrderCancelled" --> K[(Kafka)]
     K --> INV
-    K --> NOT[Notification :8084]
+    K -.->|"consumers NOT BUILT"| NOT[Notification :8084]
 ```
+
+This is the short version. The full architecture (databases, Eureka, config server, Redis, Prometheus, and what is never routed through the Gateway) is in [`docs/diagrams.md`](docs/diagrams.md#a-architecture), with the order state machine ([b](docs/diagrams.md#b-order-state-machine)) and the purchase flow with its failure branches ([c](docs/diagrams.md#c-purchase-flow)). Anything designed but not built is marked on the diagrams.
 
 | Service | Owns | Why it is separate |
 |---|---|---|
@@ -72,6 +74,8 @@ flowchart LR
 7. If anything fails, Order moves to a terminal failure state and writes `OrderCancelled{reason}`. Inventory releases the stock **asynchronously**, and nothing waits on the release.
 
 ### Order state machine
+
+Diagram: [`docs/diagrams.md`, (b)](docs/diagrams.md#b-order-state-machine). Flow diagrams: [(c)](docs/diagrams.md#c-purchase-flow).
 
 Two transient states (`CREATED`, `PENDING_PAYMENT`) lead to five terminal states: `PAID`, `PAYMENT_FAILED`, `ORDER_EXPIRED`, `PAYMENT_UNAVAILABLE`, `RESERVATION_FAILED`.
 
@@ -117,6 +121,7 @@ FlashMart/
 │   ├── decisions.md        # decision log
 │   ├── requirements.md     # FR-* / NFR-* / RZP-* requirement IDs
 │   ├── development.md      # local setup details and load-test commands
+│   ├── diagrams.md         # architecture, state machine, purchase flow (Mermaid)
 │   └── testing.md          # evidence: every manual run, with numbers
 └── CLAUDE.md               # working agreement for the AI coding agent
 ```
@@ -324,4 +329,5 @@ Stated once, with the numbers. Everything is one run each on one laptop with a s
 - [`docs/decisions.md`](docs/decisions.md): every architectural decision with context, options and trade-offs
 - [`docs/requirements.md`](docs/requirements.md): functional and non-functional requirements
 - [`docs/development.md`](docs/development.md): local setup details, pitfalls and the load-test steps
+- [`docs/diagrams.md`](docs/diagrams.md): architecture, order state machine and purchase flow (Mermaid)
 - [`docs/testing.md`](docs/testing.md): the evidence, every manual and load run with its numbers
