@@ -102,7 +102,7 @@ Identity, Inventory and Order serve their own docs on their own port. **Not rout
 
 - `/internal/**` and `/webhooks/payment` are `@Hidden`, so they are not listed.
 - Order's `POST /api/orders` needs a Gateway-signed `X-Buyer-Id` (with `X-Auth-Timestamp` and `X-Auth-Signature`). "Try it out" on Order returns `401` unless you send validly signed headers; the check was not relaxed for the docs. Identity's routes are public.
-- Library: springdoc `3.1.1` (built on Boot 4.1.0; our poms use 4.1.1). Added and unit/integration suites run; the Swagger pages themselves have **not** been opened on running services yet.
+- Library: springdoc `3.1.1` (built on Boot 4.1.0; our poms use 4.1.1). Checked once on one laptop (2026-11-09): each service's `/swagger-ui/index.html` returned 200 and `/v3/api-docs` listed only the public paths. The services need `JWT_SECRET` and `GATEWAY_SIGNING_SECRET` set to start. The Gateway's own `:8080` was not running, so that it does not serve these pages is by config (no route), not by test.
 
 ## Running the tests
 
