@@ -1433,3 +1433,130 @@ test buyers stay in Identity on purpose (re-runs skip them).
 **Full suite on `feat/load-test-setup`, same day, stack stopped, seed fresh:** identity 119, inventory 115, order 310,
 notification 29, payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **650, 0 failures, 0 errors**
 (no service code changed in this piece; the load-tests module has no unit tests).
+
+## Day 9 Part D: order load runs through the Gateway (2026-11-09)
+
+**Label: run once each, one laptop (load tool, all services, Postgres, Docker on the same machine), stub gateway
+(payment-stub, auto webhook SUCCESS, AFTER_REPLY), one Kafka broker, one partition per topic. Real processes from
+`main`'s jars, started once in the documented order and NOT restarted between runs: R1 hit a freshly started JVM, R2
+and R3 hit JVMs that had already served the earlier runs. Config values unchanged (provisional; tuning is Part F).
+Every service logged `CONFIG SOURCE: config server` at start-up (api-gateway, identity, inventory, order). Gatling
+3.16.0, `PlaceOrders`. Targets (zero oversell, p99 < 500 ms) are targets; the table says what was measured.**
+
+| Run | Buyers | Ramp | `place-order` statuses | p99 Gatling, OK only (ms) | p99 Grafana, `POST /api/orders` server side, max over the run | Oversell check | Gap (Version B) |
+|---|---|---|---|---|---|---|---|
+| R1 | 1,000 | 10 s | 201 × 500, 409 × 500 | 4,761 (no KO) | 5.69 s | none (`verify.sh` and `check-orders.sh` OK on item 1) | 0 |
+| R2 | 5,000 | 10 s | 201 × 500, 409 × 1,555, 503 × 46, **no response × 2,899** | 12,374 | 12.66 s | none | 0 |
+| R3 | 5,000 | at once | 201 × 500, 409 × 872, **no response × 3,628** | 6,539 | 2.76 s | none | 0 |
+
+**p99 < 500 ms: not met in any run.** Zero oversell held in all three: item 1 ended at `available_stock` 0 with
+exactly 500 held units and 500 PAID-or-pending order units, item 2 at 0 with 50 / 50; no buyer had two live-or-paid
+orders; nothing was stuck `CREATED`.
+
+### Per run, the rest of the numbers
+
+| | R1 | R2 | R3 |
+|---|---|---|---|
+| Token step (5,200 logins, concurrency 8) | 88.1 s | 91.3 s | 82.1 s |
+| Token budget left at Gatling start / end | 800 / 781 s | 799 / 779 s | 809 / 795 s |
+| Gatling wall time (incl. Maven start-up and warm-up) | 32 s | 31 s | 24 s |
+| `place-order` total / OK / KO | 1,000 / 1,000 / 0 | 5,000 / 2,101 / 2,899 | 5,000 / 1,372 / 3,628 |
+| `place-order` mean req/s (total) | 58.8 | 263.2 | 384.6 |
+| `place-order` OK p50 / p95 / p99 / max (ms) | 723 / 3,320 / 4,761 / 6,220 | 3,487 / 9,989 / 12,374 / 13,510 | 4,670 / 6,260 / 6,539 / 6,950 |
+| `place-order` KO (refused) p50 / p99 / max (ms) | n/a | 5 / 862 / 1,736 | 2,833 / 5,485 / 5,600 |
+| Warm-up statuses | 201 × 42, 409 × 143, **503 × 15** | 201 × 50, 409 × 150 | 201 × 50, 409 × 150 |
+| Warm-up p99 (ms) | 4,287 | 74 | 75 |
+| Orders in Order after the run | 542 PAID, 650 RESERVATION_FAILED, 8 PAYMENT_UNAVAILABLE | 537 PAID + 13 PENDING_PAYMENT (all 550 reservations CONFIRMED after the drain), 1,705 RESERVATION_FAILED | 550 PAID, 1,022 RESERVATION_FAILED |
+| Reservations after drain | item 1: 500 CONFIRMED; item 2: 42 CONFIRMED, 8 RELEASED | 500 / 50 CONFIRMED | 500 / 50 CONFIRMED |
+| Compensation drained (outbox unpublished 0, `inventory-service` lag 0), wall time from the end of the checks | 35 s | 50 s | 35 s |
+| Grafana: order rate max / reserve rate max (req/s) | 32.5 / 45.7 | 90.2 / 90.2 | 62.9 / 62.9 |
+| Grafana: reserve p99 (Inventory, server side), max | 0.20 s | 0.11 s | 0.05 s |
+| Grafana: breaker | `closed` throughout | `closed` throughout | `closed` throughout |
+| Grafana: gateway 429 | no values | no values | no values |
+| Grafana: Hikari active max, Order / Inventory / Identity | **10 (the whole pool)** / 6 / 1 | **10** / 4 / not read | **10** / 2 / not read |
+| Grafana: Hikari **pending** max, Order / Inventory | **104** / 0 | **191** / 0 | **156** / 0 |
+| Grafana: JVM heap max, gateway / order / inventory (MB) | 97 / 118 / 120 | 157 / 127 / 120 | 161 / 138 / 124 |
+| Gateway log: `Error calling rate limiter lua` (`Redis command timed out`; fails open) | 55 | 918 | 14 |
+
+### What it shows (and what is inference)
+
+- **No oversell and no gap in any run.** The atomic conditional `UPDATE` and the one-live-order index held through
+  the Gateway → Order → Inventory path. **The Version B gap count was 0 in all three runs.** That is three runs on
+  one laptop where the reserve p99 never exceeded 0.2 s, far below Order's 2 s reserve timeout. It says nothing about
+  a run where Inventory is slow enough to time out.
+- **Order's connection pool was full in every run.** Its Hikari pool sat at 10 of 10 active with 104 to 191 threads
+  waiting, while Inventory never had a waiter and its reserve p99 stayed at or under 0.2 s. So most of Order's
+  server-side p99 (2.8 to 12.7 s) is time spent inside Order, and the full pool fits that. It is the strongest
+  candidate for the bottleneck, but **not proven** (no profile, no pool-size experiment). Pool size is an open
+  decision (Part F); nothing was tuned.
+- **Most of R2 and R3 never reached FlashMart.** 2,899 (R2) and 3,628 (R3) requests failed with
+  `java.net.ConnectException: Connection refused` at the Gateway's port. The Gateway kept running and answering. The
+  likely cause is the listen backlog filling up on Windows, which refuses a connection when the backlog is full, while
+  Gatling opens one new connection per virtual user. **Not proven**: no socket-level capture was taken. So these runs
+  measure "how many of 5,000 got in" as much as latency, and the OK-only p99 is for the requests that got in.
+- **The 46 R2 503s came from the Gateway, not from Order.** No Order row exists for them (Order holds exactly
+  500 + 1,555 + 200 orders), and the Gateway's error handler turns a `ConnectException` to a backend, or "no instance",
+  into `503 SERVICE_UNAVAILABLE` without logging. Most likely Order's port refused the Gateway's connection at peak.
+  An inference, not traced.
+- **R1 warm-up, 15 × 503, cold start.** All 15 happened in the first 0.4 s of traffic after Order started
+  (00:19:32.59 to 00:19:33.00), with failure details `Could not write request: no suitable HttpMessageConverter found
+  for request type [...ReserveRequest]` (7, `RESERVATION_FAILED`) and `[...InitiatePaymentRequest]` (8,
+  `PAYMENT_UNAVAILABLE`). It happened in both Feign clients, only on the first concurrent burst, and not in R2 or R3
+  (same JVM). The likely cause is a race in the Feign encoder's lazy set-up. **Not traced in the library; not fixed.**
+  The 7 reserve calls were never written, so nothing was reserved for them. The 8 payment ones had already reserved
+  stock, and the `OrderCancelled` consumer released it (the 8 RELEASED rows). The warm-up absorbed it, which is what a
+  warm-up is for, but a real first burst after a deploy would see it.
+- **The rate limiter failed open under load.** Redis commands timed out (500 ms) 918 times in R2. By design that
+  lets the request through. No 429 was expected (one order per buyer) and none was seen. It is not known whether
+  the Redis container, the Gateway's event loop or the laptop's CPU caused the timeouts.
+- **Why the warm-up gives 201 × 50 / 409 × 150 when it does not fail:** item 2 is seeded with 50 units
+  (`scripts/seed/inventory.sql`), and the warm-up sends 200 buyers for 1 unit each. The 409 body is
+  `{"code":"RESERVATION_FAILED","message":"an item could not be reserved; the order was cancelled","orderId":...,
+  "status":"RESERVATION_FAILED","reason":"OUT_OF_STOCK"}` (captured by hand after R1), and every warm-up 409 in R1 to R3
+  has `failure_detail = product 2: OUT_OF_STOCK`.
+
+### Changes to the tools during this piece
+
+- `verify.sh` failed on correct data in R1 (item 2: 8 `RELEASED` rows whose stock was back, so `50 - 50 != 8`). Its
+  arithmetic now subtracts only `RESERVED + CONFIRMED`; the two oversell checks are unchanged, and with no `RELEASED`
+  rows the result is the same as before. Checked by breaking item 2's stock by one unit (FAIL, exit 1), then resetting.
+  R1's item 2 numbers recorded at the time fit the new rule (50 - 42 = 8).
+- `reset-run.sh` refuses any non-local host and any database that is not the local `order-service`; tested with two
+  non-local hosts. `count-gap.sh` was tested on synthetic rows: a `RESERVED` row for a `RESERVATION_FAILED` order
+  counted as gap 1 (exit 1); one for a missing order was shown as `MISSING` and not counted.
+
+### Not covered
+
+A second run of anything (each run once; no retries), a restart between runs, a run on separate machines, a run where
+Inventory times out (so Version B never had a chance to show), more than one instance, more than one partition, the
+token budget for a slower run (each run took about 30 s of the 13.5 min left), Identity's Hikari in R2 and R3 (not
+read), what exactly refused the connections.
+
+### Commands
+
+The stack was started once (same order and secrets handling as the Day 8 script above; jars from `main`). Each run
+used a throwaway driver kept in a scratch folder: `bash run.sh R1 1000 10`, `bash run.sh R2 5000 10`,
+`bash run.sh R3 5000 0`. Its steps are below. The Grafana step ran every dashboard panel's own query through
+`/api/ds/query`, as in the Part B smoke. Each run's output is in `load-tests/target/runs/<run>/` (git-ignored), and the
+Gatling report is under `load-tests/target/gatling/`.
+
+```bash
+NAME=$1 BUYERS=$2 RAMP=$3
+cd "C:/Coding Shuttle/FlashMart"; set -a; . ./.env; set +a
+bash load-tests/reset-run.sh
+curl -s -X POST http://127.0.0.1:8085/admin/auto-webhook -H 'Content-Type: application/json' -d '{"status":"SUCCESS"}'
+bash load-tests/make-tokens.sh
+(cd load-tests && ../order-service/mvnw -q gatling:test -Dgatling.simulationClass=com.flashmart.load.PlaceOrders \
+   -Dbuyers="$BUYERS" -DrampSeconds="$RAMP")
+bash load-tests/verify.sh; ITEM_ID=2 bash load-tests/verify.sh
+bash load-tests/check-orders.sh; PRODUCT_ID=2 ITEM_ID=2 bash load-tests/check-orders.sh
+# drain: poll every 5 s until both are 0
+#   order-service: select count(*) from outbox where published_at is null
+#   MSYS_NO_PATHCONV=1 docker exec flashmart-kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
+#     --bootstrap-server localhost:9092 --describe --group inventory-service   (sum of the LAG column)
+bash load-tests/count-gap.sh
+```
+
+**Full suite on `feat/load-runs` after the runs, stack stopped, seed fresh:** identity 119, inventory 115, order 310,
+notification 29, payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **650, 0 failures, 0 errors**
+(no service code changed).
