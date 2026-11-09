@@ -2127,7 +2127,7 @@ offered over 10 s, 3,978 got no response: **not reached**. Zero oversell: held i
 ### Unexplained (no causes claimed)
 
 - **Refused connections.** 3,978 of 5,000 (79.6 %) got `Connection refused`, more than Part D R2 (2,899). Why the
-  port refuses was not investigated here.
+  port refuses was not investigated here (partly diagnosed later: "Day 9: why buyers are refused at `:8080`" below).
 - **Buyer-side p99 against server-side p99.** Answered-only p99 6.0 s while Order's server-side p99 was 0.90 s and
   Order's pool never waited. The gap is time before Order (or outside it); not traced.
 - **Redis timeouts.** 28 EVALSHA calls timed out at 500 ms, all within one second near the end of the run (17:07:55).
@@ -2141,3 +2141,97 @@ offered over 10 s, 3,978 got no response: **not reached**. Zero oversell: held i
 One run. The Part D comparison is against runs on other JVM states and other builds. Nothing was tuned, so the
 numbers say nothing about what a different pool or timeout would do. Not a real payment gateway. Not a 5,000-concurrent
 run. Not repeated, so no variance is known.
+
+## Day 9: why buyers are refused at `:8080` (diagnosis only, 2026-11-09)
+
+**Question.** In the R2 re-run, 3,978 of 5,000 buyers got `Connection refused` at the Gateway's port. Order's own p99
+was 0.90 s and its pool never waited, so the refusals happen before Order. Hypothesis going in (unproven): the
+Gateway's listen backlog (the queue of connections that finished the TCP handshake but that the server has not picked
+up yet) overflows because the Gateway is busy, and Windows refuses new connections when that queue is full.
+
+**What was run.** Three short runs plus one mechanism probe, **one run each, one laptop** (8 logical CPUs; Gatling,
+servers, Postgres and Docker on the same machine). No FlashMart code or setting was changed and the full R2 was
+**not** re-run. Every run used the unchanged `PlaceOrders` scenario: 200 warm-up buyers over 5 s, then 5,000 buyers
+over 10 s (`rampSeconds=10`, about 500 new connections per second), one connection and one `POST /api/orders` per
+buyer. Only `-DbaseUrl` and `-DtokensDir` changed. The token dir was a copy of the R2 re-run's (now expired) tokens
+with a future `expires-at.txt`, so `before()` passes. All jars were rebuilt first (`mvnw -DskipTests package` in every
+module, BUILD SUCCESS; no source or pom change since the warm-up commit `4b21813`). Throwaway tools (control server,
+sampler, run script) live outside the repo and are not committed.
+
+**What was recorded.** Gatling's statuses and error text. `netstat -s -p tcp` and `-p tcpv6` before and after each
+run (the 5,000 connections showed up in the IPv4 counters: `Passive Opens` +5,219 in the control). About every 250 ms
+during each run: connections on the server port by state (`netstat -an`), plus the server process's CPU time.
+Limits of the sampler: it ran inside Claude Code's sandbox, whose `netstat` view **hides listening sockets** but
+does show connections on the port (the probe below saw 200). One sample took 30 to 480 ms in the control and up to
+1,390 ms in the Gateway run, so a connection that lives 1 ms is usually missed. That does not matter for spotting a
+full queue, which lasts much longer. Reactor Netty server metrics are **not exported** by the Gateway (no
+`reactor_netty_*` lines in `/actuator/prometheus`), so there is no count of accepted connections.
+
+### Step 1: the exact error and how Gatling counts it
+
+From the R2 re-run's Gatling log (`load-tests/target/runs/R2rerun-run/gatling.log`, git-ignored):
+`j.n.ConnectException: Connection refused: getsockopt`, 3,978 times, 100 % of errors. No timeouts and no resets.
+Gatling counts each one as a **KO request with no HTTP status**: `PlaceOrders` records it as `none`
+(`{201=500, 409=522, none=3978}`), and its response time is the time until the connect failed. Those KO times were
+short (min 1 ms, p50 96 ms, max 5,148 ms), so the server's side said "no" at once rather than letting the connection
+time out.
+
+### Steps 2 to 4: results per run
+
+| | Control (no FlashMart) | Gateway only (401 path) | Probe: slow accept |
+|---|---|---|---|
+| Server | JDK `HttpServer` on :9099, backlog **200** (set to match Netty's default, below), answers 200 at once | the running Gateway on :8080 (warm JVM from the R2 re-run stack, started 17:03; rest of the stack up and idle) | plain `ServerSocket` on :9098, backlog **200**, accepts at most one connection per 10 ms (about 100/s), then answers 200 |
+| Path | any request -> 200 | `POST /api/orders` with an expired JWT -> `AuthFilter` answers 401 before the rate limiter, Redis or Order | any request -> 200 |
+| `place-order` statuses | 200 x 5,000 | 401 x 5,000 | 200 x 998, **no response x 4,002** |
+| Warm-up statuses | 200 x 200 | 401 x 200 | 200 x 200 |
+| **Refused** | **0** | **0** | **4,002** (`j.n.ConnectException: Connection refused: getsockopt`, the same text as R2) |
+| Gatling p50 / p99 / max, all requests (ms) | 1 / 3 / 18 | 2 / 8 / 43 | 2 / 3,078 / 3,439 (refused p99 57, max 179) |
+| `Failed Connection Attempts` (IPv4) before -> after | 63,309 -> 63,311 (+2) | 63,314 -> 63,317 (+3) | 63,321 -> 67,332 (**+4,011**) |
+| Listener side, highest count seen: `ESTABLISHED` / `SYN_RECEIVED` | 2 / 0 | 2 / 1 | **200** / 0 (above 150 in 31 samples) |
+| Server CPU | not useful (tiny) | busiest 5 s: 5.2 s of CPU (about 1 of 8 CPUs); the 5 s on each side 3.4 s and 2.4 s | not recorded (sampled the launcher process) |
+| Order touched? | n/a | no: Order's non-actuator request count 1,875 before and after | n/a |
+
+A first control run before the sampler worked (its process id lookup failed) also gave 200 x 5,000 with 0 refused.
+
+### Step 5: the Gateway's effective backlog
+
+**200**, read from the libraries the Gateway runs (Netty 4.2.17.Final, Reactor Netty 1.3.7, extracted from the
+Gateway's jar):
+- `io.netty.util.NetUtil.SOMAXCONN`: in its bytecode the Windows branch is a fixed `200` (`128` on other systems
+  unless `/proc/sys/net/core/somaxconn` or sysctl says otherwise). Printed on this machine: `NetUtil.SOMAXCONN=200`.
+- A fresh `NioServerSocketChannel` reports `SO_BACKLOG=200` (option read at runtime on this machine). On Windows the
+  Gateway uses NIO, because the native epoll transport in the jar is Linux-only.
+- Nothing overrides it: there is no `SO_BACKLOG` anywhere in `reactor-netty-core` or `spring-boot-reactor-netty`,
+  and the Gateway's code and config set no Netty server option.
+- What Windows does with a requested 200 (any further cap) was **not** checked. The probe shows the queue held about
+  200 here.
+
+One more library fact, relevant to "busy": Reactor Netty's `reactor.netty.ioSelectCount` defaults to `-1`, which
+means **no separate accept thread**. The server socket is served by the same worker event loops that handle requests
+(`ioWorkerCount` = max(CPUs, 4) = 8 here). So if those loops are busy, accepting new connections waits too. This is
+read from bytecode. Whether it happened in R2 was **not measured**.
+
+### What the evidence says
+
+- **Ruled out: the laptop, Windows or Gatling cannot open about 500 connections per second.** The control run, with
+  the same ramp on the same machine and the same backlog of 200, refused 0.
+- **Ruled out: a backlog of 200 is too small for this rate by itself.** The Gateway refused 0 when its work per
+  request was tiny (a 401 from `AuthFilter`, about one CPU busy).
+- **Ruled out: timeouts or resets.** The error is `ConnectException: Connection refused` and it comes back fast.
+- **Supported (the mechanism, on this machine):** when a server accepts more slowly than connections arrive, this
+  Windows refuses the extra connections with **exactly R2's error text**. Each refusal adds one to `Failed Connection
+  Attempts` (+4,011 for 4,002 refused). The full queue shows on the server's port as about **200 `ESTABLISHED`**
+  connections, **not** as `SYN_RECEIVED` (it stayed at 0). So on this Windows the sign of backlog pressure is
+  "ESTABLISHED stuck near 200, plus Failed Connection Attempts rising", not "many SYN_RECEIVED".
+- **Still unproven:** that the Gateway's accept queue was full during R2, and why its accept would be slow then.
+  R2 was not run with this sampler, so there is no queue reading and no counter delta from it. The likely suspect is
+  the event loops shared between accepting and request work, under the full stack's load on one laptop. That is a
+  hypothesis, not a finding. The test that decides it is one R2-shaped run with the same sampler on `:8080` and
+  `netstat -s` around it: a queue near 200 and `Failed Connection Attempts` rising by about the refused count would
+  confirm it.
+
+**Likely fix:** first confirm with a sampled R2. Then give the Gateway a separate accept thread
+(`reactor.netty.ioSelectCount=1`) and/or a larger `SO_BACKLOG` through a `NettyServerCustomizer`, and find what keeps
+its event loops busy.
+**What it would change:** buyers who are now refused would wait in the queue or be accepted, so they turn into
+(slower) answered requests. It would not make Order or Inventory faster, so the answered p99 may rise. Not measured.
