@@ -113,6 +113,18 @@ mvn test
 
 Default ports: Gateway 8080, Identity 8081, Inventory 8082, Order 8083, Notification 8084, payment stub 8085.
 
+## Load test results (measured, not targets)
+
+One run each, one laptop (load tool, all services, Postgres and Docker on the same machine), stub payment gateway, one Kafka broker. Details and commands: [`docs/testing.md`](docs/testing.md). The targets are zero oversell under 5,000 concurrent requests and p99 under 500 ms; they are **not** met on this setup.
+
+| Run (5,000 buyers over 10 s, 500 units) | Sold | Oversell | Gatling p99, answered only | Order p99, server side | Refused at the port |
+|---|---|---|---|---|---|
+| Part D R2 (warmed JVMs) | 500 | none | 12,374 ms | 12.66 s | 2,899 |
+| R2F (fresh JVMs, before the cold-start fixes) | 0 | none | 20,301 ms | 7.94 s | 3,261 |
+| R2 re-run (final build, fresh JVMs plus a 51-order gate) | 500 | none | 6,022 ms | 0.90 s | 3,978 |
+
+Why buyers are refused at the port, and why the buyer-side p99 is far above the server-side one, is not explained.
+
 ## Known limitations
 
 - **The payment gateway is a stub.** The real Razorpay Clone is a separate project. Its required behaviours (idempotent initiate and refund, status lookup, signed webhooks) are specified here but not verified against it.
@@ -125,6 +137,7 @@ Default ports: Gateway 8080, Identity 8081, Inventory 8082, Order 8083, Notifica
 - **An early webhook** (arriving while the order is still `CREATED`) is answered non-2xx so the gateway retries. This depends on the gateway retrying long enough.
 - **Rate limiting fails open if Redis is down**, and the browse endpoint is not rate limited.
 - **Metrics and `/actuator/env` are exposed on each service's own port with no authentication** (never routed through the Gateway, but anyone who can reach a service port can read them). Secrets show as `******`; this is for local use only.
+- **Throughput is not where the targets are.** In the latest 5,000-buyer run, 3,978 buyers were refused at the Gateway's port and the p99 was 6.0 s (target 500 ms); one run, one laptop, cause not investigated.
 - **A buyer cannot start a new order** while an unpaid one is open, until it pays or expires.
 
 ## Documentation
