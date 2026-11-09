@@ -22,3 +22,8 @@ spring:
 # localhost:8083 about other tests' rows. The reconciler tests call runOnce().
 reconciler:
   enabled: false
+
+# No warm-up in tests: it would run the reserve path at every context start. The
+# warm-up tests turn it back on with their own properties.
+startup-warmup:
+  enabled: false

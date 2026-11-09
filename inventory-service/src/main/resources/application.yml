@@ -92,6 +92,18 @@ reconciler:
     order-sweep-interval-ms: 30000
     kafka-drain-margin-ms: 120000
 
+# Cold-start warm-up (decisions.md, "Day 9: cold-start warm-up"). Runs the real
+# reserve path in rolled-back transactions BEFORE the port opens. calls and
+# timeout-ms are PROVISIONAL policy (not derived): 20 is what the diagnosis
+# tried (2 runs), and its whole warm-up took about 1.1 s on one laptop; the
+# timeout only bounds a hung database. Mirrored in the config repo (the enabled
+# flag is not: it is a switch, not a tunable number). A failure or timeout logs
+# WARN and start-up goes on.
+startup-warmup:
+  enabled: true
+  calls: 20
+  timeout-ms: 10000
+
 # Registration with the Eureka server (decisions.md, "Day 8", addendum
 # "Gateway and discovery"). Only the API Gateway looks services up; this
 # service only registers. DEFAULT timings on purpose (heartbeat 30 s, lease
