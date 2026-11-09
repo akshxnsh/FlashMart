@@ -6083,3 +6083,86 @@ warm-up took 202 to 268 ms, against 826 to 1,182 ms without it and 16 to 34 ms f
 - The pool still saturated during the burst (Hikari active 9 to 10, up to 183 waiting), which is expected for 200
   concurrent calls on 10 connections; the Hikari readings are coarse (the scrape queues behind the burst).
 - Behaviour with more than one Inventory instance, or against a production-size table.
+
+---
+
+## Decision: Day 9: the Gateway's own rate-limiter script (lock-free)
+
+**Status: implemented and tested. Measured in isolation (one bench, inside the real boot jar) and in ONE R2-shaped run
+on one laptop, stub gateway (`testing.md`, "Day 9: the Gateway's own rate-limiter script"). The lock is gone; whether
+it caused the refused connections is NOT proven.**
+
+### Context
+
+The R2 load runs refused 2,899 to 3,978 of 5,000 buyers at the Gateway's port before Order. Five Gateway thread dumps
+over two runs (`testing.md`, "Day 9: the decisive R2 run") showed up to 5 of the 8 event-loop threads held by one
+`ReentrantLock` in `DefaultRedisScript.getSha1` (spring-data-redis 4.1.1): 4 parked and 1 inside it. On every call
+that method takes the lock and asks the script source whether the file changed. Spring Cloud Gateway 5.0.3 builds the
+script as `ResourceScriptSource(ClassPathResource("META-INF/scripts/request_rate_limiter.lua"))`, a file inside a
+nested jar, so the check throws a `FileNotFoundException` or opens a jar URL. The thread that accepts connections
+(`reactor-http-nio-1`) is one of the same 8 threads (Reactor Netty's default: no separate accept thread). Refusals
+matched Windows' Failed Connection Attempts exactly, but the accept queue itself was never seen.
+
+### Options considered
+
+1. **Our own script object that does nothing per call (chosen).** It implements `RedisScript` directly. The Lua text
+   is read once at start-up and the SHA1 is computed once, so there is no lock and no file or URL check.
+2. **`DefaultRedisScript` with a static script source.** Rejected: `getSha1()` still takes the lock on every call.
+3. **A separate accept thread (`reactor.netty.ioSelectCount=1`).** Not in this piece. It changes where accepts run,
+   not the stall itself, and it is a separate decision. Kept as the next option if refusals stay high.
+4. **A larger listen backlog.** Rejected for now. Buyers would wait longer in a queue instead of being refused; it
+   does not remove the stall.
+5. **A library upgrade.** Not taken: no Spring Data Redis or Spring Cloud Gateway version without this lock is known
+   here (not checked in detail).
+6. **Read upstream's own script file once at start-up instead of carrying a copy.** It would remove the drift risk.
+   It was not chosen (the copy was settled before this piece), and it may be worth reconsidering.
+
+### How it is wired (found while building, not as first planned)
+
+The plan was "our script bean makes the library's back off". **It cannot.** In Spring Cloud Gateway 5.0.3,
+`GatewayRedisAutoConfiguration.redisRequestRateLimiterScript()` is a plain `@Bean` with no `@ConditionalOnMissingBean`
+(read from the bytecode). Bean overriding is off in Boot, so declaring a bean under the same name fails start-up.
+Under any other name it would be ignored, because the library's limiter asks for the script by
+`@Qualifier("redisRequestRateLimiterScript")`.
+
+The library's **limiter** bean, `redisRateLimiter(...)`, is `@ConditionalOnMissingBean`. So we declare our own
+`redisRateLimiter`: `new RedisRateLimiter(reactiveStringRedisTemplate, ourScript, configurationService)`. That is the
+same class and the same constructor the library uses, which keeps rates, burst, keys, headers and fail-open
+unchanged. That 3-argument constructor marks the limiter initialized, so its `setApplicationContext` never looks the
+library's script up by name and swaps ours out (also read from the bytecode). The library's script bean is still
+created, but nothing calls it. Akshansh chose this over a bean-definition post-processor and over enabling bean
+overriding (a global property that would hide every accidental clash).
+
+### Trade-offs and consequences
+
+- **We carry a copy of upstream's `request_rate_limiter.lua`.** `RateLimiterScriptTest` compares it byte for byte with
+  the one inside the Spring Cloud Gateway jar on the classpath, and checks that our SHA1 equals the one Spring Data
+  Redis computes for the library's script. A library upgrade that changes the script fails the build; the copy is
+  then updated on purpose.
+- **We own the limiter's wiring.** If a library upgrade changes the constructor or the autoconfig, the context test
+  (the only `RateLimiter` bean is ours and holds a `PreloadedRedisScript`) fails.
+- **The SHA1 must be of the exact text,** or every EVALSHA would miss Redis' script cache and fall back to a full
+  EVAL. The drift test covers this.
+- **No other module uses Redis** (checked with grep), so there is no sibling to change.
+
+### What was measured
+
+- **Isolation (bench inside the real boot jar, 8 threads, 5 s):**
+  - Before: 9,942 calls per second in total, about 0.8 ms per call per thread, and about one exception per call
+    (JFR: 49,010 Throwables created during 48,871 calls).
+  - After: no lock, 0 exceptions per call (53 Throwables in the whole JVM, all at start-up).
+- **One R2 run on the final build:**
+  - **Fewer refused:** 947, against 3,082 / 3,978 / 2,899 / 3,261 before.
+  - **Answered requests much slower:** Gatling p99 31.3 s answered-only (was 6.0 to 8.0 s).
+  - **New failures:** 118 × 503 from Order (63 Inventory read timeouts, 55 Order pool timeouts).
+  - **Many more connections held:** up to 2,367 ESTABLISHED on :8080 (was at most 788).
+  - **Redis EVALSHA timeouts rose to 2,938** with the lock gone (28 and 758 in earlier runs), so the lock was not
+    their sole cause.
+
+### What stays unproven
+
+- **That the lock caused the refusals.** Runs vary a lot (Redis timeouts 28 against 758 between two earlier runs),
+  this is one run, and nothing here separates the fix from run-to-run variance.
+- **That the delay moved downstream.** The pattern fits it (more requests got in, then Order, Inventory and Redis
+  slowed), but it is an inference, not traced.
+- **The cause of the Redis timeouts,** and the accept queue itself.

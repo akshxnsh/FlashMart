@@ -2398,3 +2398,125 @@ laptop as a whole was saturated (one `netstat` took 7 s). The Gateway was not.
 **Likely fix (not applied):** a separate accept thread (`reactor.netty.ioSelectCount=1`) plus a rate-limiter script
 that does no per-call lock and file check. It would stop request work from delaying accepts, so buyers now refused
 would wait or be answered instead (slower). Unmeasured.
+
+## Day 9: the Gateway's own rate-limiter script (2026-11-09)
+
+**Label: tests and an isolated bench, plus ONE R2-shaped run on one laptop, stub gateway (payment-stub, auto-webhook
+SUCCESS, AFTER_REPLY), one Kafka broker. p99 < 500 ms and 5,000 concurrent buyers are TARGETS.** Branch
+`fix/gateway-ratelimiter-script`. Decision: `decisions.md`, "Day 9: the Gateway's own rate-limiter script".
+
+### Tests (Gateway, real Redis)
+
+| Test | What it proves | Broken once? |
+|---|---|---|
+| `RateLimiterScriptTest.ourCopyIsByteForByteTheScriptInsideTheGatewayLibrary` | Our Lua copy equals the one in the Spring Cloud Gateway jar (raw bytes; the upstream URL must contain `spring-cloud-gateway`) | Yes: one extra space at the end of our copy, 2 of 4 tests failed (this one and the SHA1 one). Restored, 4 of 4 pass. |
+| `RateLimiterScriptTest.sha1MatchesWhatSpringDataRedisComputesForTheLibraryScript` | Our SHA1 equals `DefaultRedisScript.getSha1()` for the library's script (what EVALSHA needs) | Same break as above |
+| `RateLimiterScriptTest.valuesAreFixedAtConstruction`, `aBlankScriptIsRejected` | Values computed once (the SHA1 of `return 1` is Redis' documented `e0e1f9fa…`); a blank script is rejected | No (routine) |
+| `RateLimitTest.theOnlyRateLimiterIsOursAndHoldsThePreloadedScript` | The library's limiter backed off; the only `RateLimiter` is ours and holds a `PreloadedRedisScript` | Yes: removed `@Bean` from ours, so the library's came back with `DefaultRedisScript`, and the test failed. Restored. |
+| `RateLimitTest` (existing, 5 tests) | Burst then 429 with the project's body and `Retry-After`; buckets per buyer and per IP; the JWT filter runs before the limiter | No change |
+| `RateLimitFailOpenTest` (existing) | With Redis really stopped (`docker compose stop redis`), 12 orders past the burst all pass; limiting returns when Redis is back | Yes: a temporary limiter subclass let a Redis error escape, and the test failed ("order 1 with Redis stopped: expected 200 but was 500"). Restored. |
+
+Suites: Gateway 57 run, 0 failed. The full suite was then run once: config-server 1, eureka-server 2, identity 119,
+inventory 137, order 319, notification 29, payment-stub 22, api-gateway 57 = **686 run, 0 failures, 0 errors, 0
+skipped** (681 + the 5 new). The first full attempt had Order 4 failures. All four came from 1,550 orders that the
+earlier load runs left in the shared dev database; `load-tests/reset-run.sh` emptied it and Order passed 319 / 319
+(no code change). The first attempt also ran without `.env` loaded, which gave connection errors in the four
+database modules; it was rerun with `.env`.
+
+### Isolated bench (inside the real Gateway boot jar)
+
+`load-tests/bench/ScriptSha1Bench.java` (not part of any build; run commands in its header). It runs through Spring
+Boot's own launcher (`PropertiesLauncher`), so the library's script resolves through the production URL
+(`jar:nested:/…/api-gateway-0.0.1-SNAPSHOT.jar/!BOOT-INF/lib/spring-cloud-gateway-server-webflux-5.0.3.jar!/META-INF/scripts/request_rate_limiter.lua`).
+8 threads call `getSha1()` as fast as they can. "Before" is a `DefaultRedisScript` built exactly as
+`GatewayRedisAutoConfiguration` builds it; "after" is `PreloadedRedisScript`. One run each.
+
+| | Before (`DefaultRedisScript`) | After (`PreloadedRedisScript`) |
+|---|---|---|
+| Calls in 5 s, 8 threads | 49,724 (9,942 per second) | 887,851,264 (177.6 million per second) |
+| Mean time per call per thread | 805 µs | 0.045 µs (a field read; the JIT may optimise it) |
+| Exceptions per call (JFR `jdk.ExceptionStatistics`, separate 5 s run) | about 1: 49,010 Throwables created during 48,871 calls | 0: 53 Throwables in the whole JVM, the same number as start-up alone |
+| SHA1 | `0ad5736e…` | `0ad5736e…` (identical) |
+
+How the exceptions were counted: the JVM's exception log (`-Xlog:exceptions`) undercounts, because compiled code can
+catch an exception in place without logging it (it showed 2,639 for 4,462 calls). JFR's `jdk.JavaExceptionThrow`
+event was throttled (476 events). The cumulative `jdk.ExceptionStatistics` counter is exact.
+
+### R2-shaped run on the final build (R2fix)
+
+**Setup.**
+- All seven jars rebuilt (the Gateway jar contains `PreloadedRedisScript` and `ratelimit/request_rate_limiter.lua`).
+  Stack started fresh by `recon-tools/stack3.sh`: config 19:41:07, Eureka 19:41:19, services 19:42:06, Gateway
+  19:42:21. Inventory warm-up: 20 calls, 2,247 ms. Reconciler ON. Redis, Kafka, Prometheus and Grafana from compose.
+- **Gate, first attempt: FAILED.** Result: `201 x 18, 503 x 32` in the warm-up. Cause, from the Gateway log: 32 ×
+  `RoundRobinLoadBalancer: No servers available for service: order-service` at 19:42:48. The gate ran 27 s after the
+  Gateway started, inside its default Eureka fetch interval (30 s) and load-balancer cache (35 s). Not the fix: no
+  Redis timeout, and the 32 never reached Order.
+- **Gate, second attempt (after `reset-run.sh`), 19:43:17: passed.** Result: `201 x 50`, `201 x 1`, 51 PAID, breaker
+  closed (0 failed calls). Then `recon-tools/run.sh R2fix 5000 10`.
+- **Measuring.** The only extra load was the connection sampler: `netstat -ano` every 250 ms outside the sandbox,
+  started before Gatling. Windows TCP counters were read just before and just after. **No thread dumps.**
+
+| | R2fix (this, lock-free script) | Run 2 (decisive, with dumps) | R2 re-run |
+|---|---|---|---|
+| Orders sold / expected (item 1) | **500 / 500** | 500 / 500 | 500 / 500 |
+| `place-order` statuses | 201 x 500, 409 x 3,434, **503 x 118**, no response x 948 | 201 x 500, 409 x 1,418, no response x 3,082 | 201 x 500, 409 x 522, no response x 3,978 |
+| No response: refused / timed out | **947** refused (`Connection refused: getsockopt`) / 1 (60 s, `::1`) | 3,082 / 0 | 3,978 / 0 |
+| Warm-up statuses | 201 x 50, 409 x 150 | same | same |
+| Oversell (`verify.sh`, `check-orders.sh`, both items) | none | none | none |
+| Gap, Version B (after drain) | 0 (drain 35 s; 0 `RESERVED` rows left) | 0 | 0 |
+| Gatling p99, answered only / all 5,000 (ms) | **31,339 / 31,085** | 8,046 / 7,388 | 6,022 / 5,349 |
+| Gatling p50, answered only / all (ms) | 17,433 / 15,286 | 3,396 / 1,525 | 3,553 / 943 |
+| Gatling wall time (incl. Maven start-up and warm-up) | 100 s | 36 s | 32 s |
+| Order server-side p99, `POST /api/orders` (Grafana, max of windows) | 9.77 s | 3.20 s | 0.90 s |
+| Inventory server-side p99, reserve (same) | 2.21 s | 0.32 s | 0.32 s |
+| Order 503s | 118: 63 × "inventory unreachable: Read timed out" (reserve), 55 × pool timeout ("Connection is not available", 1000 ms) | 0 | 0 |
+| Order / Inventory pool max active / pending (Grafana) | 2 / 0 and 4 / 0 (coarse: 55 pool timeouts happened between scrapes) | 3 / 0 and 1 / 0 | 3 / 0 and 2 / 0 |
+| Gateway Redis timeouts (EVALSHA, 500 ms, fail open) | **2,938** (all in the minute 19:46) | 758 | 28 |
+| Payment breaker | `closed` all run | `closed` | `closed` |
+| Reconciler actions / alerts | 0 / 0 (all four reasons) | 0 / 0 | 0 / 0 |
+
+**Windows TCP counters (19:45:50.4 → 19:47:32.6):**
+
+| Counter | Before | After | Change |
+|---|---|---|---|
+| TCPv6 Connection Failures | 36,796 | 37,744 | **+948** (no-response count 948: 947 refused, 1 timed out) |
+| TCPv4 Connection Failures | 75,810 | 77,563 | +1,753 |
+| TCPv4 / TCPv6 Connections Reset | 22,486 / 9,678 | 22,570 / 9,692 | +84 / +14 |
+| TCPv4 Connections Established | 253 | 3,424 | +3,171 (2 s after Gatling ended; not explained) |
+
+**What the sampler showed (server side of :8080):**
+
+| Sample start | One `netstat` took | ESTABLISHED / SYN_RECEIVED / CLOSE_WAIT | Gateway CPU (cumulative ms) |
+|---|---|---|---|
+| 19:46:12.1 (before the burst) | 0.6 s | 1 / 0 / 0 | 65,531 |
+| 19:46:12.7 | 3.4 s | 331 / 0 / 0 | 71,672 |
+| 19:46:16.2 | 5.6 s | 1,220 / 0 / 28 | 79,719 |
+| 19:46:21.8 | 6.5 s | 1,962 / 0 / 50 | 91,375 |
+| 19:46:28.3 | 4.9 s | **2,367** / 0 / 76 | 100,844 |
+| 19:46:33.5 | 14.1 s | 1,903 / 0 / 239 | 118,797 |
+| 19:46:47.6 | 1.5 s | 2 / 0 / 0 | 118,797 |
+
+- **Gateway CPU:** about 53 s of CPU from 19:46:12 to about 19:46:47, about 1.5 of 8 cores (run 2: about 0.8).
+- **Connections held:** many more were held at the Gateway at once (up to 2,367; run 2 at most 788).
+- **Limits, same as before:** samples during the burst took 3 to 14 s each, and `netstat` cannot tell queued
+  connections from accepted ones.
+
+**Against the targets:** Gatling p99 31.3 s answered-only and 31.1 s for all requests, so **p99 < 500 ms not met**.
+948 of 5,000 got no response, so **5,000 concurrent not reached**. Zero oversell held (one run).
+
+### What this run does and does not show
+
+**Shows:**
+- With the lock gone, **fewer buyers were refused** (947 against 2,899 to 3,978 in four earlier R2-shaped runs; the
+  disturbed run 1 had 1,870).
+- The buyers who got in **waited much longer**. Order and Inventory were slower, and 118 got a 503.
+- **Redis timeouts rose** (2,938) with no `getSha1` lock left, so the lock was not their sole cause.
+
+**Does not show:**
+- **That the lock caused the refusals.** Runs vary a lot (Redis timeouts 28 against 758 between two earlier runs,
+  refusals 2,899 to 3,978), and this is one run.
+- **That the delay moved downstream** (more requests in, so Order, Inventory and Redis slowed). That reading fits the
+  numbers, but it was not traced.
+- **Why 947 were still refused.** No dumps were taken, so this run says nothing about the event loops.
+- Not repeated, so no variance is known.
