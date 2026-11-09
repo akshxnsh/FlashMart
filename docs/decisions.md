@@ -5899,3 +5899,102 @@ load-driven trigger.
   the Gateway, so **p99 < 500 ms is still not met**. R2F, on fresh JVMs, sold nothing: a Feign cold-start error
   opened the payment breaker during the burst. Zero oversell held and the gap count was 0 in both runs, although
   R2F had 285 late reservations (Version B) that were released only because each commit beat its `OrderCancelled`.
+
+## Decision: Day 9: Inventory stale-reservation reconciler
+
+**Status: implemented and tested (real Postgres with Order mocked, a two-thread race with a break-and-restore, the
+HTTP client against a JDK stub, Order's endpoint over real HTTP, the Gateway's no-`/internal` route check with a
+break-and-restore); demonstrated once on real processes on one laptop with a FORCED late reservation, and a 50-buyer run with live
+orders on the real threshold took no action (`testing.md`, "Day 9: stale-reservation reconciler"). How often
+Version B happens under real overload is NOT measured.**
+
+### Context
+
+Version B of the late reservation (decisions.md, "Day 7", point 5): Order's reserve call times out, Order fails the
+order and publishes `OrderCancelled`, Inventory's consumer finds nothing to release, and THEN the blocked reserve
+commits. The `RESERVED` row belongs to a dead order and no event will ever release it. It was accepted as a known gap.
+The Day 9 Part F R2F run made it real: 285 reserve calls timed out in Order and still committed in Inventory. All were
+released, but only because each commit landed before its `OrderCancelled` was consumed. The design for the cure was
+already written (architecture.md §3, "Inventory → Order"): Inventory asks Order, never guesses.
+
+### Chosen approach
+
+- **Order: `GET /internal/orders/{orderId}/status` → `{orderId, status}`, `404` if unknown.** One read, nothing
+  written. Internal: not under `/api/orders` (no Gateway signature), never routed through the Gateway (the Gateway's
+  route test now evaluates every route against `/internal/**` too; adding `/internal/**` to a route made it fail).
+- **Inventory: `StaleReservationReconciler`, a scheduled pass every 60 s (fixed delay).**
+  1. One short read: up to `batch-size` (50) `RESERVED` rows with `reserved_at` older than the threshold, oldest
+     first (index `(status, reserved_at)`), reduced to distinct order ids.
+  2. For each order, ask Order, with **no transaction and no connection held during the call** (open-in-view is off;
+     the call is made from a non-transactional bean). Connect 1 s, read 2 s, one attempt, no retries.
+  3. Act only on a terminal answer, through the EXISTING status-guarded code (`ReservationEventService`), each in its
+     own short transaction: `PAID` → `confirm` (`RESERVED → CONFIRMED`); `RESERVATION_FAILED`,
+     `PAYMENT_UNAVAILABLE`, `ORDER_EXPIRED`, `PAYMENT_FAILED` → `release` (`RESERVED → RELEASED`, stock back only
+     for the rows that flipped). The consumers' behaviour is unchanged.
+  4. Everything else changes nothing: `CREATED` / `PENDING_PAYMENT` (an order that old should have been ended by
+     Order's sweep), `404`, an unknown status, an answer about another order, or Order unreachable. **Alert = an ERROR
+     log with the order id + a Micrometer counter** `inventory.reconciler.alerts{reason=order_live | order_not_found
+     | unknown_status | order_unreachable}`. Actions are counted too: `inventory.reconciler.actions{action=confirmed
+     | released}` (rows changed).
+  5. **The pass stops at the first unreachable Order** (no hammering a sick service); the next pass retries. A
+     `404` or a live order is an answer, not a failure, so the pass goes on.
+- **Threshold, derived:** a row is stale only when no healthy path could still settle it. Its order may stay
+  `CREATED` up to the longest `CREATED` deadline (9 lines: 60.5 s), then `PENDING_PAYMENT` up to the payment window
+  (360 s); Order's sweep may run up to one interval late (30 s); then the event still has to reach Inventory (Kafka
+  drain margin 120 s, policy; the Day 9 runs drained in 20 to 50 s). **Threshold = 360 + 60.5 + 30 + 120 =
+  570.5 s.** Inventory keeps the four parts in its own config and adds them; the first three MIRROR Order's values
+  and nothing checks they stay equal.
+- **Why no lock is needed:** every Order status write requires the old status to be `CREATED` or `PENDING_PAYMENT`
+  (checked in `OrderRepository`), so `PAID` and the four failure states never change: an answer acted on cannot be
+  stale. A race with the Kafka consumers is safe because both use the same `UPDATE ... WHERE status = 'RESERVED'`;
+  the loser matches 0 rows and adds 0 stock (raced 20 times in a test; without the guard the test fails).
+- **No path releases a paid order or confirms a failed one:** release only on a failure answer, confirm only on
+  `PAID`, both terminal; release never touches `CONFIRMED` rows, confirm never touches `RELEASED` ones.
+- All numbers (interval 60 s, batch 50, timeouts 1 s / 2 s, drain margin 120 s) are PROVISIONAL and unmeasured, in
+  Inventory's `application.yml` and mirrored in the config repo; the Order address stays local.
+
+### Options considered
+
+- A delayed second `OrderCancelled` from Order (rejected on Day 7: Order cannot know when the late commit lands).
+- Inventory asking Order on every reserve (rejected on Day 7: a synchronous call on the hot path).
+- Inventory releasing old rows by age alone: rejected, it would guess, and could release a paid order's stock.
+
+### Trade-offs and consequences
+
+- A Version B row now holds its unit for up to about 10.5 minutes (threshold + one interval) instead of forever.
+  During a flash sale that unit may be unsellable until the sale is over; the reconciler restores the count, not the
+  missed sale.
+- A `CREATED` / `PENDING_PAYMENT` answer for a row this old is alerted, not acted on: if Order's sweep is dead the
+  rows stay held until a human looks.
+- The threshold depends on Order's values copied by hand; a change in Order's payment window or `maxLines` must be
+  copied to Inventory, or the reconciler may ask about rows that are still settling (it then only alerts; it never
+  acts on a live order).
+- Unproven: the frequency of Version B under real overload, a pass against a large backlog, more than one Inventory
+  instance (passes may overlap; the guards keep that correct, untested).
+
+### Addendum: keyset cursor and counters at zero (found in review)
+
+- **Problem.** Each pass read "the 50 oldest stale rows". Rows answered live, `404` or an unknown status are never
+  acted on, so they stay `RESERVED` and stay the oldest: 50 of them hid every releasable row behind them, for ever.
+  And one order that always answered 5xx stopped every pass at the same place. A test with 55 "live" rows and one
+  releasable row behind them failed on that code (the row was still `RESERVED` after 2 passes).
+- **Chosen.** An in-memory keyset cursor `(reserved_at, id)` (`stock_reservations.id` is the `BIGSERIAL` primary
+  key). Each pass reads stale rows (same threshold, database clock) with `(reserved_at, id)` after the cursor,
+  `ORDER BY reserved_at, id LIMIT batch`. A full batch moves the cursor to its last row; fewer rows than the batch
+  means the end was reached and the cursor goes back to the start (the next pass wraps around). On an unreachable
+  Order the pass still stops, and the cursor moves PAST that order's rows in the batch, so the next pass starts after
+  it. No schema change, no new config; lost on restart (it starts again from the oldest row).
+- **Trade-off.** An order that failed only once, and any row read before that order's last row but not yet asked
+  about, waits until the next wrap-around. With N stale rows the reconciler cannot act on, a wrap-around takes
+  about N / 50 passes (60 s each), so a releasable row can wait that much longer than threshold + one interval. It
+  only delays: nothing is acted on without a terminal answer.
+- **Unchanged.** What is acted on (`PAID` → confirm, the four failure states → release, anything else → alert), the
+  status-guarded release/confirm, and no Order call inside a transaction. The cursor decides only which rows are
+  looked at, never what is done to them, so it cannot make the reconciler act on a row it should not.
+- **Counters at zero.** The four `inventory.reconciler.alerts{reason}` and two `inventory.reconciler.actions{action}`
+  counters are registered at zero when the reconciler is built, so Prometheus shows them from the first scrape.
+- **Tests.** Starvation (failed on the old code; now released within 2 passes), wrap-around (a row that became
+  releasable is found after the end), a poison order in the middle (the pass stops there, the next starts after it,
+  rows behind it are released, it is asked again after the wrap), and the six counters at zero. One existing test
+  changed because its expectation was the old behaviour: after an unreachable order, the next pass no longer
+  retries that order first; it is retried after the wrap.

@@ -17,23 +17,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * The Gateway must never forward {@code /actuator/**} to a service (decisions.md,
  * Day 9, Part B): a service's {@code /actuator/env} would otherwise be reachable
- * from outside, past the JWT check's intent. Each route's own predicate is
- * evaluated against actuator paths, for every method; none may match. Done for
- * the default {@code lb://} routes and for the {@code fixed} profile's routes.
+ * from outside, past the JWT check's intent. Nor {@code /internal/**}
+ * (CLAUDE.md: internal endpoints are never routed through the Gateway): Inventory's
+ * reserve and Order's order-status lookup for the stale-reservation reconciler
+ * have no authentication of their own. Each route's own predicate is evaluated
+ * against those paths, for every method; none may match. Done for the default
+ * {@code lb://} routes and for the {@code fixed} profile's routes.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.MOCK)
 class ActuatorNotRoutedTest {
 
     private static final List<String> PATHS = List.of(
             "/actuator", "/actuator/health", "/actuator/prometheus", "/actuator/env",
-            "/actuator/env/payment.read-timeout-ms");
+            "/actuator/env/payment.read-timeout-ms",
+            "/internal", "/internal/orders/1/status", "/internal/flash-sale-items/reserve");
     private static final List<HttpMethod> METHODS = List.of(HttpMethod.GET, HttpMethod.POST);
 
     @Autowired
     RouteLocator routeLocator;
 
     @Test
-    void noRouteMatchesAnActuatorPath() {
+    void noRouteMatchesAnActuatorOrInternalPath() {
         List<Route> routes = routeLocator.getRoutes().collectList().block();
         assertThat(routes).as("the routes are loaded").hasSizeGreaterThanOrEqualTo(4);
         for (Route route : routes) {

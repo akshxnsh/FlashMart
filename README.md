@@ -117,9 +117,9 @@ Default ports: Gateway 8080, Identity 8081, Inventory 8082, Order 8083, Notifica
 
 - **The payment gateway is a stub.** The real Razorpay Clone is a separate project. Its required behaviours (idempotent initiate and refund, status lookup, signed webhooks) are specified here but not verified against it.
 - **Brands, flash sales and stock are seeded.** There is no brand-side API. Sale creation and editing, the "frozen once live" rules, and API-key auth exist only in the design (the `api_keys` schema exists, but no code path uses it).
-- **Design-only components:** payment reconciliation sweep, Inventory's stale-reservation reconciler, Identity outbox events and the contact-cache backfill, outbox cleanup job.
+- **Design-only components:** payment reconciliation sweep, Identity outbox events and the contact-cache backfill, outbox cleanup job.
 - **No dead-letter topic.** A malformed Kafka message is skipped with an ERROR log. A temporary failure is retried and never skipped.
-- **A late reservation after a timed-out reserve call** is a documented gap, and its frequency is unmeasured.
+- **A late reservation after a timed-out reserve call** (Version B) is released by Inventory's stale-reservation reconciler, but only after about 10 minutes at best (threshold 570.5 s + one 60 s pass), and later when many stale rows it cannot act on are waiting (its cursor wraps around about every N / 50 passes) or an order it asks about keeps failing (retried after the wrap); until then that unit cannot be sold. The reconciler is tested and was demonstrated once on one laptop with the ordering forced; how often this happens under real overload is not measured (285 late commits in one 5,000-buyer run, all released by timing).
 - **One accepted exception to the one-payment invariant:** a second captured payment can escape correction only if initiate idempotency fails to dedupe, a webhook is separately lost, *and* the order reaches `PAID`. Three rare failures must stack.
 - **An early webhook** (arriving while the order is still `CREATED`) is answered non-2xx so the gateway retries. This depends on the gateway retrying long enough.
 - **Rate limiting fails open if Redis is down**, and the browse endpoint is not rate limited.
