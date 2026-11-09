@@ -67,6 +67,31 @@ kafka:
     backoff-multiplier: 2.0
     backoff-max-ms: 30000
 
+# Stale-reservation reconciler (decisions.md, "Day 9: Inventory stale-reservation
+# reconciler"). Every NUMBER here is PROVISIONAL and unmeasured, and is mirrored
+# in the config repo (inventory-service.yml); the Order address is local only.
+reconciler:
+  # false: no scheduled passes (tests call runOnce() by hand).
+  enabled: true
+  interval-ms: 60000
+  batch-size: 50
+  order:
+    base-url: http://localhost:8083
+    # One attempt, no retries: the next pass is the retry.
+    connect-timeout-ms: 1000
+    read-timeout-ms: 2000
+  # A RESERVED row is stale only after every healthy path could have settled it:
+  # threshold = payment window + longest CREATED deadline + sweep interval + Kafka
+  # drain margin = 360 + 60.5 + 30 + 120 = 570.5 s. The first three MIRROR Order's
+  # order.payment-window-ms, CreateOrderSettings.deadlineSeconds(maxLines) (9 lines:
+  # 9 x 5 s + 10.5 s + 5 s) and order.sweep.interval-ms; nothing checks they stay
+  # equal. The drain margin is policy: the Day 9 runs drained in 20-50 s.
+  threshold:
+    order-payment-window-ms: 360000
+    order-max-created-deadline-ms: 60500
+    order-sweep-interval-ms: 30000
+    kafka-drain-margin-ms: 120000
+
 # Registration with the Eureka server (decisions.md, "Day 8", addendum
 # "Gateway and discovery"). Only the API Gateway looks services up; this
 # service only registers. DEFAULT timings on purpose (heartbeat 30 s, lease

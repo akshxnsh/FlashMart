@@ -17,3 +17,8 @@ spring:
   cloud:
     config:
       enabled: false
+
+# No scheduled reconciler passes in tests: they would ask a real Order on
+# localhost:8083 about other tests' rows. The reconciler tests call runOnce().
+reconciler:
+  enabled: false
