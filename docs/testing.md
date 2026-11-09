@@ -1954,3 +1954,90 @@ bash scripts/seed/seed.sh                                                       
 java -cp "$CP" com.flashmart.inventory.diagnosis.ReserveColdStartProbe burst 200 100000
 # then stop the Inventory JVM before the next run
 ```
+
+## Day 9: cold-start fixes (2026-11-09)
+
+Branch `fix/startup-warmup`, stacked on `fix/startup-diagnosis`. One laptop, a few runs each, no load tool, stub
+gateway. Decisions and trade-offs: `decisions.md`, "Day 9: cold-start fixes (Feign upgrade, Inventory warm-up
+before the port)".
+
+### Fix A: Spring Cloud 2025.1.2 → 2025.1.3 (openfeign 5.0.2 → 5.0.3)
+
+Order's `dependency:tree` after the bump: openfeign 5.0.3, feign-core 13.6.1, Spring Framework 7.0.9 and Boot 4.1.1
+(unchanged). The 5.0.3 sources jar was not available locally, so the fixed code was not read; the fix is shown by
+behaviour. Same harness as the diagnosis (`FeignColdStartHarness`), 50 concurrent first calls, 25 per client:
+
+| Run | Rounds | Rounds with failures | Calls failed |
+|---|---|---|---|
+| `burst`, a fresh JVM per round | 20 | **0 / 20** (was 20 / 20) | 0 of 1,000 (was 7 to 44 of 50 per round) |
+| `direct` race on `getConverters()` | 20 | **0 / 20** (was 20 / 20) | every thread saw all 7 converters (was 49 of 50 seeing 0) |
+
+No Feign warm-up was added to the app.
+
+### Fix B: Inventory's warm-up before the port
+
+Probe: `ReserveColdStartProbe` (as in the diagnosis), fresh jar, config server and Eureka not running, Kafka up,
+seed reset before each run, 200 concurrent reserves at one item (50 units).
+
+| Run (fresh JVM) | Warm-up | Calls > 2 s | p50 / p99 / max (ms) | Hikari max active / pending seen |
+|---|---|---|---|---|
+| coldA, coldB, cold1 (diagnosis) | off | 123, 87, 150 | p99 2,282, 2,232, 2,256 (p50 about 2,000 to 2,100) | 10 / 96, 10 / 149, 10 / 176 |
+| warmA, warmB (diagnosis: 20 HTTP calls first) | off | 0, 0 | p50 548 / 647, p99 850 / 797 | 0 / 0, 1 / 0 (coarse) |
+| **onA** | on | **0** | 1,414 / 1,617 / 1,629 | 10 / 183 |
+| **onB** | on | **0** | 1,016 / 1,251 / 1,268 | 9 / 53 |
+| **onC** | on | **0** | 1,132 / 1,417 / 1,433 | 10 / 180 |
+
+- **The 2 s timeouts are gone in 3 of 3 runs. The cold cost is not all gone.** p99 is 1.25 to 1.62 s: better than
+  2.23 to 2.28 s without it, worse than 0.80 to 0.85 s once HTTP calls have been served, and near Order's 2 s
+  limit. The pool still fills (expected: 200 concurrent calls, 10 connections). The Hikari readings are coarse (the
+  scrape queues behind the burst), so they are not comparable with the earlier "0 / 0".
+- **What a before-the-port warm-up cannot warm**, seen in the first single HTTP call on a fresh JVM (3 runs each):
+  without the warm-up 1,182 / 848 / 826 ms; with it 268 / 202 / 219 ms; a warm call is 16 to 34 ms. About 200 ms is
+  still paid by the first call: Tomcat, the DispatcherServlet's first-request set-up, Jackson on the request and
+  response, validation. Inference, not profiled.
+- **Start-up time:** "Started InventoryServiceApplication in" 11.28 / 11.74 / 11.60 s without (mean 11.54), 12.49 /
+  12.79 / 12.27 s with (mean 12.52): about **+1.0 s**. The warm-up line itself reports 0.78 to 1.12 s.
+- **Order of events** (one start, from the log): `startup warm-up: 20 reserve calls, all rolled back, 995 ms`, then
+  Eureka "Registering application", then "Tomcat started on port 8082", then the first request's DispatcherServlet
+  initialisation.
+- **Side effect:** each start burns 20 ids of the `stock_reservations` sequence (reservation ids jumped by about 20
+  between consecutive starts).
+
+### Tests added (7; inventory 130 → 137)
+
+`StartupWarmupTest` (real Postgres, not `@Transactional`): the real reserve path runs 20 times and nothing of it
+commits (native SQL before and after: reservation rows, reserved units, summed stock, summed versions, item count;
+and the id sequence advanced by exactly 20, so "unchanged" is not "never ran"); an empty database is skipped and
+`reserve` is never called; a failing reserve returns `FAILED` and does not throw; a hung reserve is cut off at the
+timeout (`TIMED_OUT`, 1 s configured); disabled does nothing. `StartupWarmupBeforePortTest` (real web server, warm-up
+on): a post-processor stamps every start-up reserve call and a listener stamps the web-server event; all 20 calls
+come before it. `StartupWarmupFailingStartTest` (warm-up on, the reserve service replaced by one that always throws):
+the context starts anyway, with the WARN "startup warm-up: failed after 0 calls; starting anyway" in the log. Both
+context tests are skipped, visibly, if the database has no item at start-up; neither was skipped here.
+
+- **Break-and-restore, once each.** (1) Removing `setRollbackOnly()`: `theRealReservePathRunsAndNothingOfItCommits`
+  failed (reservation rows: 0 expected, 20 seen); restored. (2) Making the class an `ApplicationRunner`:
+  `everyStartUpWarmupCallIsBeforeTheWebServerIsInitialised` failed (the last call came after the web-server event);
+  restored.
+- **What these tests cannot see:** a second Inventory instance, a production-size table, a database that is slow
+  rather than empty. The failing-start test did not get its own break-and-restore (a failure that stops start-up
+  was not injected into the class).
+
+### Suites
+
+Run after the last code change, in this session: identity 119, inventory 137, order 319, notification 29,
+payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **681, 0 failures, 0 errors, 0 skipped**
+(674 before the 7 new tests; the harnesses have no `@Test`. The other seven modules were last run in the full run before the seventh test was added; nothing in them changed). **A first Inventory run after the bump had 6
+reconciler failures**: the reconciler tests read every stale `RESERVED` row in the shared database, and the earlier
+diagnosis bursts had left 50 there. After `seed.sh` the same suite passed. Reset the seed after any manual burst.
+
+### Commands
+
+```bash
+# Fix A: the Problem A commands from the diagnosis section (after ./mvnw test-compile in order-service)
+# Fix B (repo root, .env exported, Kafka up, nothing on :8082): a fresh jar per run, seed.sh first
+bash scripts/seed/seed.sh
+STARTUP_WARMUP_ENABLED=true java -jar inventory-service/target/inventory-service-0.0.1-SNAPSHOT.jar &   # false = off
+java -cp "$CP" com.flashmart.inventory.diagnosis.ReserveColdStartProbe burst 200 100000   # or: warm 1 900000
+# stop the jar before the next run
+```
