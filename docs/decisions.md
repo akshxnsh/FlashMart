@@ -24,6 +24,105 @@
 > still designed only**; "Day 8: auth, gateway identity, rate limiting, browse"
 > (last entry) designs them and is itself **not built**.
 
+> **Correction (Day 9 docs pass, 2026-11-09):** the Status note above is long out of date. Kafka, Redis, security, the gateway, the config server, metrics and the Inventory reconciler are all built and tested now; the labels per piece are in `architecture.md` §8 (the status source of truth) and the status of each entry is in the index below.
+
+## Index of entries
+
+> Added in the Day 9 docs pass (2026-11-09), built from `grep -n '^## ' docs/decisions.md`, one row per heading in file order. The heading is the one-line summary. **Status** is read from each entry's own notes and from `architecture.md` §8; the entry itself wins if they disagree. Nothing below this index was rewritten: later outcomes are added as blockquote notes under the heading they change.
+
+| Entry | Status |
+|---|---|
+| [Saga (orchestration) instead of 2PC or a single distributed transaction for Order/Inventory/Payment consistency](#decision-saga-orchestration-instead-of-2pc-or-a-single-distributed-transaction-for-orderinventorypayment-consistency) | Active, amended (`saga_state` dropped, see the entry `saga_state` is dropped) |
+| [TTL-based polling sweep, not a Kafka delayed-message pattern, for reservation expiry / webhook-never-arrives safety net](#decision-ttl-based-polling-sweep-not-a-kafka-delayed-message-pattern-for-reservation-expiry--webhook-never-arrives-safety-net) | Superseded twice (the sweep now lives in Order; see Day 7) |
+| [`docs/requirements.md` stays scoped to functional/non-functional requirements only — no API contracts, schema, or code](#decision-docsrequirementsmd-stays-scoped-to-functionalnon-functional-requirements-only--no-api-contracts-schema-or-code) | Active |
+| [Performance targets (NFR-P1–P4) documented as unverified targets, not requirements assumed to be satisfied by design](#decision-performance-targets-nfr-p1p4-documented-as-unverified-targets-not-requirements-assumed-to-be-satisfied-by-design) | Active (targets; not met in the load runs, see `testing.md`) |
+| [Service boundaries drawn by traffic shape + failure blast radius](#decision-service-boundaries-drawn-by-traffic-shape--failure-blast-radius) | Active (the rule stands; its service list is superseded by the pivot and Identity entries) |
+| [Vendor Service kept as one combined service (not split into Identity/Auth vs. Vendor Profile/Payout)](#decision-vendor-service-kept-as-one-combined-service-not-split-into-identityauth-vs-vendor-profilepayout) | Superseded (by the pivot and the Identity entry) |
+| [Communication pattern per service interaction (sync Feign / async Kafka / inbound webhook)](#decision-communication-pattern-per-service-interaction-sync-feign--async-kafka--inbound-webhook) | Active |
+| [Go multi-service (Gateway + Eureka discovery) from day one, skipping the PRD's phased monolith-first build](#decision-go-multi-service-gateway--eureka-discovery-from-day-one-skipping-the-prds-phased-monolith-first-build) | Active (its service list predates the pivot) |
+| [Config server lives in its own repo, separate from the business-services monorepo](#decision-config-server-lives-in-its-own-repo-separate-from-the-business-services-monorepo) | Active; built in Day 9, Part 0 |
+| [Vendor email delivered to Notification Service via event enrichment, not a synchronous Vendor Service call](#decision-vendor-email-delivered-to-notification-service-via-event-enrichment-not-a-synchronous-vendor-service-call) | Superseded |
+| [Vendor email sourced via the existing Inventory reservation call, denormalized into Inventory's `products` table — not a new Vendor Service call or a Redis cache](#decision-vendor-email-sourced-via-the-existing-inventory-reservation-call-denormalized-into-inventorys-products-table--not-a-new-vendor-service-call-or-a-redis-cache) | Superseded |
+| [Order state machine — final state set derived from sequence diagrams; `CONFIRMED` and `RESERVED` dropped from the PRD's original list](#decision-order-state-machine--final-state-set-derived-from-sequence-diagrams-confirmed-and-reserved-dropped-from-the-prds-original-list) | Active, amended (`RESERVATION_FAILED` added) |
+| [Idempotent terminal-state guard for late-arriving payment webhooks/events](#decision-idempotent-terminal-state-guard-for-late-arriving-payment-webhooksevents) | Superseded (by "An order keeps exactly one payment") |
+| [Multi-item orders — Order supports multiple OrderItems, not one-product-per-order](#decision-multi-item-orders--order-supports-multiple-orderitems-not-one-product-per-order) | Active |
+| [Reservation strategy for multi-item orders — all-or-nothing, via a sequential loop of per-item Feign calls](#decision-reservation-strategy-for-multi-item-orders--all-or-nothing-via-a-sequential-loop-of-per-item-feign-calls) | Active, amended (`release()` and `COMPENSATING` dropped) |
+| [Product vision pivot — FlashMart is a flash-sale platform for brands, not a multi-vendor marketplace; Settlement Service removed](#decision-product-vision-pivot--flashmart-is-a-flash-sale-platform-for-brands-not-a-multi-vendor-marketplace-settlement-service-removed) | Active |
+| [One flash sale per order — `flash_sale_id` stays on `orders`, not on `order_items`](#decision-one-flash-sale-per-order--flash_sale_id-stays-on-orders-not-on-order_items) | Active |
+| [`flash_sales` is a brand-level sale event; per-product terms live in `flash_sale_items`](#decision-flash_sales-is-a-brand-level-sale-event-per-product-terms-live-in-flash_sale_items) | Active |
+| [Optimistic-lock `version` column on `flash_sale_items`, not on `stock_reservations`](#decision-optimistic-lock-version-column-on-flash_sale_items-not-on-stock_reservations) | Active, amended (the counter is `available_stock`; reserve path decided in "Reserve write path") |
+| [`UNIQUE(flash_sale_id, product_id)` on `flash_sale_items`](#decision-uniqueflash_sale_id-product_id-on-flash_sale_items) | Active |
+| [Brand Service becomes Identity Service, owning `brands`, `api_keys`, and `users` (buyers)](#decision-brand-service-becomes-identity-service-owning-brands-api_keys-and-users-buyers) | Active |
+| [Notification consumer idempotency via `UNIQUE(order_id, event_type, recipient_type, channel)` on `notification_log`](#decision-notification-consumer-idempotency-via-uniqueorder_id-event_type-recipient_type-channel-on-notification_log) | Active (Notification's consumers are not built) |
+| [Brand email delivery to Notification Service — local `brand_contacts` cache, fed by an Identity Service event; `brand_id` carried in the outbox payload but not persisted on `orders`](#decision-brand-email-delivery-to-notification-service--local-brand_contacts-cache-fed-by-an-identity-service-event-brand_id-carried-in-the-outbox-payload-but-not-persisted-on-orders) | Active, amended (event also fires on creation; consumer not built) |
+| [Order expiry via a `ReservationExpired` event from Inventory Service](#decision-order-expiry-via-a-reservationexpired-event-from-inventory-service) | Superseded entirely (`ReservationExpired` no longer exists) |
+| [Drop `StockReserved` from the event list](#decision-drop-stockreserved-from-the-event-list) | Active |
+| [Every service that publishes events owns an outbox](#decision-every-service-that-publishes-events-owns-an-outbox) | Active, amended (the list of publishers changed) |
+| [Idempotent reserve via `UNIQUE(order_id, flash_sale_item_id)` on `stock_reservations`](#decision-idempotent-reserve-via-uniqueorder_id-flash_sale_item_id-on-stock_reservations) | Active |
+| [`total_stock` stays fixed; `available_stock` is the decremented counter](#decision-total_stock-stays-fixed-available_stock-is-the-decremented-counter) | Active |
+| [`flash_sales.status` is stored: `SCHEDULED \| LIVE \| ENDED \| CANCELLED`](#decision-flash_salesstatus-is-stored-scheduled--live--ended--cancelled) | Superseded (status is `ACTIVE \| CANCELLED`) |
+| [`orders.payment_ref` stores Razorpay Clone's payment reference](#decision-orderspayment_ref-stores-razorpay-clones-payment-reference) | Active, amended |
+| [`UNIQUE(order_id, product_id)` on `order_items`](#decision-uniqueorder_id-product_id-on-order_items) | Active |
+| [Idempotency key scoped per buyer — `UNIQUE(buyer_id, idempotency_key)`](#decision-idempotency-key-scoped-per-buyer--uniquebuyer_id-idempotency_key) | Active |
+| [Contact caches fed by `BrandUpserted` / `UserUpserted`; buyer emails handled the same way as brand emails](#decision-contact-caches-fed-by-brandupserted--userupserted-buyer-emails-handled-the-same-way-as-brand-emails) | Active (Notification's consumers are not built) |
+| [`UNIQUE(key_hash)` on `api_keys`, and index list per service](#decision-uniquekey_hash-on-api_keys-and-index-list-per-service) | Active; its index list is partly stale (see its note) |
+| [Order Service is the sole authority on an order's fate; every `orders.status` write is a compare-and-set](#decision-order-service-is-the-sole-authority-on-an-orders-fate-every-ordersstatus-write-is-a-compare-and-set) | Active |
+| [`RESERVATION_FAILED` added as a fifth terminal state](#decision-reservation_failed-added-as-a-fifth-terminal-state) | Active |
+| [One order-death event — `OrderCancelled { order_id, reason }` — replaces `ReservationExpired` and the per-item `release()` call](#decision-one-order-death-event--ordercancelled--order_id-reason---replaces-reservationexpired-and-the-per-item-release-call) | Active |
+| [A late reservation is cleaned up by re-publishing `OrderCancelled`, not by a new mechanism](#decision-a-late-reservation-is-cleaned-up-by-re-publishing-ordercancelled-not-by-a-new-mechanism) | Active; the related Version B gap is closed by the Day 9 reconciler |
+| [The order row is created before the reservation loop; `amount` is NULL until the last item is priced](#decision-the-order-row-is-created-before-the-reservation-loop-amount-is-null-until-the-last-item-is-priced) | Active |
+| [`reserve()` returns `sale_price`; money columns are `DECIMAL`; a live sale's price is immutable](#decision-reserve-returns-sale_price-money-columns-are-decimal-a-live-sales-price-is-immutable) | Active |
+| [An order keeps exactly one payment; every other captured payment is refunded](#decision-an-order-keeps-exactly-one-payment-every-other-captured-payment-is-refunded) | Active, amended (Day 6) |
+| [Refunds are issued through a `refunds` command-outbox table, not a direct call](#decision-refunds-are-issued-through-a-refunds-command-outbox-table-not-a-direct-call) | Active, amended (Day 6); the refund worker is not built |
+| [`saga_state` is dropped; orchestration state lives on `orders`](#decision-saga_state-is-dropped-orchestration-state-lives-on-orders) | Active |
+| [Inventory publishes nothing and owns no outbox](#decision-inventory-publishes-nothing-and-owns-no-outbox) | Active |
+| [`OrderCreated` is dropped with no replacement](#decision-ordercreated-is-dropped-with-no-replacement) | Active |
+| [No status-transition job — liveness is computed, and `flash_sales.status` shrinks to `ACTIVE \| CANCELLED`](#decision-no-status-transition-job--liveness-is-computed-and-flash_salesstatus-shrinks-to-active--cancelled) | Active |
+| [Event payload shapes for `PaymentConfirmed`, `BrandUpserted`, `UserUpserted`; money crosses every boundary as a string; no envelope, no `event_id`](#decision-event-payload-shapes-for-paymentconfirmed-brandupserted-userupserted-money-crosses-every-boundary-as-a-string-no-envelope-no-event_id) | Active, amended (Day 6) |
+| [Notification consumes `OrderCancelled`, but notifies only for the two asynchronous reasons](#decision-notification-consumes-ordercancelled-but-notifies-only-for-the-two-asynchronous-reasons) | Active; Notification's consumers are not built |
+| [Out-of-order `BrandUpserted`/`UserUpserted` delivery is handled by a timestamp-conditional upsert, not by requiring ordered delivery](#decision-out-of-order-brandupserteduserupserted-delivery-is-handled-by-a-timestamp-conditional-upsert-not-by-requiring-ordered-delivery) | Active |
+| [Notification retries `FAILED` sends with a small capped backoff; no escalation, no fencing, a claim but not the refund worker's full machinery](#decision-notification-retries-failed-sends-with-a-small-capped-backoff-no-escalation-no-fencing-a-claim-but-not-the-refund-workers-full-machinery) | Active; Notification's consumers are not built |
+| [A sale cannot be cancelled once it has started](#decision-a-sale-cannot-be-cancelled-once-it-has-started) | Active |
+| [Inventory's `reserve` API contract](#decision-inventorys-reserve-api-contract) | Active, amended |
+| [Order's internal order-status endpoint — `GET /internal/orders/{orderId}/status`](#decision-orders-internal-order-status-endpoint--get-internalordersorderidstatus) | Active; implemented in Day 9 (reconciler) |
+| [Webhook-never-arrives is closed by a reconciliation sweep that queries the gateway by the order's deterministic idempotency key](#decision-webhook-never-arrives-is-closed-by-a-reconciliation-sweep-that-queries-the-gateway-by-the-orders-deterministic-idempotency-key) | Designed, NOT built (the heading says "closed" in the design sense) |
+| [The PRD's remaining event list is reduced to four events](#decision-the-prds-remaining-event-list-is-reduced-to-four-events) | Active |
+| [Inventory keeps no deadline of its own; stale reservations are reconciled by asking Order](#decision-inventory-keeps-no-deadline-of-its-own-stale-reservations-are-reconciled-by-asking-order) | Active; implemented in Day 9 (reconciler) |
+| [Deadlines and leases are derived from the timeouts they race, never picked](#decision-deadlines-and-leases-are-derived-from-the-timeouts-they-race-never-picked) | Active, amended (Day 5 numbers; Day 9 pool wait) |
+| [Outbound brand webhooks — dropped](#decision-outbound-brand-webhooks--dropped) | Active (outbound brand webhooks dropped) |
+| [Flyway (SQL-first migrations), not Hibernate `ddl-auto`, owns schema creation](#decision-flyway-sql-first-migrations-not-hibernate-ddl-auto-owns-schema-creation) | Active |
+| [`updated_at` on `brands`/`users` is database-generated and strictly increasing; emails are stored normalised](#decision-updated_at-on-brandsusers-is-database-generated-and-strictly-increasing-emails-are-stored-normalised) | Active |
+| [Every time column is `TIMESTAMPTZ`/`Instant`; Inventory's zone-less columns converted by a forward migration](#decision-every-time-column-is-timestamptzinstant-inventorys-zone-less-columns-converted-by-a-forward-migration) | Active |
+| [Identity's remaining tables — a fast hash for `api_keys.key_hash`, revoked keys kept, a partial index and `JSONB` for the outbox](#decision-identitys-remaining-tables--a-fast-hash-for-api_keyskey_hash-revoked-keys-kept-a-partial-index-and-jsonb-for-the-outbox) | Active |
+| [Entity and migration conventions, applied to every service](#decision-entity-and-migration-conventions-applied-to-every-service) | Active |
+| [Database `CHECK` constraints are the last line of defence — each one documented against the guard that comes first](#decision-database-check-constraints-are-the-last-line-of-defence--each-one-documented-against-the-guard-that-comes-first) | Active |
+| [Who stamps a time column depends on who compares it](#decision-who-stamps-a-time-column-depends-on-who-compares-it) | Active |
+| [Service scaffolding — fixed ports, one shared credential pair, a separate database per service, and deferred dependencies](#decision-service-scaffolding--fixed-ports-one-shared-credential-pair-a-separate-database-per-service-and-deferred-dependencies) | Active, amended |
+| [Entity tests run against real Postgres, roll back, and must be shown to fail](#decision-entity-tests-run-against-real-postgres-roll-back-and-must-be-shown-to-fail) | Active |
+| [`notification_log` records what happened, not what is currently true — `recipient_address` and `last_error` added](#decision-notification_log-records-what-happened-not-what-is-currently-true--recipient_address-and-last_error-added) | Active |
+| [the contact caches are keyed by the *other* service's id, and the conditional upsert's strict `<` depends on Identity's trigger](#decision-the-contact-caches-are-keyed-by-the-other-services-id-and-the-conditional-upserts-strict--depends-on-identitys-trigger) | Active |
+| [The payment webhook finds its order by our order id, never by `payment_ref`; `payment_ref` gets a partial `UNIQUE`](#decision-the-payment-webhook-finds-its-order-by-our-order-id-never-by-payment_ref-payment_ref-gets-a-partial-unique) | Active, amended (Day 6) |
+| [Order Service's guards ship in its first migration, and the database clock stamps every time column that is compared](#decision-order-services-guards-ship-in-its-first-migration-and-the-database-clock-stamps-every-time-column-that-is-compared) | Active |
+| [Reserve contract revised — `outcome` replaces `success`/`reason`](#decision-reserve-contract-revised--outcome-replaces-successreason) | Active, amended |
+| [Per-item quantity cap of 5, enforced at the API, not the database](#decision-per-item-quantity-cap-of-5-enforced-at-the-api-not-the-database) | Active |
+| [`ITEM_NOT_IN_SALE` is a `200` outcome, not `404 ITEM_NOT_FOUND`](#decision-item_not_in_sale-is-a-200-outcome-not-404-item_not_found) | Active |
+| [One live-or-paid order per buyer per sale](#decision-one-live-or-paid-order-per-buyer-per-sale) | Active |
+| [CAS-owned columns are insert-only in the entities (A1)](#decision-cas-owned-columns-are-insert-only-in-the-entities-a1) | Active |
+| [Reserve write path: READ COMMITTED, one atomic conditional UPDATE, one short transaction](#decision-reserve-write-path-read-committed-one-atomic-conditional-update-one-short-transaction) | Active; implemented, tested, raced; load-measured on one laptop only |
+| [Order creation: retries, conflicts, deadlines and Inventory failures](#decision-order-creation-retries-conflicts-deadlines-and-inventory-failures) | Active, amended (Day 9 pool wait counted in the deadline) |
+| [Day 5: payment step, resilience and derived deadlines](#decision-day-5-payment-step-resilience-and-derived-deadlines) | Active, amended (Day 9: pool wait, values on the config server) |
+| [Open Items (not yet decided or not yet built)](#open-items-not-yet-decided-or-not-yet-built) | Tracker, brought up to date at the end of Day 9 |
+| [Day 6: webhook, one-payment edge cases, PaymentConfirmed, outbox relay](#decision-day-6-webhook-one-payment-edge-cases-paymentconfirmed-outbox-relay) | Active; implemented and tested (Day 6) |
+| [Day 7: Inventory consumers, late-reservation cleanup, expiry sweep and its index](#decision-day-7-inventory-consumers-late-reservation-cleanup-expiry-sweep-and-its-index) | Active; the reconciler is now built (Day 9), the reconciliation sweep is not |
+| [Day 8: auth, gateway identity, rate limiting, browse](#decision-day-8-auth-gateway-identity-rate-limiting-browse) | Active; built and tested (2026-11-08); the limiter script was replaced in Day 9 |
+| [Day 9, Part 0: config server (Spring Cloud Config, Git backend, public repo, local fallback)](#decision-day-9-part-0-config-server-spring-cloud-config-git-backend-public-repo-local-fallback) | Active; implemented and tested |
+| [Day 9, Part B: observability (Prometheus, Grafana, one dashboard as files)](#decision-day-9-part-b-observability-prometheus-grafana-one-dashboard-as-files) | Active; implemented and tested |
+| [Day 9, Part F: open-in-view off and the pool wait in the CREATED deadline](#decision-day-9-part-f-open-in-view-off-and-the-pool-wait-in-the-created-deadline) | Active; implemented and tested |
+| [Day 9: Inventory stale-reservation reconciler](#decision-day-9-inventory-stale-reservation-reconciler) | Active; implemented and tested |
+| [Day 9: cold-start fixes (Feign upgrade, Inventory warm-up before the port)](#decision-day-9-cold-start-fixes-feign-upgrade-inventory-warm-up-before-the-port) | Active; implemented and tested |
+| [Day 9: the Gateway's own rate-limiter script (lock-free)](#decision-day-9-the-gateways-own-rate-limiter-script-lock-free) | Active; implemented and tested |
+
+
 ---
 
 ## Decision: Saga (orchestration) instead of 2PC or a single distributed transaction for Order/Inventory/Payment consistency
@@ -1662,6 +1761,8 @@ oversell it.
 
 ## Decision: A late reservation is cleaned up by re-publishing `OrderCancelled`, not by a new mechanism
 
+> **Status update (Day 9 docs pass):** the republish described here is "Version A" and is implemented and tested (Day 7). The related gap "Version B" (Order's reserve call times out and Inventory commits the reservation later), documented as open in "Day 7", point 5, is **closed by** "Day 9: Inventory stale-reservation reconciler": implemented, tested, and demonstrated once on real processes with a late reservation forced. It releases such a unit after about 10.5 minutes at best. How often Version B happens under real overload is not measured. The text below is unchanged.
+
 **Context / Problem:**
 The reservation loop can have a `reserve()` call in flight when the sweep kills
 the order. Sequence: items 1–2 reserved; sweep fires; `OrderCancelled` is
@@ -2718,6 +2819,8 @@ That makes the immutability rule load-bearing here, not merely tidy.
 
 ## Decision: Order's internal order-status endpoint — `GET /internal/orders/{orderId}/status`
 
+> **Status update (Day 9 docs pass):** implemented and tested together with the Inventory reconciler that calls it; see "Day 9: Inventory stale-reservation reconciler". The text below is unchanged.
+
 **Context / Problem:**
 Inventory's stale-reservation reconciler must ask Order what became of an
 order before acting on a reservation it still holds. Order is the sole
@@ -2804,6 +2907,8 @@ the authority — but silence would hide a dead sweep.
 ---
 
 ## Decision: Webhook-never-arrives is closed by a reconciliation sweep that queries the gateway by the order's deterministic idempotency key
+
+> **Status (Day 9 docs pass):** the heading says "is closed" in the sense of the design. The reconciliation sweep is **designed, not built** (`architecture.md` §8, §9). The text below is unchanged.
 
 **Context / Problem:**
 Every refund in this design was triggered by an inbound webhook. If a webhook
@@ -2937,6 +3042,8 @@ The PRD's Section 3.2 list needs updating to match.
 
 ## Decision: Inventory keeps no deadline of its own; stale reservations are reconciled by asking Order
 
+> **Closed by (Day 9 docs pass):** option 2 is implemented as "Day 9: Inventory stale-reservation reconciler" (threshold derived, 570.5 s; acts only on `PAID` or a failure state; otherwise alerts). The text below is unchanged.
+
 **Context / Problem:**
 With expiry moved to Order, `stock_reservations.expires_at` no longer drives
 anything. But a reservation could still be stranded by a lost event or a bug,
@@ -2985,6 +3092,8 @@ Order must expose a status-check endpoint. The call is off the hot path.
 ---
 
 ## Decision: Deadlines and leases are derived from the timeouts they race, never picked
+
+> **Amended by (Day 9 docs pass):** "Day 9, Part F" adds Order's Hikari connection wait (1 s, policy, provisional) to the `CREATED` deadline (one item 20.5 s, was 14.5 s; `maxLines` 9, was 17). "Day 9, Part 0" moves the tunable numbers to the config server (precedence env var, then config server, then the local file; applied on restart). Numbers in the text below are as written at the time.
 
 > **Correction (2026-11-05, from "Day 5: payment step, resilience and derived
 > deadlines"):** the numbers now exist. The `CREATED` deadline is derived from
@@ -4409,6 +4518,8 @@ target). See `architecture.md` §8 for what was and was not exercised.**
 
 ## Decision: Order creation: retries, conflicts, deadlines and Inventory failures
 
+> **Amended by (Day 9 docs pass):** "Day 9, Part F" adds Order's Hikari connection wait to the `CREATED` deadline and makes a pool timeout answer `503 SERVICE_BUSY`; "Day 9, Part 0" serves the numbers from the config server. The text below is unchanged.
+
 **Context / Problem:**
 Order's create endpoint is the first piece that has to behave when things go
 wrong: a client retries after a timeout, two tabs submit together, the process
@@ -4566,6 +4677,8 @@ writing.
 ---
 
 ## Decision: Day 5: payment step, resilience and derived deadlines
+
+> **Amended by (Day 9 docs pass):** "Day 9, Part F" adds Order's Hikari connection wait (1 s, policy, provisional) to the `CREATED` deadline (one item 20.5 s, was 14.5 s; `maxLines` 9, was 17), and "Day 9, Part 0" serves the retry, breaker, fee and sweep numbers from the config server. The values in the text below are as written on Day 5.
 
 **Status:** points 1 and 6 **implemented and tested** (`feat/day5-fee-deadline`,
 merged); points 2 to 5 and the payment window (7) **implemented and tested
@@ -4730,6 +4843,35 @@ Feign client's real ceiling per call is connect 1 s + read 2 s = 3 s.
 ---
 
 ## Open Items (not yet decided or not yet built)
+
+> **Status at the end of Day 9 (2026-11-09, Day 9 docs pass).** The items below keep the text they had when written. This block says where each stands now; where a row and an item disagree, the row is newer. It is a summary, not a second copy: the reasoning is in the entry each row names.
+>
+> **Decided and built** (implemented and tested, labels as in `architecture.md` §8)
+> - Locking strategy, isolation level and the reserve write path: READ COMMITTED, one atomic conditional `UPDATE` ("Reserve write path"). Load-measured on one laptop only.
+> - The zero-amount order (closed in Day 5); `RESERVATION_RELEASED`, the retried create and the unique-violation `409` ("Order creation: retries, conflicts, deadlines and Inventory failures"); the quantity cap; A1; B1 to B5; the V8 `CHECK`s; the expiry-sweep part of A3 and V9.
+> - Browse, the signup race and the JWT subject type (Day 8, built).
+> - The `CREATED` deadline now includes Order's pool wait (Day 9, Part F); the tunable numbers are served by the config server (Day 9, Part 0). All of them stay provisional.
+> - **Closed in Day 9:** Version B of the late reservation, by the stale-reservation reconciler ("Day 9: Inventory stale-reservation reconciler"). Not measured under real overload; a stranded unit waits about 10.5 minutes at best.
+>
+> **Open (undecided, unmeasured, or not built)**
+> - Pool size, `lock_timeout` / `statement_timeout`, and Inventory's and Identity's connection wait. (Order's 1 s connection wait is decided policy.)
+> - Insert-first against update-first in `reserve`: no entry records the comparison.
+> - Relay lock time with a slow broker (up to batch x ack timeout, 50 x 5 s): unmeasured; the "recheck Day 9" is not recorded anywhere as done.
+> - A2 (what a `NULL` `next_retry_at` means) and the refund-index part of A3: undecided. **The refund worker is not built.**
+> - The reconciliation sweep for a lost webhook: designed, not built.
+> - Contact-cache backfill; Identity's outbox events (signup writes none); the outbox cleanup job (Order and Identity); a consumer for `BrandUpserted` (Notification's consumers are not built).
+> - "Frozen once the sale opens", "product name frozen" and "reject a sale starting in the past": designed, not built (there is no brand-side API).
+> - The wrong-amount-then-right-amount edge (a `PAID` order with a refund row for its own payment): recorded, not decided.
+> - Which clock function stamps any other column compared against `now()`: open for new columns.
+> - Test isolation: 4 Order tests still count whole tables; mitigated by `load-tests/reset-run.sh`, not fixed in the tests.
+> - Config drift between the `flashmart-config` repo and the local fallback copies (unchecked), and Spring Cloud 2025.1.x BOMs naming Boot 4.0.x while the repo runs 4.1.1.
+> - The p99 under 500 ms and 5,000 concurrent targets: **not met** (`testing.md`).
+> - Razorpay Clone: not built; the four behaviours the design leans on are designed, not verified.
+>
+> **Accepted risks (not scheduled)**
+> - A second captured payment can escape correction (first item below).
+> - A buyer cannot start a new order while an unpaid one is open, until it pays or expires.
+> - One person with two accounts is not covered by the one-live-order rule.
 
 - **Accepted, permanently — not scheduled for fix.** A second captured payment
   can escape correction entirely, in two distinct shapes, if the initiate
@@ -5116,6 +5258,8 @@ redelivered webhook cannot insert a second refund row.
 
 ## Decision: Day 7: Inventory consumers, late-reservation cleanup, expiry sweep and its index
 
+> **Status update (Day 9 docs pass):** the Status line below is as of Day 7. The stale-reservation reconciler, and with it the "Version B" gap in point 5, is **closed by** "Day 9: Inventory stale-reservation reconciler" (implemented and tested). The reconciliation sweep is **still designed only**. The text below is unchanged.
+
 **Status:** **decided; Inventory consumers, Order expiry sweep (with drain loop), V9 partial index and late-reservation republish implemented and tested; Inventory stale-reservation reconciler and reconciliation sweep designed only.** The reasoning below is the Day 7 design as written; what was built is in architecture.md §8. Every value that is a number or a timing is **provisional and
 unmeasured**. The Razorpay Clone does not exist, so nothing here that touches
 the gateway is verified.
@@ -5272,6 +5416,8 @@ each consumer and the sweep use them.
   partial index in use.
 
 ## Decision: Day 8: auth, gateway identity, rate limiting, browse
+
+> **Status update (Day 9 docs pass):** the Status line below is as of the morning of 2026-11-08. Everything in this entry is now **built and tested** (Identity, the Gateway, the signed header and Order's check, Eureka, the rate limiter, browse; `architecture.md` §8). Gateway and Eureka were smoke-run once, and the Gateway was load-run in Day 9. The limiter's Redis script bean was replaced by "Day 9: the Gateway's own rate-limiter script (lock-free)" (rates, burst, keys and fail-open unchanged), and the rate-limit numbers are now served by the config server ("Day 9, Part 0"). The text below is unchanged.
 
 **Status:** **DESIGNED; partly built since (2026-11-08).** Identity's signup,
 login, refresh and logout and migration V8 (points 1 to 4 and 6) are implemented
