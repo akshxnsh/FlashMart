@@ -18,7 +18,7 @@ Authority order when documents disagree: `docs/decisions.md` → `docs/architect
 | Schema per service | `architecture.md` §4 |
 | Order state machine, one-payment invariant | `architecture.md` §6 |
 | What is built / tested / not | `architecture.md` §8 (the status source of truth) |
-| Open items | `architecture.md` §9 and the final "Open Items" section of `decisions.md` |
+| Open items | `architecture.md` §9 and the "Open Items (not yet decided or not yet built)" section of `decisions.md` (mid-file; find it with `grep -n '^## Open Items'`) |
 | Why something is the way it is | `decisions.md`, **by heading** |
 
 **Reading discipline:** `decisions.md` is ~4,500 lines. Never read it whole. `grep -n '^## Decision'` for headings, then read only the relevant section. Same for `architecture.md`: read the section you need.
