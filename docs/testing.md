@@ -1788,3 +1788,169 @@ curl -s http://localhost:8082/actuator/prometheus | grep ^inventory_reconciler
 
 **Full suite on `feat/reconciler`, before the demo:** identity 119, inventory 126, order 319, notification 29,
 payment-stub 22, api-gateway 52, eureka-server 2, config-server 1 = **670, 0 failures, 0 errors**.
+
+## Day 9: cold-start diagnosis, Feign converter error and Inventory's pool (2026-11-09)
+
+Diagnosis only: no production code, config, pool or timeout changed. Two harnesses were added as `main()` classes in
+test sources (no `@Test`, so the suites do not run them and the counts do not change). One laptop, a few runs each,
+no load tool.
+
+### Problem A: "no suitable HttpMessageConverter found for request type [...]" in Order
+
+**Cause: proven (a race in the library, not in FlashMart code).** `spring-cloud-openfeign-core` 5.0.2,
+`FeignHttpMessageConverters.initConvertersIfRequired()`, read in the 5.0.2 sources jar:
+
+```java
+if (this.converters == null) {
+    this.converters = new ArrayList<>();   // published EMPTY, no lock
+    // ... registerDefaults(), customizers, then hmc.forEach(converter -> converters.add(converter));
+}
+```
+
+The first thread to call it publishes an empty list and then fills it. Any thread that arrives in that gap sees a
+non-null list, skips the set-up, and loops over zero (or a half-filled list of) converters. `SpringEncoder` then
+finds nothing that can write the body and throws the message we saw. The bean is defined in
+`FeignClientsConfiguration`, which runs once **per Feign client** (each client has its own child context), so each
+client fails on its own first burst. That fits R2F: the payment client failed on its first burst even though the
+Inventory client had been used before.
+
+**The earlier guess is ruled out for this version.** In Spring Framework 7.0.9,
+`AbstractJacksonHttpMessageConverter.canWrite` checks only the media type and charset. It no longer builds a
+serializer (Spring 6's `canSerialize` did, and swallowed the cause). The DEBUG run shows nothing was swallowed
+(below).
+
+Harness: `order-service/src/test/java/com/flashmart/order/diagnosis/FeignColdStartHarness.java`. It builds a Spring
+context with only Order's two real Feign clients (same interfaces and per-client config classes; Jackson,
+HTTP-converter and Feign auto-configuration; Order's `application.yml` is on the classpath) against a JDK HTTP stub.
+It fires 50 concurrent first calls, 25 through each client, released together by a latch.
+
+| Run | Rounds | Rounds with failures | Calls failed per round |
+|---|---|---|---|
+| `burst`, a fresh JVM per round | 20 | **20 / 20** | 7 to 44 of 50 |
+| `warm` (one sequential call per client, then the same burst), a fresh JVM per round | 20 | **0 / 20** | 0 |
+| `direct`: 50 threads race `getConverters()` on a new instance (one JVM, 20 rounds) | 20 | **20 / 20** | 49 of 50 saw **size 0**, 1 saw the full 7 |
+
+- Failures across the 20 `burst` JVMs (number of rounds each message appeared in): "no suitable
+  HttpMessageConverter" for `ReserveRequest` in 20 and for `InitiatePaymentRequest` in 18. Also
+  `Index 1 out of bounds for length 0` (3), `Index 11 out of bounds for length 10` (1), and an `EncodeException` with
+  a null message (1). The last three are what reading an `ArrayList` while another thread adds to it looks like: the
+  same race, a different symptom. Order would treat them the same way (a failed call).
+- **DEBUG run** (`org.springframework.http.converter` and `org.springframework.cloud.openfeign.support` at DEBUG, one
+  burst): 33 calls failed, 17 succeeded, and there were exactly 17 "Writing [...] using [...]" DEBUG lines. The 33
+  failing calls logged nothing from either package, and there were no WARN/ERROR lines. The stack ends in
+  `SpringEncoder.encodeWithMessageConverter(SpringEncoder.java:168)`, the throw after the loop, with no cause attached.
+- The harness's burst is harsher than production (50 threads released at the same instant), so its failure counts
+  do not predict how many real orders fail. Production saw 15 (R1) and 12 + 3 (R2F).
+
+**Versions that resolve** (Order's `dependency:tree`): spring-cloud-openfeign 5.0.2, feign-core 13.6.1, Spring
+Framework 7.0.9, Spring Boot 4.1.1, and Jackson 3 (`tools.jackson`) 3.1.5 for the converters. Jackson 2.21.5 is
+also on the classpath, pulled in by the Eureka client (`spring-boot-jackson2`); it plays no part in this failure.
+
+**Upstream** (read on GitHub, not tried): fixed in spring-cloud-openfeign **5.0.3** (released 2026-08-20), PR #1384
+"Fix concurrent initialization race in FeignHttpMessageConverters" (issue #1371, milestone 5.0.3). Current `main`
+builds the list locally and publishes it only once complete (`volatile` field plus a double-checked lock). 5.0.4 is
+the latest 5.0.x. Issue #1307 (the same race) still shows as open. Which Spring Cloud train release ships openfeign
+5.0.3 was not checked. Nothing was upgraded.
+
+**Warm-up evidence (step 4):** one sequential call per client before the burst gave 20 / 20 clean rounds. Not added
+to the app.
+
+### Problem B: Inventory's Hikari pool filled during a cold-start burst
+
+Probe: `inventory-service/src/test/java/com/flashmart/inventory/diagnosis/ReserveColdStartProbe.java`, against a
+fresh Inventory jar on `:8082`. Order was not involved. Conditions: config server and Eureka not running (local
+fallback config); Postgres local; Kafka from compose. The seed was reset before each run. 200 concurrent reserves
+were released by a latch, all on **one item** (sale 1, product 2 = item 2, 50 units), quantity 1, distinct order
+ids, with a 30 s client timeout so latencies past Order's 2 s limit are visible. One dedicated JDBC connection sampled
+`pg_stat_activity` for `inventory-service` every 250 ms; a second thread scraped Hikari from `/actuator/prometheus`.
+"Warm" means 20 sequential reserves on the same item on the same fresh JVM, then the seed reset again (same stock),
+then the burst.
+
+| Run (fresh JVM each) | Outcomes | p50 / p99 / max (ms) | Calls > 2 s | Hikari max active / pending seen |
+|---|---|---|---|---|
+| cold1 (first sampler version) | 50 RESERVED, 150 OUT_OF_STOCK | 2,112 / 2,256 / 2,257 | **150** | 10 / 176 |
+| coldA | same | 2,047 / 2,282 / 2,286 | **123** | 10 / 96 |
+| coldB | same | 1,984 / 2,232 / 2,254 | **87** | 10 / 149 |
+| warmA (20 sequential first) | same | 548 / 850 / 867 | 0 | 0 / 0 * |
+| warmB (20 sequential first) | same | 647 / 797 / 803 | 0 | 1 / 0 * |
+
+\* The Hikari scrape goes through Inventory's own Tomcat and queues behind the burst (scrapes took 50 ms to 1.4 s),
+so these readings are coarse and short peaks can be missed. The warm "0 / 0" means "none seen", not "none".
+
+There was also an accidental run (cold2) against cold1's JVM, which had not been stopped and was already warmed by a
+full 200-call burst: p99 795 ms, 0 over 2 s. It is reported as that, not as a fresh run. The run script was then
+fixed to refuse to start if anything already answers on `:8082`.
+
+Without Order in the loop, the cold runs repeat R2F's pattern: the pool full (10 / 96 to 176 against R2F's
+10 / 177) and calls past 2 s (87 to 150 against R2F's 186 timeouts).
+
+**What the connections were doing** (sessions summed over all samples of a run: one session in one sample counts 1):
+
+| Run | idle | idle in transaction, `Client/ClientRead` | active (running) | active, `Lock/transactionid` |
+|---|---|---|---|---|
+| coldA | 94 | 36 | 0 | **0** |
+| coldB | 98 | 32 | 0 | **0** |
+| warmA | 54 | 22 | 3 | 1 |
+| warmB | 64 | 16 | 0 | 0 |
+
+- **Row-lock queue on the hot item: not the cause, as far as 250 ms sampling can see.** No lock waits were sampled in
+  either cold run. A short lock wait between samples can be missed, so this rules out a lasting lock queue, not every
+  lock wait.
+- **The busy connections were waiting on the JVM, not on Postgres.** Every non-idle session in the cold runs was
+  `idle in transaction` with `ClientRead`: a transaction open, Postgres waiting for Inventory to send the next
+  statement. The connection is held while Inventory's own code runs between statements.
+- **For about 1.4 s after the release, nothing reached Postgres.** In coldA the burst was released at t=638 ms and all
+  10 sessions stayed plain `idle` until about t=2,070 ms; the database work then ran from about 2.07 to 2.9 s. In
+  warmA, transactions appear about 220 ms after the release and are done by about 1.4 s.
+- **The first single call on a cold JVM took 1,036 ms on its own**; calls 2 to 20 took 16 to 34 ms (warmA's warm-up).
+
+**Cause: partly proven.**
+- Proven in these runs: the pool fills and calls pass 2 s only on a cold JVM. 20 sequential calls first removed it
+  in 2 of 2 runs. So it is **not** the hot item's row lock and **not** pool size alone: 10 connections handled the
+  same 200-call burst on the same item in under 0.9 s once warm.
+- Proven: the held connections are waiting on Inventory's code (`ClientRead` inside a transaction), not on a lock.
+- **Not proven: what the cold JVM is slow at.** Candidates are first-use class loading, the JIT, first-use set-up in
+  Jackson / Hibernate / Spring MVC, and first-time query preparation. No profile was taken. One inference: a
+  *sequential* warm-up (one thread) cured it, so creating many Tomcat threads is unlikely to be the main cost. The
+  likelier cost is one-time set-up per code path.
+- Not separated: how much "open-in-view off" (about 3 borrows per reserve) adds to the queue on a cold JVM, and how
+  much the laptop's CPU does. Every run shared the laptop with Postgres and Kafka.
+
+### Not covered
+
+A profile of the cold JVM; Problem B with Order in the loop; more than two runs per arm in B; whether one sequential
+call (instead of 20) is enough for Inventory; the Spring Cloud train release that carries openfeign 5.0.3. Order is
+the only service with Feign clients (grep for `@FeignClient`), so the race cannot occur elsewhere today.
+
+### Suites
+
+Run on `fix/startup-diagnosis` for the two touched modules only (the others are unchanged): order **319**, inventory
+**130**, 0 failures, 0 errors. The first Order run had 305 errors, caused by the harness itself: its nested config
+class was a `@SpringBootConfiguration`, and Order's component scan picked it up from the test classpath, so its
+`@EnableFeignClients` registered the Feign clients twice. The annotation was removed (the harness passes the class
+to `SpringApplicationBuilder` as a plain source). One `burst` and one `warm` round were re-run afterwards with the
+same result as before (43 / 50 failed; 0 / 50). The 20-round tables above were taken with the earlier version, which
+differs only in that annotation.
+
+### Commands
+
+```bash
+# Problem A (from order-service/, after ./mvnw test-compile and
+#   ./mvnw dependency:build-classpath -Dmdep.outputFile=cp.txt -Dmdep.includeScope=test)
+CP="target/test-classes;target/classes;$(cat cp.txt)"
+java -cp "$CP" com.flashmart.order.diagnosis.FeignColdStartHarness burst 1     # once per fresh JVM, x20
+java -cp "$CP" com.flashmart.order.diagnosis.FeignColdStartHarness warm 1      # x20
+java -cp "$CP" com.flashmart.order.diagnosis.FeignColdStartHarness direct 20
+java -Dlogging.level.org.springframework.http.converter=DEBUG \
+     -Dlogging.level.org.springframework.cloud.openfeign.support=DEBUG -cp "$CP" \
+     com.flashmart.order.diagnosis.FeignColdStartHarness burst 1
+
+# Problem B (repo root, .env exported, Kafka up, nothing on :8082). Per run: reseed, start a fresh jar, wait for UP.
+bash scripts/seed/seed.sh
+java -jar inventory-service/target/inventory-service-0.0.1-SNAPSHOT.jar &
+CP="inventory-service/target/test-classes;inventory-service/target/classes;$(cat icp.txt)"
+java -cp "$CP" com.flashmart.inventory.diagnosis.ReserveColdStartProbe warm 20 900000   # warm arm only,
+bash scripts/seed/seed.sh                                                                 # then reseed
+java -cp "$CP" com.flashmart.inventory.diagnosis.ReserveColdStartProbe burst 200 100000
+# then stop the Inventory JVM before the next run
+```
