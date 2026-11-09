@@ -5998,3 +5998,88 @@ already written (architecture.md §3, "Inventory → Order"): Inventory asks Ord
   rows behind it are released, it is asked again after the wrap), and the six counters at zero. One existing test
   changed because its expectation was the old behaviour: after an unreachable order, the next pass no longer
   retries that order first; it is retried after the wrap.
+
+## Decision: Day 9: cold-start fixes (Feign upgrade, Inventory warm-up before the port)
+
+**Status: both implemented and tested; measured on one laptop, a few runs each (`testing.md`, "Day 9: cold-start
+fixes"). The Feign race is fixed and was shown fixed (0 of 20 fresh JVMs failed, was 20 of 20). The Inventory warm-up
+fixes the SYMPTOM (calls over 2 s: 0 in 3 of 3 cold runs, was 87 to 150) but only part of the cold cost; why a cold
+JVM is slow was never profiled.**
+
+### Context
+
+The diagnosis (`testing.md`, "Day 9: cold-start diagnosis") found two cold-start problems on a fresh JVM:
+
+- **A. Order's Feign clients** threw "no suitable HttpMessageConverter found for request type [...]" on the first
+  concurrent burst. Cause proven: spring-cloud-openfeign 5.0.2 builds `FeignHttpMessageConverters`' list empty,
+  publishes it, then fills it, with no lock; a thread arriving in the gap sees no converter. Fixed upstream in 5.0.3
+  (PR #1384).
+- **B. Inventory's pool filled** on a cold burst (200 concurrent reserves on one item): 87 to 150 calls over Order's
+  2 s read limit, which is what made R2F fail every warm-up order. Not the row lock on the hot item, not the pool
+  size: the held connections were waiting on Inventory's own code. 20 sequential calls first removed it (2 of 2).
+
+### Fix A: upgrade the train, do not warm the Feign clients
+
+**Chosen:** Spring Cloud `2025.1.2` → `2025.1.3` in all six modules that declare `spring-cloud.version` (identical
+across services of the same shape). The BOM ships openfeign 5.0.3. Same train, patch step: Boot stays 4.1.1, no
+override outside the BOM. Only `order-service` uses Feign; the other five take the same patch bumps (commons, gateway,
+config). 2025.1.3's notes list security fixes (CVEs in commons, config, function, gateway, stream) and no breaking
+change; 2025.1.4 (openfeign 5.0.4) would also qualify and was not needed.
+
+**Why not a Feign warm-up in the app (the other option).** A warm-up would have to make a real first call through each
+client before traffic: a reserve call to Inventory and an initiate call to the payment gateway, both of which have
+side effects on another service, or a fake target whose address production does not have. It also fixes only the
+clients that exist today, and each new Feign client (each has its own converter list) would need its own warm-up.
+The upgrade removes the cause. The warm-up was kept only as a harness arm to prove the diagnosis (20 of 20 clean).
+
+**Trade-offs.** The patch also moves the other Spring Cloud modules, although only openfeign was wanted. And the
+2025.1.x BOMs name Boot 4.0.x while the repo runs 4.1.1; that mismatch was already there with 2025.1.2 and the suites
+and runs have worked with it, but it is a combination the train does not state it supports. Not changed here.
+
+### Fix B: Inventory warms up before the port opens
+
+**Chosen:** `StartupWarmup`, a `SmartInitializingSingleton`, calls the real `ReservationService.reserve` 20 times,
+each inside an outer transaction that is always rolled back.
+
+- **Why before the port.** Order reaches Inventory by a fixed URL, not Eureka, so there is no readiness gate between
+  "the port opens" and "the first buyer arrives". `afterSingletonsInstantiated` runs when every bean exists (Flyway
+  done, DataSource and JPA up) and before the lifecycle phase that opens the Tomcat connector, registers with Eureka
+  and starts the Kafka listeners. An `ApplicationRunner` or `ApplicationReadyEvent` handler runs after all three, so
+  the first buyers would race the warm-up. Shown, not assumed: a test observes the start-up calls and the
+  web-server event and fails when the hook is moved to an `ApplicationRunner` (break-and-restore), and the log shows
+  the warm-up line before the Eureka registration and "Tomcat started".
+- **Why the real path, rolled back (the other option: read-only queries).** A read-only warm-up has no side effect at
+  all, but it would not touch the reservation insert, the generated id, the conditional stock `UPDATE` or the
+  exception path, which are the code buyers run. The rolled-back real path warms those. The cost is below.
+- **Bounded and non-fatal.** One daemon thread, the caller waits at most `timeout-ms` (10 s), the transactions carry
+  a matching transaction timeout so a stuck statement cannot hold the stock row lock long. A failure, a timeout or an
+  empty database is logged and start-up goes on. The item is a live one with stock when there is one (the success
+  path), else any item.
+- **Config** (`startup-warmup.*`, provisional, in `application.yml` and mirrored in the config repo; the `enabled`
+  flag stays local): `calls: 20` (the number the diagnosis tried), `timeout-ms: 10000`. Both are policy, not
+  derived: 20 is what was tried, the timeout only bounds a hung database. Off in tests.
+
+**What it cannot warm.** Anything that needs a request on the port: Tomcat's threads, the DispatcherServlet's
+first-request set-up, Jackson on the request and response, bean validation. Measured: the first HTTP call after a
+warm-up took 202 to 268 ms, against 826 to 1,182 ms without it and 16 to 34 ms for a warm call.
+
+**Trade-offs and consequences.**
+- **Each start burns 20 ids of the `stock_reservations` sequence** (a sequence does not roll back). Rows, quantities
+  and stock are identical before and after (native SQL, tested). The ids are not contractual.
+- **A start adds about 1 s** (11.5 s mean without, 12.5 s with, three starts each; the warm-up itself 0.8 to 1.1 s).
+- **The warm-up briefly row-locks one stock row** until each rollback. Harmless with one instance before it takes
+  traffic; a second instance starting next to a live one would delay its writers on that row by a few milliseconds.
+  Not tested with two instances.
+- It only helps a start with data in it. An empty database is skipped, visibly.
+
+**What stays unproven.**
+- **Why a cold JVM is slow** (class loading, JIT, Hibernate/Jackson/MVC first use). Not profiled. The warm-up fixes
+  the symptom; it does not name the cause.
+- **That 20 is the right number**, or that fewer would do. Only 20 was tried.
+- **That the cold burst is now safe.** Cold p99 with the warm-up on was 1.25 to 1.62 s (3 runs), against 0.80 to
+  0.85 s for a JVM that had served HTTP calls first and 2.23 to 2.28 s with no warm-up. That is close to Order's 2 s
+  limit, with little margin. The remaining gap is probably the part of the request path that needs the port
+  (inference: the first-call figures above; not profiled).
+- The pool still saturated during the burst (Hikari active 9 to 10, up to 183 waiting), which is expected for 200
+  concurrent calls on 10 connections; the Hikari readings are coarse (the scrape queues behind the burst).
+- Behaviour with more than one Inventory instance, or against a production-size table.
